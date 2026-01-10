@@ -63,7 +63,7 @@ pub struct CPU {
     memory: [u8; 0xFFFF],
 }
 
-trait Memory {
+pub trait Memory {
     fn mem_read(&self, addr: u16) -> u8;
 
     fn mem_read_u16(&self, pos: u16) -> u16 {
@@ -519,10 +519,18 @@ impl CPU {
     }
 
     pub fn run(&mut self) {
+        self.run_with_callback(|_| {});
+    }
+
+    pub fn run_with_callback<F>(&mut self, mut callback: F)
+    where
+        F: FnMut(&mut CPU),
+    {
         // we borrow the opscode data structure without taking ownership
         let ref opcodes: HashMap<u8, &'static opcodes::OpCode> = *opcodes::OPCODES_MAP;
 
         loop {
+            callback(self);
             let code = self.mem_read(self.program_counter);
             self.program_counter += 1;
             let program_counter_state = self.program_counter;
