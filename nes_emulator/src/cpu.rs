@@ -63,8 +63,10 @@ pub struct CPU {
     memory: [u8; 0xFFFF],
 }
 
-pub trait Memory {
+pub trait Mem {
     fn mem_read(&self, addr: u16) -> u8;
+
+    fn mem_write(&mut self, addr: u16, data: u8);
 
     fn mem_read_u16(&self, pos: u16) -> u16 {
         let lo = self.mem_read(pos) as u16;
@@ -72,17 +74,15 @@ pub trait Memory {
         (hi << 8) | (lo as u16)
     }
 
-    fn mem_write(&mut self, addr: u16, data: u8);
-
     fn mem_write_u16(&mut self, pos: u16, data: u16) {
         let hi = (data >> 8) as u8;
-        let lo = (data & 0xFF) as u8;
+        let lo = (data & 0xff) as u8;
         self.mem_write(pos, lo);
         self.mem_write(pos + 1, hi);
     }
 }
 
-impl Memory for CPU {
+impl Mem for CPU {
     fn mem_read(&self, addr: u16) -> u8 {
         self.memory[addr as usize]
     }
@@ -104,6 +104,7 @@ impl CPU {
             memory: [0; 0xFFFF],
         }
     }
+
     fn get_operand_addressing(&self, mode: &AddressingMode) -> u16 {
         match mode {
             AddressingMode::Immediate => self.program_counter,
@@ -156,7 +157,7 @@ impl CPU {
             }
 
             AddressingMode::NoneAddressing => {
-                panic!("mode {:?} not supported", mode);
+                panic!("mode {:?} is not supported", mode);
             }
         }
     }
@@ -186,6 +187,34 @@ impl CPU {
         self.mem_write(addr, self.register_a);
     }
 
+    fn set_register_a(&mut self, value: u8) {
+        self.register_a = value;
+        self.update_zero_and_negative_flags(self.register_a);
+    }
+
+    fn and(&mut self, mode: &AddressingMode) {
+        let addr = self.get_operand_addressing(mode);
+        let data = self.mem_read(addr);
+        self.set_register_a(data & self.register_a);
+    }
+
+    fn eor(&mut self, mode: &AddressingMode) {
+        let addr = self.get_operand_addressing(mode);
+        let data = self.mem_read(addr);
+        self.set_register_a(data ^ self.register_a);
+    }
+
+    fn ora(&mut self, mode: &AddressingMode) {
+        let addr = self.get_operand_addressing(mode);
+        let data = self.mem_read(addr);
+        self.set_register_a(data | self.register_a);
+    }
+
+    fn tax(&mut self) {
+        self.register_x = self.register_a;
+        self.update_zero_and_negative_flags(self.register_x);
+    }
+
     fn add_to_register_a(&mut self, data: u8) {
         let sum = self.register_a as u16
             + data as u16
@@ -208,7 +237,7 @@ impl CPU {
         if (data ^ result) & (result ^ self.register_a) & 0x80 != 0 {
             self.status.insert(CpuFlags::OVERFLOW);
         } else {
-            self.status.remove(CpuFlags::OVERFLOW);
+            self.status.remove(CpuFlags::OVERFLOW)
         }
 
         self.set_register_a(result);
@@ -218,6 +247,12 @@ impl CPU {
         let addr = self.get_operand_addressing(&mode);
         let data = self.mem_read(addr);
         self.add_to_register_a(((data as i8).wrapping_neg().wrapping_sub(1)) as u8);
+    }
+
+    fn adc(&mut self, mode: &AddressingMode) {
+        let addr = self.get_operand_addressing(mode);
+        let value = self.mem_read(addr);
+        self.add_to_register_a(value);
     }
 
     fn stack_push(&mut self, data: u8) {
@@ -238,6 +273,7 @@ impl CPU {
 
         hi << 8 | lo
     }
+
     fn asl_accumulator(&mut self) {
         let mut data = self.register_a;
         if data >> 7 == 1 {
@@ -248,6 +284,7 @@ impl CPU {
         data = data << 1;
         self.set_register_a(data)
     }
+
     fn asl(&mut self, mode: &AddressingMode) -> u8 {
         let addr = self.get_operand_addressing(mode);
         let mut data = self.mem_read(addr);
@@ -261,6 +298,7 @@ impl CPU {
         self.update_zero_and_negative_flags(data);
         data
     }
+
     fn lsr_accumulator(&mut self) {
         let mut data = self.register_a;
         if data & 1 == 1 {
@@ -271,6 +309,7 @@ impl CPU {
         data = data >> 1;
         self.set_register_a(data)
     }
+
     fn lsr(&mut self, mode: &AddressingMode) -> u8 {
         let addr = self.get_operand_addressing(mode);
         let mut data = self.mem_read(addr);
@@ -360,40 +399,6 @@ impl CPU {
         self.mem_read((STACK as u16) + self.stack_pointer as u16)
     }
 
-    fn set_register_a(&mut self, value: u8) {
-        self.register_a = value;
-        self.update_zero_and_negative_flags(self.register_a);
-    }
-
-    fn and(&mut self, mode: &AddressingMode) {
-        let addr = self.get_operand_addressing(mode);
-        let data = self.mem_read(addr);
-        self.set_register_a(data & self.register_a);
-    }
-
-    fn eor(&mut self, mode: &AddressingMode) {
-        let addr = self.get_operand_addressing(mode);
-        let data = self.mem_read(addr);
-        self.set_register_a(data ^ self.register_a);
-    }
-
-    fn ora(&mut self, mode: &AddressingMode) {
-        let addr = self.get_operand_addressing(mode);
-        let data = self.mem_read(addr);
-        self.set_register_a(data | self.register_a);
-    }
-
-    fn adc(&mut self, mode: &AddressingMode) {
-        let addr = self.get_operand_addressing(mode);
-        let value = self.mem_read(addr);
-        self.add_to_register_a(value);
-    }
-
-    fn tax(&mut self) {
-        self.register_x = self.register_a;
-        self.update_zero_and_negative_flags(self.register_x);
-    }
-
     fn inx(&mut self) {
         self.register_x = self.register_x.wrapping_add(1);
         self.update_zero_and_negative_flags(self.register_x);
@@ -429,7 +434,7 @@ impl CPU {
     }
 
     pub fn load(&mut self, program: Vec<u8>) {
-        self.memory[0x8000..(0x8000 + program.len())].copy_from_slice(&program[..]);
+        self.memory[0x0600..(0x0600 + program.len())].copy_from_slice(&program[..]);
         self.mem_write_u16(0xFFFC, 0x0600);
     }
 
@@ -678,11 +683,6 @@ impl CPU {
                 /* JMP Indirect */
                 0x6c => {
                     let mem_address = self.mem_read_u16(self.program_counter);
-                    // let indirect_ref = self.mem_read_u16(mem_address);
-                    //6502 bug mode with with page boundary:
-                    //  if address $3000 contains $40, $30FF contains $80, and $3100 contains $50,
-                    // the result of JMP ($30FF) will be a transfer of control to $4080 rather than $5080 as you intended
-                    // i.e. the 6502 took the low byte of the address from $30FF and the high byte from $3000
 
                     let indirect_ref = if mem_address & 0x00FF == 0x00FF {
                         let lo = self.mem_read(mem_address);
@@ -816,6 +816,7 @@ impl CPU {
                     self.register_a = self.register_y;
                     self.update_zero_and_negative_flags(self.register_a);
                 }
+
                 0x00 => return,
                 _ => todo!(),
             }
@@ -835,11 +836,12 @@ impl CPU {
         }
 
         if result >> 7 == 1 {
-            self.status.insert(CpuFlags::NEGATIV)
+            self.status.insert(CpuFlags::NEGATIV);
         } else {
-            self.status.remove(CpuFlags::NEGATIV)
+            self.status.remove(CpuFlags::NEGATIV);
         }
     }
+
     fn update_negative_flags(&mut self, result: u8) {
         if result >> 7 == 1 {
             self.status.insert(CpuFlags::NEGATIV)

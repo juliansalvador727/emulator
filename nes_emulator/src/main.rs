@@ -7,7 +7,7 @@ extern crate lazy_static;
 #[macro_use]
 extern crate bitflags;
 
-use cpu::Memory;
+use cpu::Mem;
 use cpu::CPU;
 use rand::Rng;
 
