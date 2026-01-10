@@ -1,3 +1,4 @@
+pub mod bus;
 pub mod cpu;
 pub mod opcodes;
 
@@ -7,15 +8,16 @@ extern crate lazy_static;
 #[macro_use]
 extern crate bitflags;
 
-use cpu::Mem;
+use bus::Bus;
 use cpu::CPU;
+use cpu::Mem;
 use rand::Rng;
 
+use sdl2::EventPump;
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 use sdl2::pixels::Color;
 use sdl2::pixels::PixelFormatEnum;
-use sdl2::EventPump;
 
 fn color(byte: u8) -> Color {
     match byte {
@@ -126,20 +128,26 @@ fn main() {
         0x60, 0xa2, 0x00, 0xea, 0xea, 0xca, 0xd0, 0xfb, 0x60,
     ];
 
-    let mut cpu = CPU::new();
+    let bus = Bus::new();
+    let mut cpu = CPU::new(bus);
     cpu.load(game_code);
     cpu.reset();
+    cpu.program_counter = 0x0600;
 
     let mut screen_state = [0 as u8; 32 * 3 * 32];
     let mut rng = rand::thread_rng();
 
+    // run the game cycle
     cpu.run_with_callback(move |cpu| {
         handle_user_input(cpu, &mut event_pump);
+
         cpu.mem_write(0xfe, rng.gen_range(1, 16));
 
         if read_screen_state(cpu, &mut screen_state) {
             texture.update(None, &screen_state, 32 * 3).unwrap();
+
             canvas.copy(&texture, None, None).unwrap();
+
             canvas.present();
         }
 
