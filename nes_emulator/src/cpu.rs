@@ -205,7 +205,7 @@ impl CPU {
 
         let result = sum as u8;
 
-        if (data ^ result) & (result & self.register_a) & 0x80 != 0 {
+        if (data ^ result) & (result ^ self.register_a) & 0x80 != 0 {
             self.status.insert(CpuFlags::OVERFLOW);
         } else {
             self.status.remove(CpuFlags::OVERFLOW);
@@ -222,7 +222,7 @@ impl CPU {
 
     fn stack_push(&mut self, data: u8) {
         self.mem_write((STACK as u16) + self.stack_pointer as u16, data);
-        self.stack_pointer = self.stack_pointer.wrapping_add(1)
+        self.stack_pointer = self.stack_pointer.wrapping_sub(1)
     }
 
     fn stack_push_u16(&mut self, data: u16) {
@@ -300,7 +300,7 @@ impl CPU {
             data = data | 1;
         }
         self.mem_write(addr, data);
-        self.update_zero_and_negative_flags(data);
+        self.update_negative_flags(data);
         data
     }
 
@@ -335,7 +335,7 @@ impl CPU {
             data = data | 0b10000000;
         }
         self.mem_write(addr, data);
-        self.update_zero_and_negative_flags(data);
+        self.update_negative_flags(data);
         data
     }
 
@@ -419,7 +419,7 @@ impl CPU {
     }
 
     fn clear_carry_flag(&mut self) {
-        self.status.insert(CpuFlags::CARRY)
+        self.status.remove(CpuFlags::CARRY)
     }
 
     pub fn load_and_run(&mut self, program: Vec<u8>) {
@@ -430,7 +430,7 @@ impl CPU {
 
     pub fn load(&mut self, program: Vec<u8>) {
         self.memory[0x8000..(0x8000 + program.len())].copy_from_slice(&program[..]);
-        self.mem_write_u16(0xFFFC, 0x8000);
+        self.mem_write_u16(0xFFFC, 0x0600);
     }
 
     fn inc(&mut self, mode: &AddressingMode) -> u8 {
@@ -530,12 +530,10 @@ impl CPU {
         let ref opcodes: HashMap<u8, &'static opcodes::OpCode> = *opcodes::OPCODES_MAP;
 
         loop {
-            callback(self);
             let code = self.mem_read(self.program_counter);
             self.program_counter += 1;
             let program_counter_state = self.program_counter;
-
-            let opcode = opcodes.get(&code).expect(&format!("OpCode {:x} DNE", code));
+            let opcode = opcodes.get(&code).unwrap();
 
             match code {
                 // LDA
@@ -544,7 +542,7 @@ impl CPU {
                 }
 
                 // STA
-                0x85 | 0x95 | 0x8d | 0x99 | 0x81 | 0x91 => {
+                0x85 | 0x95 | 0x8d | 0x9d | 0x99 | 0x81 | 0x91 => {
                     self.sta(&opcode.mode);
                 }
 
@@ -825,6 +823,7 @@ impl CPU {
             if program_counter_state == self.program_counter {
                 self.program_counter += (opcode.len - 1) as u16;
             }
+            callback(self);
         }
     }
 
@@ -835,10 +834,17 @@ impl CPU {
             self.status.remove(CpuFlags::ZERO);
         }
 
-        if result & 0b1000_0000 != 0 {
-            self.status.insert(CpuFlags::NEGATIV);
+        if result >> 7 == 1 {
+            self.status.insert(CpuFlags::NEGATIV)
         } else {
-            self.status.remove(CpuFlags::NEGATIV);
+            self.status.remove(CpuFlags::NEGATIV)
+        }
+    }
+    fn update_negative_flags(&mut self, result: u8) {
+        if result >> 7 == 1 {
+            self.status.insert(CpuFlags::NEGATIV)
+        } else {
+            self.status.remove(CpuFlags::NEGATIV)
         }
     }
 }
