@@ -7,12 +7,14 @@ const PPU_REGISTERS_MIRRORS_END: u16 = 0x3FFF;
 
 pub struct Bus {
     cpu_vram: [u8; 2048],
+    rom: Rom,
 }
 
 impl Bus {
-    pub fn new() -> Self {
+    pub fn new(rom: Rom) -> Self {
         Bus {
             cpu_vram: [0; 2048],
+            rom: rom,
         }
     }
 }
