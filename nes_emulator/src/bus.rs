@@ -1,3 +1,4 @@
+use crate::cartridge::Rom;
 use crate::cpu::Mem;
 
 const RAM: u16 = 0x0000;
@@ -17,6 +18,15 @@ impl Bus {
             rom: rom,
         }
     }
+
+    fn read_prg_rom(&self, mut addr: u16) -> u8 {
+        addr -= 0x8000;
+
+        if self.rom.prg_rom.len() == 0x4000 && addr >= 0x4000 {
+            addr = addr % 4000;
+        }
+        self.rom.prg_rom[addr as usize]
+    }
 }
 
 impl Mem for Bus {
@@ -30,6 +40,7 @@ impl Mem for Bus {
                 let _mirror_down_addr = addr & 0b00100000_00000111;
                 todo!("no ppu yet")
             }
+            0x8000..=0xFFFF => self.read_prg_rom(addr),
             _ => {
                 println!("Ignoring mem access at {}", addr);
                 0
@@ -46,6 +57,9 @@ impl Mem for Bus {
             PPU_REGISTERS..=PPU_REGISTERS_MIRRORS_END => {
                 let _mirror_down_addr = addr & 0b00100000_00000111;
                 todo!("no ppu yet :(");
+            }
+            0x8000..=0xFFFF => {
+                panic!("attempting to write to cartridge rom space")
             }
             _ => {
                 println!("Ignoring mem access at {}", addr);
