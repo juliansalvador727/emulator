@@ -1,4 +1,4 @@
-Progress
+## NES Emulator Progress
 - [x] 6502 CPU
 - [x] Bus
 - [x] Running Snake
