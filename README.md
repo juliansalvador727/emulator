@@ -1,0 +1,5 @@
+- [x] 6502 CPU
+- [x] Bus
+- [ ] Cartridge Support
+- [ ] PPU
+  - [ ] Scrolling
