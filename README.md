@@ -5,3 +5,7 @@
 - [x] Cartridge Support
 - [x] PPU
   - [x] Scrolling
+
+
+What's Next?
+Web support + audio.
