@@ -198,7 +198,7 @@ lazy_static! {
         OpCode::new(0xa9, "LDA", 2, 2, AddressingMode::Immediate),
         OpCode::new(0xa5, "LDA", 2, 3, AddressingMode::ZeroPage),
         OpCode::new(0xb5, "LDA", 2, 4, AddressingMode::ZeroPage_X),
-        OpCode::new(0xad, "LDA", 3, 4, AddressingMode::Immediate),
+        OpCode::new(0xad, "LDA", 3, 4, AddressingMode::Absolute),
         OpCode::new(0xbd, "LDA", 3, 4 /* +1 if page crossed */, AddressingMode::Absolute_X),
         OpCode::new(0xb9, "LDA", 3, 4 /* +1 if page crossed */, AddressingMode::Absolute_Y),
         OpCode::new(0xa1, "LDA", 2, 6, AddressingMode::Indirect_X),

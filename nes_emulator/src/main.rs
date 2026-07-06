@@ -15,6 +15,7 @@ use cartridge::Rom;
 use cpu::Mem;
 use cpu::CPU;
 use rand::Rng;
+use trace::trace;
 
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
@@ -89,8 +90,8 @@ fn handle_user_input(cpu: &mut CPU, event_pump: &mut EventPump) {
     }
 }
 
-// will need to make changes
-fn main() {
+// Runs the Snake game ROM with an SDL2 window (default).
+fn run_snake() {
     let sdl_context = sdl2::init().unwrap();
     let video_subsystem = sdl_context.video().unwrap();
     let window = video_subsystem
@@ -114,7 +115,6 @@ fn main() {
     let bus = Bus::new(rom);
     let mut cpu = CPU::new(bus);
     cpu.reset();
-    // cpu.program_counter = 0x0600;
 
     let mut screen_state = [0 as u8; 32 * 3 * 32];
     let mut rng = rand::thread_rng();
@@ -135,7 +135,28 @@ fn main() {
 
         std::thread::sleep(std::time::Duration::new(0, 70_000));
     });
+}
+
+// Runs the nestest ROM in automation mode, printing a CPU trace per instruction.
+// Redirect stdout to a file and diff against nestest.log to validate the CPU.
+fn run_nestest() {
+    let bytes: Vec<u8> = std::fs::read("nestest.nes").unwrap();
+    let rom = Rom::new(&bytes).unwrap();
+
+    let bus = Bus::new(rom);
+    let mut cpu = CPU::new(bus);
+    cpu.reset();
+    cpu.program_counter = 0xC000;
+
     cpu.run_with_callback(move |cpu| {
         println!("{}", trace(cpu));
     });
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(|s| s.as_str()) {
+        Some("nestest") => run_nestest(),
+        _ => run_snake(),
+    }
 }
