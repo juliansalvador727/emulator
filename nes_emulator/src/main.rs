@@ -2,6 +2,7 @@ pub mod bus;
 pub mod cartridge;
 pub mod cpu;
 pub mod opcodes;
+pub mod ppu;
 pub mod trace;
 
 #[macro_use]
@@ -36,7 +37,7 @@ fn color(byte: u8) -> Color {
         _ => sdl2::pixels::Color::CYAN,
     }
 }
-fn read_screen_state(cpu: &CPU, frame: &mut [u8; 32 * 3 * 32]) -> bool {
+fn read_screen_state(cpu: &mut CPU, frame: &mut [u8; 32 * 3 * 32]) -> bool {
     let mut frame_idx = 0;
     let mut update = false;
     for i in 0x0200..0x600 {
