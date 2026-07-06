@@ -2,14 +2,16 @@
 
 Following [bugzmanov/nes_ebook](https://github.com/bugzmanov/nes_ebook).
 
-**Current chapter: 5.1 (CPU trace / `nestest`) — complete. Next up: 6.1 (PPU).**
+**Current chapter: 6.1 (PPU registers) — complete. Next up: 6.2 (PPU clock + NMI interrupt).**
 
 - [x] 6502 CPU (all official opcodes)
 - [x] Bus
 - [x] Running Snake
 - [x] Cartridge Support (iNES format)
 - [x] CPU trace + `nestest` validation — matches the reference log for all 5003 legal opcodes
-- [ ] PPU  ← you are here (ch 6.1, `src/ppu.rs` is still empty)
+- [x] PPU registers (ch 6.1) — CTRL/MASK/STATUS/OAMADDR/OAMDATA/SCROLL/ADDR/DATA + OAM DMA, wired through the bus
+- [ ] PPU clock + NMI interrupt (ch 6.2)  ← you are here
+- [ ] Rendering CHR tiles (ch 6.3) / background (ch 6.4)
   - [ ] Scrolling
 - [ ] Unofficial/illegal opcodes (optional; needed to finish the rest of `nestest`)
 
