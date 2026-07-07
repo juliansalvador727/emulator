@@ -52,6 +52,9 @@ pub struct NesAPU {
     hp90: HighPassFilter,
     hp440: HighPassFilter,
     lp14k: LowPassFilter,
+
+    // TEMP: debug probe - log register writes to stderr.
+    pub trace_writes: bool,
 }
 
 impl NesAPU {
@@ -71,6 +74,7 @@ impl NesAPU {
             hp90: HighPassFilter::new(90.0, DEFAULT_SAMPLE_RATE as f32),
             hp440: HighPassFilter::new(440.0, DEFAULT_SAMPLE_RATE as f32),
             lp14k: LowPassFilter::new(14000.0, DEFAULT_SAMPLE_RATE as f32),
+            trace_writes: false,
         };
         apu.set_sample_rate(DEFAULT_SAMPLE_RATE);
         apu
@@ -86,6 +90,9 @@ impl NesAPU {
     }
 
     pub fn write_register(&mut self, addr: u16, data: u8) {
+        if self.trace_writes {
+            eprintln!("APUW {:04x}={:02x}", addr, data);
+        }
         match addr {
             0x4000 => self.pulse1.write_control(data),
             0x4001 => self.pulse1.write_sweep(data),

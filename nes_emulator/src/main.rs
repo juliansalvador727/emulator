@@ -5,6 +5,7 @@ pub mod cpu;
 pub mod joypad;
 pub mod opcodes;
 pub mod ppu;
+pub mod probe;
 pub mod render;
 pub mod trace;
 
@@ -198,6 +199,11 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
         Some("nestest") => run_nestest(),
+        Some("probe") => probe::run_probe(
+            args.get(2).expect("probe needs a ROM path"),
+            args.get(3).map(|s| s.as_str()).unwrap_or(""),
+            args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1800),
+        ),
         Some("tiles") => run_tiles(args.get(2).map(|s| s.as_str()).unwrap_or("nestest.nes")),
         Some(rom_path) => run_game(rom_path),
         None => run_game("games/pacman.nes"),
