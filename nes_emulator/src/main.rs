@@ -14,6 +14,7 @@ extern crate lazy_static;
 #[macro_use]
 extern crate bitflags;
 
+use apu::NesAPU;
 use bus::Bus;
 use cartridge::Rom;
 use cpu::CPU;
@@ -26,14 +27,15 @@ use trace::trace;
 
 use std::collections::HashMap;
 
+use sdl2::audio::{AudioQueue, AudioSpecDesired};
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 use sdl2::pixels::PixelFormatEnum;
 
 // Runs a game ROM, rendering the PPU background to an SDL2 window.
 // The bus fires the callback once per frame (at vblank); we render the
-// nametable into a Frame and blit it. Loads game.nes from the working dir.
-fn run_game() {
+// nametable into a Frame and blit it.
+fn run_game(rom_path: &str) {
     let sdl_context = sdl2::init().unwrap();
     let video_subsystem = sdl_context.video().unwrap();
     let window = video_subsystem
@@ -51,7 +53,25 @@ fn run_game() {
         .create_texture_target(PixelFormatEnum::RGB24, 256, 240)
         .unwrap();
 
-    let bytes: Vec<u8> = std::fs::read("game.nes").unwrap();
+    // Mono f32 queue for the APU output. Some hosts (e.g. WSL without a
+    // sound server) have no audio device; run silently in that case.
+    let audio_device: Option<AudioQueue<f32>> = sdl_context.audio().ok().and_then(|audio| {
+        let desired = AudioSpecDesired {
+            freq: Some(44100),
+            channels: Some(1),
+            samples: Some(1024),
+        };
+        audio.open_queue(None, &desired).ok()
+    });
+    let sample_rate = audio_device
+        .as_ref()
+        .map(|device| device.spec().freq as u32)
+        .unwrap_or(44100);
+    if let Some(device) = &audio_device {
+        device.resume();
+    }
+
+    let bytes: Vec<u8> = std::fs::read(rom_path).unwrap();
     let rom = Rom::new(&bytes).unwrap();
 
     let mut frame = Frame::new();
@@ -68,13 +88,23 @@ fn run_game() {
     key_map.insert(Keycode::S, JoypadButton::BUTTON_B);
 
     // Called by the bus at each vblank: draw the background, present it,
-    // and drain the SDL event queue (updating the joypad) so the window
-    // stays responsive.
-    let bus = Bus::new(rom, move |ppu: &NesPPU, joypad: &mut Joypad| {
+    // queue the frame's audio, and drain the SDL event queue (updating the
+    // joypad) so the window stays responsive.
+    let bus = Bus::new(rom, move |ppu: &NesPPU, apu: &mut NesAPU, joypad: &mut Joypad| {
         render::render(ppu, &mut frame);
         texture.update(None, &frame.data, 256 * 3).unwrap();
         canvas.copy(&texture, None, None).unwrap();
         canvas.present();
+
+        let samples = apu.drain_samples();
+        if let Some(device) = &audio_device {
+            // Cap the queue at ~1/4 s (size() is in bytes, 4 per f32
+            // sample) so audio latency can't grow without bound when the
+            // emulator outpaces the DAC.
+            if device.size() < sample_rate {
+                device.queue(&samples);
+            }
+        }
 
         for event in event_pump.poll_iter() {
             match event {
@@ -99,6 +129,7 @@ fn run_game() {
     });
 
     let mut cpu = CPU::new(bus);
+    cpu.bus.apu.set_sample_rate(sample_rate);
     cpu.reset();
     cpu.run();
 }
@@ -109,7 +140,7 @@ fn run_nestest() {
     let bytes: Vec<u8> = std::fs::read("nestest.nes").unwrap();
     let rom = Rom::new(&bytes).unwrap();
 
-    let bus = Bus::new(rom, |_, _| {});
+    let bus = Bus::new(rom, |_, _, _| {});
     let mut cpu = CPU::new(bus);
     cpu.reset();
     cpu.program_counter = 0xC000;
@@ -168,6 +199,7 @@ fn main() {
     match args.get(1).map(|s| s.as_str()) {
         Some("nestest") => run_nestest(),
         Some("tiles") => run_tiles(args.get(2).map(|s| s.as_str()).unwrap_or("nestest.nes")),
-        _ => run_game(),
+        Some(rom_path) => run_game(rom_path),
+        None => run_game("games/pacman.nes"),
     }
 }

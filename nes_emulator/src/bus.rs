@@ -1,3 +1,4 @@
+use crate::apu::NesAPU;
 use crate::cartridge::Rom;
 use crate::cpu::Mem;
 use crate::joypad::Joypad;
@@ -12,41 +13,64 @@ pub struct Bus<'call> {
     cpu_vram: [u8; 2048],
     prg_rom: Vec<u8>,
     ppu: NesPPU,
+    pub apu: NesAPU,
 
     cycles: usize,
-    gameloop_callback: Box<dyn FnMut(&NesPPU, &mut Joypad) + 'call>,
+    gameloop_callback: Box<dyn FnMut(&NesPPU, &mut NesAPU, &mut Joypad) + 'call>,
     joypad1: Joypad,
 }
 
 impl<'a> Bus<'a> {
     pub fn new<'call, F>(rom: Rom, gameloop_callback: F) -> Bus<'call>
     where
-        F: FnMut(&NesPPU, &mut Joypad) + 'call,
+        F: FnMut(&NesPPU, &mut NesAPU, &mut Joypad) + 'call,
     {
         let ppu = NesPPU::new(rom.chr_rom, rom.screen_mirroring);
         Bus {
             cpu_vram: [0; 2048],
             prg_rom: rom.prg_rom,
             ppu: ppu,
+            apu: NesAPU::new(),
             cycles: 0,
             gameloop_callback: Box::from(gameloop_callback),
             joypad1: Joypad::new(),
         }
     }
     pub fn tick(&mut self, cycles: u8) {
-        self.cycles += cycles as usize;
-
         let nmi_before = self.ppu.nmi_interrupt.is_some();
-        self.ppu.tick(cycles * 3);
-        let nmi_after = self.ppu.nmi_interrupt.is_some();
 
+        self.cycles += cycles as usize;
+        self.apu.tick(cycles);
+        self.ppu.tick(cycles * 3);
+
+        // DMC sample fetch: when the APU's memory reader wants a byte, the
+        // bus reads it and stalls the CPU. Hardware stalls 1-4 cycles
+        // depending on alignment (https://www.nesdev.org/wiki/DMA); we use
+        // the common case of 4 and keep the PPU and APU running through it.
+        // Servicing once per CPU instruction (rather than the moment the
+        // sample buffer empties) is at most a few cycles late.
+        while let Some(addr) = self.apu.dmc_dma_request() {
+            let value = self.mem_read(addr);
+            self.apu.dmc_dma_load(value);
+            self.cycles += 4;
+            self.apu.tick(4);
+            self.ppu.tick(12);
+        }
+
+        let nmi_after = self.ppu.nmi_interrupt.is_some();
         if !nmi_before && nmi_after {
-            (self.gameloop_callback)(&self.ppu, &mut self.joypad1);
+            (self.gameloop_callback)(&self.ppu, &mut self.apu, &mut self.joypad1);
         }
     }
 
     pub fn poll_nmi_status(&mut self) -> Option<u8> {
         self.ppu.poll_nmi_interrupt()
+    }
+
+    // The APU's IRQ line (frame counter or DMC). Level-triggered: stays
+    // asserted until the program acknowledges the flag on the APU side.
+    pub fn poll_irq_status(&self) -> bool {
+        self.apu.irq_pending()
     }
 
     fn read_prg_rom(&self, mut addr: u16) -> u8 {
@@ -78,6 +102,7 @@ impl Mem for Bus<'_> {
                 let mirror_down_addr = addr & 0b00100000_00000111;
                 self.mem_read(mirror_down_addr)
             }
+            0x4015 => self.apu.read_status(),
             0x4016 => self.joypad1.read(),
             0x8000..=0xFFFF => self.read_prg_rom(addr),
 
@@ -136,6 +161,13 @@ impl Mem for Bus<'_> {
                 self.ppu.write_oam_dma(&buffer);
             }
 
+            // APU registers ($4014 is OAM DMA above, $4016 the joypad below;
+            // reads of $4017 would be joypad 2, but writes go to the APU
+            // frame counter).
+            0x4000..=0x4013 | 0x4015 | 0x4017 => {
+                self.apu.write_register(addr, data);
+            }
+
             0x4016 => {
                 self.joypad1.write(data);
             }
@@ -146,5 +178,48 @@ impl Mem for Bus<'_> {
                 println!("Ignoring mem write-access at {}", addr);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::cartridge::test::test_rom;
+
+    fn test_bus<'a>() -> Bus<'a> {
+        Bus::new(test_rom(vec![]), |_, _, _| {})
+    }
+
+    #[test]
+    fn apu_registers_reachable_through_bus() {
+        let mut bus = test_bus();
+        bus.mem_write(0x4015, 0x01); // enable pulse 1
+        bus.mem_write(0x4003, 0x08); // load its length counter
+        assert_eq!(bus.mem_read(0x4015) & 0x01, 0x01);
+    }
+
+    #[test]
+    fn frame_irq_reaches_bus_irq_line_and_status_read_clears_it() {
+        let mut bus = test_bus();
+        // 4-step mode with IRQ enabled is the power-up default; one full
+        // sequence is 29830 CPU cycles.
+        for _ in 0..(29830 / 10) {
+            bus.tick(10);
+        }
+        assert!(bus.poll_irq_status());
+        assert_eq!(bus.mem_read(0x4015) & 0x40, 0x40);
+        assert!(!bus.poll_irq_status());
+    }
+
+    #[test]
+    fn dmc_dma_fetches_sample_bytes_from_prg_rom() {
+        let mut bus = test_bus();
+        // test_rom PRG is all zeroes; what matters here is that enabling
+        // the DMC drains bytes via DMA as the bus ticks.
+        bus.mem_write(0x4012, 0x00); // sample address $C000
+        bus.mem_write(0x4013, 0x00); // length 1 byte
+        bus.mem_write(0x4015, 0x10); // enable DMC
+        bus.tick(1); // services the fetch immediately
+        assert_eq!(bus.mem_read(0x4015) & 0x10, 0); // 0 bytes remaining
     }
 }

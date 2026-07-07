@@ -361,6 +361,21 @@ mod test {
     }
 
     #[test]
+    fn enabled_pulse_produces_audible_samples() {
+        let mut apu = NesAPU::new();
+        apu.write_register(0x4015, 0x01); // enable pulse 1
+        apu.write_register(0x4000, 0xbf); // duty 2, halt, constant volume 15
+        apu.write_register(0x4002, 0xfd); // timer low
+        apu.write_register(0x4003, 0x09); // timer hi 1 -> period 0x1fd (~219 Hz)
+        for _ in 0..29830 {
+            apu.tick(1);
+        }
+        let samples = apu.drain_samples();
+        assert!(!samples.is_empty());
+        assert!(samples.iter().any(|s| s.abs() > 0.01));
+    }
+
+    #[test]
     fn dc_output_decays_to_silence_through_filters() {
         // At power-up the triangle holds sequence value 15: a pure DC
         // level, since its sequencer is frozen by the zeroed linear

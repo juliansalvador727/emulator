@@ -563,6 +563,23 @@ impl<'a> CPU<'a> {
         self.program_counter = self.mem_read_u16(0xfffA);
     }
 
+    // Maskable interrupt (the APU frame counter and DMC assert it); same as
+    // NMI but through the $FFFE vector. The line is level-triggered, so the
+    // handler must acknowledge the source (e.g. read $4015) or it will fire
+    // again after RTI.
+    fn interrupt_irq(&mut self) {
+        self.stack_push_u16(self.program_counter);
+        let mut flag = self.status.clone();
+        flag.set(CpuFlags::BREAK, false);
+        flag.set(CpuFlags::BREAK2, true);
+
+        self.stack_push(flag.bits);
+        self.status.insert(CpuFlags::INTERRUPT_DISABLE);
+
+        self.bus.tick(2);
+        self.program_counter = self.mem_read_u16(0xfffE);
+    }
+
     pub fn run(&mut self) {
         self.run_with_callback(|_| {});
     }
@@ -577,6 +594,10 @@ impl<'a> CPU<'a> {
         loop {
             if let Some(_nmi) = self.bus.poll_nmi_status() {
                 self.interrupt_nmi();
+            }
+
+            if self.bus.poll_irq_status() && !self.status.contains(CpuFlags::INTERRUPT_DISABLE) {
+                self.interrupt_irq();
             }
 
             callback(self);
@@ -904,7 +925,7 @@ mod test {
 
     #[test]
     fn test_0xa9_lda_immediate_load_data() {
-        let bus = Bus::new(test::test_rom(vec![0xa9, 0x05, 0x00]), |_, _| {});
+        let bus = Bus::new(test::test_rom(vec![0xa9, 0x05, 0x00]), |_, _, _| {});
         let mut cpu = CPU::new(bus);
 
         cpu.run();
@@ -916,7 +937,7 @@ mod test {
 
     #[test]
     fn test_0xaa_tax_move_a_to_x() {
-        let bus = Bus::new(test::test_rom(vec![0xaa, 0x00]), |_, _| {});
+        let bus = Bus::new(test::test_rom(vec![0xaa, 0x00]), |_, _, _| {});
         let mut cpu = CPU::new(bus);
         cpu.register_a = 10;
 
@@ -927,7 +948,7 @@ mod test {
 
     #[test]
     fn test_5_ops_working_together() {
-        let bus = Bus::new(test::test_rom(vec![0xa9, 0xc0, 0xaa, 0xe8, 0x00]), |_, _| {});
+        let bus = Bus::new(test::test_rom(vec![0xa9, 0xc0, 0xaa, 0xe8, 0x00]), |_, _, _| {});
         let mut cpu = CPU::new(bus);
 
         cpu.run();
@@ -937,7 +958,7 @@ mod test {
 
     #[test]
     fn test_inx_overflow() {
-        let bus = Bus::new(test::test_rom(vec![0xe8, 0xe8, 0x00]), |_, _| {});
+        let bus = Bus::new(test::test_rom(vec![0xe8, 0xe8, 0x00]), |_, _, _| {});
         let mut cpu = CPU::new(bus);
         cpu.register_x = 0xff;
 
@@ -948,12 +969,41 @@ mod test {
 
     #[test]
     fn test_lda_from_memory() {
-        let bus = Bus::new(test::test_rom(vec![0xa5, 0x10, 0x00]), |_, _| {});
+        let bus = Bus::new(test::test_rom(vec![0xa5, 0x10, 0x00]), |_, _, _| {});
         let mut cpu = CPU::new(bus);
         cpu.mem_write(0x10, 0x55);
 
         cpu.run();
 
         assert_eq!(cpu.register_a, 0x55);
+    }
+
+    #[test]
+    fn test_irq_serviced_after_cli() {
+        // CLI enables interrupts; a pending APU IRQ (DMC flag forced here)
+        // then fires before the next instruction, vectoring through $FFFE
+        // (0x0000 in the zero-filled test ROM, where BRK ends run()).
+        let bus = Bus::new(test::test_rom(vec![0x58, 0xea, 0xea, 0x00]), |_, _, _| {});
+        let mut cpu = CPU::new(bus);
+        cpu.bus.apu.dmc.irq_flag = true;
+
+        cpu.run();
+
+        // The IRQ pushed PC and status (3 bytes) and jumped to 0x0000.
+        assert_eq!(cpu.stack_pointer, STACK_RESET - 3);
+        assert_eq!(cpu.program_counter, 0x0001);
+        assert!(cpu.status.contains(CpuFlags::INTERRUPT_DISABLE));
+    }
+
+    #[test]
+    fn test_irq_masked_by_interrupt_disable() {
+        // The power-up status has I set, so the pending IRQ must not fire.
+        let bus = Bus::new(test::test_rom(vec![0xea, 0x00]), |_, _, _| {});
+        let mut cpu = CPU::new(bus);
+        cpu.bus.apu.dmc.irq_flag = true;
+
+        cpu.run();
+
+        assert_eq!(cpu.stack_pointer, STACK_RESET);
     }
 }
