@@ -1,5 +1,6 @@
 use crate::cartridge::Rom;
 use crate::cpu::Mem;
+use crate::joypad::Joypad;
 use crate::ppu::NesPPU;
 
 const RAM: u16 = 0x0000;
@@ -13,13 +14,14 @@ pub struct Bus<'call> {
     ppu: NesPPU,
 
     cycles: usize,
-    gameloop_callback: Box<dyn FnMut(&NesPPU) + 'call>,
+    gameloop_callback: Box<dyn FnMut(&NesPPU, &mut Joypad) + 'call>,
+    joypad1: Joypad,
 }
 
 impl<'a> Bus<'a> {
     pub fn new<'call, F>(rom: Rom, gameloop_callback: F) -> Bus<'call>
     where
-        F: FnMut(&NesPPU) + 'call,
+        F: FnMut(&NesPPU, &mut Joypad) + 'call,
     {
         let ppu = NesPPU::new(rom.chr_rom, rom.screen_mirroring);
         Bus {
@@ -28,6 +30,7 @@ impl<'a> Bus<'a> {
             ppu: ppu,
             cycles: 0,
             gameloop_callback: Box::from(gameloop_callback),
+            joypad1: Joypad::new(),
         }
     }
     pub fn tick(&mut self, cycles: u8) {
@@ -38,7 +41,7 @@ impl<'a> Bus<'a> {
         let nmi_after = self.ppu.nmi_interrupt.is_some();
 
         if !nmi_before && nmi_after {
-            (self.gameloop_callback)(&self.ppu);
+            (self.gameloop_callback)(&self.ppu, &mut self.joypad1);
         }
     }
 
@@ -75,6 +78,7 @@ impl Mem for Bus<'_> {
                 let mirror_down_addr = addr & 0b00100000_00000111;
                 self.mem_read(mirror_down_addr)
             }
+            0x4016 => self.joypad1.read(),
             0x8000..=0xFFFF => self.read_prg_rom(addr),
 
             _ => {
@@ -130,6 +134,10 @@ impl Mem for Bus<'_> {
                     buffer[i as usize] = self.mem_read(hi + i);
                 }
                 self.ppu.write_oam_dma(&buffer);
+            }
+
+            0x4016 => {
+                self.joypad1.write(data);
             }
 
             0x8000..=0xFFFF => panic!("Attempt to write to Cartridge ROM space: {:x}", addr),

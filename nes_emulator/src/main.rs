@@ -1,6 +1,7 @@
 pub mod bus;
 pub mod cartridge;
 pub mod cpu;
+pub mod joypad;
 pub mod opcodes;
 pub mod ppu;
 pub mod render;
@@ -15,10 +16,14 @@ extern crate bitflags;
 use bus::Bus;
 use cartridge::Rom;
 use cpu::CPU;
+use joypad::Joypad;
+use joypad::JoypadButton;
 use ppu::NesPPU;
 use render::frame::Frame;
 use render::show_tile;
 use trace::trace;
+
+use std::collections::HashMap;
 
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
@@ -50,9 +55,21 @@ fn run_game() {
 
     let mut frame = Frame::new();
 
+    // Keyboard -> NES controller button mapping.
+    let mut key_map = HashMap::new();
+    key_map.insert(Keycode::Down, JoypadButton::DOWN);
+    key_map.insert(Keycode::Up, JoypadButton::UP);
+    key_map.insert(Keycode::Right, JoypadButton::RIGHT);
+    key_map.insert(Keycode::Left, JoypadButton::LEFT);
+    key_map.insert(Keycode::Space, JoypadButton::SELECT);
+    key_map.insert(Keycode::Return, JoypadButton::START);
+    key_map.insert(Keycode::A, JoypadButton::BUTTON_A);
+    key_map.insert(Keycode::S, JoypadButton::BUTTON_B);
+
     // Called by the bus at each vblank: draw the background, present it,
-    // and drain the SDL event queue so the window stays responsive.
-    let bus = Bus::new(rom, move |ppu: &NesPPU| {
+    // and drain the SDL event queue (updating the joypad) so the window
+    // stays responsive.
+    let bus = Bus::new(rom, move |ppu: &NesPPU, joypad: &mut Joypad| {
         render::render(ppu, &mut frame);
         texture.update(None, &frame.data, 256 * 3).unwrap();
         canvas.copy(&texture, None, None).unwrap();
@@ -65,6 +82,16 @@ fn run_game() {
                     keycode: Some(Keycode::Escape),
                     ..
                 } => std::process::exit(0),
+                Event::KeyDown { keycode, .. } => {
+                    if let Some(button) = keycode.and_then(|k| key_map.get(&k)) {
+                        joypad.set_button_pressed_status(*button, true);
+                    }
+                }
+                Event::KeyUp { keycode, .. } => {
+                    if let Some(button) = keycode.and_then(|k| key_map.get(&k)) {
+                        joypad.set_button_pressed_status(*button, false);
+                    }
+                }
                 _ => { /* do nothing */ }
             }
         }
@@ -81,7 +108,7 @@ fn run_nestest() {
     let bytes: Vec<u8> = std::fs::read("nestest.nes").unwrap();
     let rom = Rom::new(&bytes).unwrap();
 
-    let bus = Bus::new(rom, |_| {});
+    let bus = Bus::new(rom, |_, _| {});
     let mut cpu = CPU::new(bus);
     cpu.reset();
     cpu.program_counter = 0xC000;

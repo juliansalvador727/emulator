@@ -23,7 +23,7 @@ pub fn render(ppu: &NesPPU, frame: &mut Frame) {
             let mut lower = tile[y + 8];
 
             for x in (0..=7).rev() {
-                let value = (1 & upper) << 1 | (1 & lower);
+                let value = (1 & lower) << 1 | (1 & upper);
                 upper = upper >> 1;
                 lower = lower >> 1;
                 let rgb = match value {
@@ -37,6 +37,57 @@ pub fn render(ppu: &NesPPU, frame: &mut Frame) {
             }
         }
     }
+
+    // Draw sprites from OAM (64 entries of 4 bytes: y, tile, attr, x).
+    // Iterate in reverse so lower-index sprites draw on top.
+    for i in (0..ppu.oam_data.len()).step_by(4).rev() {
+        let tile_idx = ppu.oam_data[i + 1] as u16;
+        let tile_x = ppu.oam_data[i + 3] as usize;
+        let tile_y = ppu.oam_data[i] as usize;
+
+        let flip_vertical = ppu.oam_data[i + 2] >> 7 & 1 == 1;
+        let flip_horizontal = ppu.oam_data[i + 2] >> 6 & 1 == 1;
+        let palette_idx = ppu.oam_data[i + 2] & 0b11;
+        let sprite_palette = sprite_palette(ppu, palette_idx);
+
+        let bank: u16 = ppu.ctrl.sprt_pattern_addr();
+        let tile =
+            &ppu.chr_rom[(bank + tile_idx * 16) as usize..=(bank + tile_idx * 16 + 15) as usize];
+
+        for y in 0..=7 {
+            let mut upper = tile[y];
+            let mut lower = tile[y + 8];
+            'next: for x in (0..=7).rev() {
+                let value = (1 & lower) << 1 | (1 & upper);
+                upper = upper >> 1;
+                lower = lower >> 1;
+                let rgb = match value {
+                    0 => continue 'next, // color 0 is transparent for sprites
+                    1 => palette::SYSTEM_PALLETE[sprite_palette[1] as usize],
+                    2 => palette::SYSTEM_PALLETE[sprite_palette[2] as usize],
+                    3 => palette::SYSTEM_PALLETE[sprite_palette[3] as usize],
+                    _ => panic!("impossible"),
+                };
+                match (flip_horizontal, flip_vertical) {
+                    (false, false) => frame.set_pixel(tile_x + x, tile_y + y, rgb),
+                    (true, false) => frame.set_pixel(tile_x + 7 - x, tile_y + y, rgb),
+                    (false, true) => frame.set_pixel(tile_x + x, tile_y + 7 - y, rgb),
+                    (true, true) => frame.set_pixel(tile_x + 7 - x, tile_y + 7 - y, rgb),
+                }
+            }
+        }
+    }
+}
+
+// Sprite palettes live at $3F11.. in palette_table (index 0 is transparent).
+fn sprite_palette(ppu: &NesPPU, palette_idx: u8) -> [u8; 4] {
+    let start = 0x11 + (palette_idx * 4) as usize;
+    [
+        0,
+        ppu.palette_table[start],
+        ppu.palette_table[start + 1],
+        ppu.palette_table[start + 2],
+    ]
 }
 
 fn bg_palette(ppu: &NesPPU, tile_column: usize, tile_row: usize) -> [u8; 4] {
@@ -107,6 +158,35 @@ mod test {
 
         assert_eq!(frame.data.len(), 256 * 240 * 3);
         assert!(frame.data.iter().any(|&b| b != 0), "render wrote no pixels");
+    }
+
+    #[test]
+    fn render_draws_a_sprite_over_the_background() {
+        // Tile 1 = fully solid (value 3 everywhere): both bitplanes all-ones.
+        let mut chr = vec![0u8; 0x2000];
+        for b in 16..32 {
+            chr[b] = 0xFF;
+        }
+        let mut ppu = NesPPU::new(chr, Mirroring::Horizontal);
+
+        // Sprite palette 0, color 3 -> palette_table[0x13].
+        ppu.palette_table[0x13] = 0x30;
+        // OAM sprite 0: y=50, tile=1, attr=0 (palette 0, no flip), x=60.
+        ppu.oam_data[0] = 50;
+        ppu.oam_data[1] = 1;
+        ppu.oam_data[2] = 0;
+        ppu.oam_data[3] = 60;
+
+        let mut frame = Frame::new();
+        render(&ppu, &mut frame);
+
+        // A pixel inside the 8x8 sprite should carry the sprite's color.
+        let (px, py) = (63usize, 53usize);
+        let base = py * 3 * 256 + px * 3;
+        assert_eq!(
+            (frame.data[base], frame.data[base + 1], frame.data[base + 2]),
+            palette::SYSTEM_PALLETE[0x30]
+        );
     }
 
     #[test]

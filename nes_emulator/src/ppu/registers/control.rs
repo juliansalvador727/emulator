@@ -53,6 +53,14 @@ impl ControlRegister {
         }
     }
 
+    pub fn sprt_pattern_addr(&self) -> u16 {
+        if !self.contains(ControlRegister::SPRITE_PATTERN_ADDR) {
+            0
+        } else {
+            0x1000
+        }
+    }
+
     pub fn update(&mut self, data: u8) {
         self.bits = data;
     }
