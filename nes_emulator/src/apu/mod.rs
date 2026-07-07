@@ -3,3 +3,4 @@
 pub mod envelope;
 pub mod frame_counter;
 pub mod length_counter;
+pub mod pulse;
