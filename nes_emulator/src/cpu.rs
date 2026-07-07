@@ -54,14 +54,14 @@ pub enum AddressingMode {
     NoneAddressing,
 }
 
-pub struct CPU {
+pub struct CPU<'a> {
     pub register_a: u8,
     pub register_x: u8,
     pub register_y: u8,
     pub status: CpuFlags,
     pub program_counter: u16,
     pub stack_pointer: u8,
-    pub bus: Bus,
+    pub bus: Bus<'a>,
 }
 
 pub trait Mem {
@@ -83,7 +83,7 @@ pub trait Mem {
     }
 }
 
-impl Mem for CPU {
+impl Mem for CPU<'_> {
     fn mem_read(&mut self, addr: u16) -> u8 {
         self.bus.mem_read(addr)
     }
@@ -100,8 +100,8 @@ impl Mem for CPU {
     }
 }
 
-impl CPU {
-    pub fn new(bus: Bus) -> Self {
+impl<'a> CPU<'a> {
+    pub fn new(bus: Bus<'a>) -> Self {
         CPU {
             register_a: 0,
             register_x: 0,
@@ -904,7 +904,7 @@ mod test {
 
     #[test]
     fn test_0xa9_lda_immediate_load_data() {
-        let bus = Bus::new(test::test_rom(vec![0xa9, 0x05, 0x00]));
+        let bus = Bus::new(test::test_rom(vec![0xa9, 0x05, 0x00]), |_| {});
         let mut cpu = CPU::new(bus);
 
         cpu.run();
@@ -916,7 +916,7 @@ mod test {
 
     #[test]
     fn test_0xaa_tax_move_a_to_x() {
-        let bus = Bus::new(test::test_rom(vec![0xaa, 0x00]));
+        let bus = Bus::new(test::test_rom(vec![0xaa, 0x00]), |_| {});
         let mut cpu = CPU::new(bus);
         cpu.register_a = 10;
 
@@ -927,7 +927,7 @@ mod test {
 
     #[test]
     fn test_5_ops_working_together() {
-        let bus = Bus::new(test::test_rom(vec![0xa9, 0xc0, 0xaa, 0xe8, 0x00]));
+        let bus = Bus::new(test::test_rom(vec![0xa9, 0xc0, 0xaa, 0xe8, 0x00]), |_| {});
         let mut cpu = CPU::new(bus);
 
         cpu.run();
@@ -937,7 +937,7 @@ mod test {
 
     #[test]
     fn test_inx_overflow() {
-        let bus = Bus::new(test::test_rom(vec![0xe8, 0xe8, 0x00]));
+        let bus = Bus::new(test::test_rom(vec![0xe8, 0xe8, 0x00]), |_| {});
         let mut cpu = CPU::new(bus);
         cpu.register_x = 0xff;
 
@@ -948,7 +948,7 @@ mod test {
 
     #[test]
     fn test_lda_from_memory() {
-        let bus = Bus::new(test::test_rom(vec![0xa5, 0x10, 0x00]));
+        let bus = Bus::new(test::test_rom(vec![0xa5, 0x10, 0x00]), |_| {});
         let mut cpu = CPU::new(bus);
         cpu.mem_write(0x10, 0x55);
 

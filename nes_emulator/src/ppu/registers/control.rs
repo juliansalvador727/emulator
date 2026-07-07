@@ -45,6 +45,14 @@ impl ControlRegister {
         self.contains(ControlRegister::GENERATE_NMI)
     }
 
+    pub fn bknd_pattern_addr(&self) -> u16 {
+        if !self.contains(ControlRegister::BACKROUND_PATTERN_ADDR) {
+            0
+        } else {
+            0x1000
+        }
+    }
+
     pub fn update(&mut self, data: u8) {
         self.bits = data;
     }
