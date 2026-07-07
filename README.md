@@ -17,7 +17,7 @@ Following [bugzmanov/nes_ebook](https://github.com/bugzmanov/nes_ebook).
   - [x] Joypad input — `Joypad` wired into the bus at `$4016`; keyboard mapped in `run_game`
   - [ ] Sprite rendering — draw `oam_data` on top of the background in `render::render`
   - [ ] Scrolling (ch8) — SMB1
-- [x] APU (per [NESDev](https://www.nesdev.org/wiki/APU), not the ebook) — all five channels (pulse ×2, triangle, noise, DMC) in `src/apu/`, ticked per CPU cycle from the bus; frame counter with IRQ, DMC DMA with CPU stall, non-linear mixer + 90/440 Hz high-pass and 14 kHz low-pass filters, downsampled into an SDL2 `AudioQueue`. Frame-counter/DMC IRQs vector through `$FFFE` (CPU IRQ support added alongside)
+- [x] APU (per [NESDev](https://www.nesdev.org/wiki/APU), not the ebook) — all five channels (pulse ×2, triangle, noise, DMC) in `src/apu/`, ticked per CPU cycle from the bus; frame counter with IRQ, DMC DMA with CPU stall, non-linear mixer + 90/440 Hz high-pass and 14 kHz low-pass filters, downsampled into an SDL2 `AudioQueue`. Frame-counter/DMC IRQs vector through `$FFFE` (CPU IRQ support added alongside). The game loop is paced by the audio queue (the DAC is the master clock), not vsync, so game speed and pitch stay exact and latency stays at ~70 ms
 - [ ] Unofficial/illegal opcodes (optional; needed to finish the rest of `nestest`)
 
 ## Commands

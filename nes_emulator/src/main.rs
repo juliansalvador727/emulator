@@ -45,7 +45,12 @@ fn run_game(rom_path: &str) {
         .build()
         .unwrap();
 
-    let mut canvas = window.into_canvas().present_vsync().build().unwrap();
+    // No present_vsync: the emulator is paced by the audio queue below (or a
+    // frame timer when there's no audio device). Pacing by vsync instead
+    // would tie the game speed to the display's refresh rate, which never
+    // quite matches the NES's 60.0988 fps - the mismatch slowly drains or
+    // overfills the audio queue until the sound breaks up.
+    let mut canvas = window.into_canvas().build().unwrap();
     let mut event_pump = sdl_context.event_pump().unwrap();
     canvas.set_scale(3.0, 3.0).unwrap();
 
@@ -88,9 +93,19 @@ fn run_game(rom_path: &str) {
     key_map.insert(Keycode::A, JoypadButton::BUTTON_A);
     key_map.insert(Keycode::S, JoypadButton::BUTTON_B);
 
+    // Audio-clock pacing: keep ~67 ms of audio queued (in bytes; 4 per f32
+    // sample). The DAC drains the queue at exactly the sample rate, so
+    // sleeping until the backlog falls back to this target locks emulation
+    // to real time and bounds audio latency, with no samples ever dropped.
+    let target_queued_bytes = sample_rate / 15 * 4;
+    // Fallback pacing when there is no audio device: one NTSC NES frame
+    // (29780.5 CPU cycles) is 1/60.0988 s.
+    let frame_duration = std::time::Duration::from_nanos(16_639_267);
+    let mut next_frame = std::time::Instant::now();
+
     // Called by the bus at each vblank: draw the background, present it,
-    // queue the frame's audio, and drain the SDL event queue (updating the
-    // joypad) so the window stays responsive.
+    // queue the frame's audio, pace the loop, and drain the SDL event queue
+    // (updating the joypad) so the window stays responsive.
     let bus = Bus::new(rom, move |ppu: &NesPPU, apu: &mut NesAPU, joypad: &mut Joypad| {
         render::render(ppu, &mut frame);
         texture.update(None, &frame.data, 256 * 3).unwrap();
@@ -99,11 +114,28 @@ fn run_game(rom_path: &str) {
 
         let samples = apu.drain_samples();
         if let Some(device) = &audio_device {
-            // Cap the queue at ~1/4 s (size() is in bytes, 4 per f32
-            // sample) so audio latency can't grow without bound when the
-            // emulator outpaces the DAC.
-            if device.size() < sample_rate {
-                device.queue(&samples);
+            device.queue(&samples);
+            // Sleep off the surplus. If the host sink stalls (size() stops
+            // shrinking), bail out after ~250 ms and drop the backlog so the
+            // game doesn't hang and latency can't accumulate.
+            let mut waited_ms = 0;
+            while device.size() > target_queued_bytes {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                waited_ms += 1;
+                if waited_ms > 250 {
+                    device.clear();
+                    break;
+                }
+            }
+        } else {
+            next_frame += frame_duration;
+            let now = std::time::Instant::now();
+            if now < next_frame {
+                std::thread::sleep(next_frame - now);
+            } else {
+                // Fell behind (e.g. the window was dragged); resync rather
+                // than fast-forwarding to catch up.
+                next_frame = now;
             }
         }
 
