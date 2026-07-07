@@ -34,7 +34,12 @@ impl NesPPU {
             mirroring: mirroring,
             vram: [0; 2048],
             oam_data: [0; 64 * 4],
-            palette_table: [0; 32],
+            // Power-on palette RAM as NES black ($0F) rather than $00 (a visible
+            // gray). Games that only initialize the background palettes leave the
+            // sprite palettes ($3F11..) untouched; with a $00 default any unused
+            // sprite (e.g. Pac-Man clears OAM to tile 0 at 0,0 on the title
+            // screen) would render as a gray block. $0F keeps those invisible.
+            palette_table: [0x0F; 32],
             addr: AddrRegister::new(),
             ctrl: ControlRegister::new(),
             mask: MaskRegister::new(),
@@ -51,11 +56,16 @@ impl NesPPU {
     pub fn tick(&mut self, cycles: u8) -> bool {
         self.cycles += cycles as usize;
         if self.cycles >= 341 {
+            if self.is_sprite_0_hit(self.cycles) {
+                self.status.set_sprite_zero_hit(true);
+            }
+
             self.cycles = self.cycles - 341;
             self.scanline += 1;
 
             if self.scanline == 241 {
                 self.status.set_vblank_status(true);
+                self.status.set_sprite_zero_hit(false);
                 if self.ctrl.generate_vblank_nmi() {
                     self.nmi_interrupt = Some(1);
                 }
@@ -64,11 +74,19 @@ impl NesPPU {
             if self.scanline >= 262 {
                 self.scanline = 0;
                 self.nmi_interrupt = None;
+                self.status.set_sprite_zero_hit(false);
                 self.status.reset_vblank_status();
                 return true;
             }
         }
         return false;
+    }
+
+    fn is_sprite_0_hit(&self, cycle: usize) -> bool {
+        let y = self.oam_data[0] as usize;
+        let x = self.oam_data[3] as usize;
+
+        (y == self.scanline as usize) && x <= cycle && self.mask.show_sprites()
     }
 
     pub fn poll_nmi_interrupt(&mut self) -> Option<u8> {

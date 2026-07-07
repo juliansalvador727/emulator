@@ -61,6 +61,17 @@ impl ControlRegister {
         }
     }
 
+    // Base nametable address selected by the low two control bits.
+    pub fn nametable_addr(&self) -> u16 {
+        match self.bits & 0b11 {
+            0 => 0x2000,
+            1 => 0x2400,
+            2 => 0x2800,
+            3 => 0x2C00,
+            _ => unreachable!(),
+        }
+    }
+
     pub fn update(&mut self, data: u8) {
         self.bits = data;
     }
