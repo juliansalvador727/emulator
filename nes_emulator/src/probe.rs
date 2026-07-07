@@ -1,17 +1,50 @@
-// TEMP: headless audio debug probe.
+// Headless audio debug probe.
 //
-// Runs a ROM with scripted joypad input and logs, per frame, the RMS/peak of
-// the APU's sample output plus each channel's length counter state, to
-// stderr. Combined with NesAPU::trace_writes this gives a timeline of what
-// the game wrote and when the audio died.
+// Runs a ROM with scripted joypad input and logs to stderr, per frame, the
+// RMS/peak of the APU's sample output and each channel's length counter
+// state, interleaved with every APU register write (NesAPU::trace_writes) -
+// a timeline of what the game wrote and what came out of the mixer.
 //
 // Usage: cargo run --release -- probe <rom> "<button@from-to,...>" <frames>
 // e.g.   cargo run --release -- probe games/mario.nes "start@120-135,right@350-" 2100
+//
+// Set PROBE_SHOTS=<dir> (and optionally PROBE_SHOT_EVERY=<n>, default 50) to
+// also dump a BMP screenshot every n frames, to see what the game was doing.
 
 use crate::bus::Bus;
 use crate::cartridge::Rom;
 use crate::cpu::CPU;
 use crate::joypad::JoypadButton;
+use crate::render;
+use crate::render::frame::Frame;
+
+// Minimal 24-bit BMP writer so screenshots need no external crates.
+fn write_bmp(path: &str, frame: &Frame) {
+    let (w, h) = (256usize, 240usize);
+    let row = (w * 3 + 3) & !3;
+    let size = 54 + row * h;
+    let mut out = Vec::with_capacity(size);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&(size as u32).to_le_bytes());
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&54u32.to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&(w as i32).to_le_bytes());
+    out.extend_from_slice(&(h as i32).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&24u16.to_le_bytes());
+    out.extend_from_slice(&[0; 24]);
+    for y in (0..h).rev() {
+        for x in 0..w {
+            let i = (y * w + x) * 3;
+            out.push(frame.data[i + 2]);
+            out.push(frame.data[i + 1]);
+            out.push(frame.data[i]);
+        }
+        out.resize(out.len() + (row - w * 3), 0);
+    }
+    std::fs::write(path, out).unwrap();
+}
 
 struct Press {
     button: JoypadButton,
@@ -55,9 +88,22 @@ pub fn run_probe(rom_path: &str, script: &str, max_frames: u32) {
     let bytes: Vec<u8> = std::fs::read(rom_path).unwrap();
     let rom = Rom::new(&bytes).unwrap();
 
+    let shot_dir = std::env::var("PROBE_SHOTS").ok();
+    let shot_every: u32 = std::env::var("PROBE_SHOT_EVERY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
+    let mut shot_frame = Frame::new();
+
     let mut frame_no: u32 = 0;
-    let bus = Bus::new(rom, move |_ppu, apu, joypad| {
+    let bus = Bus::new(rom, move |ppu, apu, joypad| {
         frame_no += 1;
+        if let Some(dir) = &shot_dir {
+            if frame_no % shot_every == 0 {
+                render::render(ppu, &mut shot_frame);
+                write_bmp(&format!("{}/f{:05}.bmp", dir, frame_no), &shot_frame);
+            }
+        }
         for p in &presses {
             joypad.set_button_pressed_status(p.button, frame_no >= p.from && frame_no <= p.to);
         }

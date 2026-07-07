@@ -41,6 +41,11 @@ cargo run -- games/mario.nes     # or any ROM path
 # Dump the CPU trace while running nestest (the ch 5.1 deliverable)
 cargo run -- nestest
 
+# Headless audio debug probe: run a ROM with scripted joypad input, logging
+# every APU register write and per-frame output RMS + channel state to
+# stderr. PROBE_SHOTS=<dir> additionally dumps BMP screenshots.
+cargo run --release -- probe games/mario.nes "start@120-135,right@350-" 2100 2>probe.log
+
 # View a CHR tile in a window (the ch 6.3 deliverable).
 # Optional ROM filename (must have CHR ROM); defaults to nestest.nes.
 # Esc or window-close to quit.

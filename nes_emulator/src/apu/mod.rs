@@ -53,7 +53,8 @@ pub struct NesAPU {
     hp440: HighPassFilter,
     lp14k: LowPassFilter,
 
-    // TEMP: debug probe - log register writes to stderr.
+    // Debug aid (used by the `probe` subcommand): log every register write
+    // to stderr as `APUW addr=value`.
     pub trace_writes: bool,
 }
 
