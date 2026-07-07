@@ -3,6 +3,7 @@ pub mod cartridge;
 pub mod cpu;
 pub mod opcodes;
 pub mod ppu;
+pub mod render;
 pub mod trace;
 
 #[macro_use]
@@ -16,6 +17,7 @@ use cartridge::Rom;
 use cpu::Mem;
 use cpu::CPU;
 use rand::Rng;
+use render::show_tile;
 use trace::trace;
 
 use sdl2::event::Event;
@@ -154,10 +156,55 @@ fn run_nestest() {
     });
 }
 
+// Renders a single CHR tile to an SDL2 window (the ch6.3 deliverable).
+// Pass any iNES ROM that ships CHR ROM (e.g. pacman.nes); defaults to
+// nestest.nes. snake.nes has 0 bytes of CHR and will panic.
+fn run_tiles(rom_path: &str) {
+    let sdl_context = sdl2::init().unwrap();
+    let video_subsystem = sdl_context.video().unwrap();
+    let window = video_subsystem
+        .window("Tile viewer", (256.0 * 3.0) as u32, (240.0 * 3.0) as u32)
+        .position_centered()
+        .build()
+        .unwrap();
+
+    let mut canvas = window.into_canvas().present_vsync().build().unwrap();
+    let mut event_pump = sdl_context.event_pump().unwrap();
+    canvas.set_scale(3.0, 3.0).unwrap();
+
+    let creator = canvas.texture_creator();
+    let mut texture = creator
+        .create_texture_target(PixelFormatEnum::RGB24, 256, 240)
+        .unwrap();
+
+    let bytes: Vec<u8> = std::fs::read(rom_path).unwrap();
+    let rom = Rom::new(&bytes).unwrap();
+
+    let tile_frame = show_tile(&rom.chr_rom, 1, 0);
+
+    texture.update(None, &tile_frame.data, 256 * 3).unwrap();
+    canvas.copy(&texture, None, None).unwrap();
+    canvas.present();
+
+    loop {
+        for event in event_pump.poll_iter() {
+            match event {
+                Event::Quit { .. }
+                | Event::KeyDown {
+                    keycode: Some(Keycode::Escape),
+                    ..
+                } => std::process::exit(0),
+                _ => { /* do nothing */ }
+            }
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
         Some("nestest") => run_nestest(),
+        Some("tiles") => run_tiles(args.get(2).map(|s| s.as_str()).unwrap_or("nestest.nes")),
         _ => run_snake(),
     }
 }
