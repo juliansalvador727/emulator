@@ -2,7 +2,7 @@
 
 Following [bugzmanov/nes_ebook](https://github.com/bugzmanov/nes_ebook).
 
-**Current chapter: 6.1 (PPU registers) — complete. Next up: 6.2 (PPU clock + NMI interrupt).**
+**Current chapter: 6.2 (PPU clock + NMI interrupt) — complete. Next up: 6.3 (rendering CHR tiles).**
 
 - [x] 6502 CPU (all official opcodes)
 - [x] Bus
@@ -10,8 +10,8 @@ Following [bugzmanov/nes_ebook](https://github.com/bugzmanov/nes_ebook).
 - [x] Cartridge Support (iNES format)
 - [x] CPU trace + `nestest` validation — matches the reference log for all 5003 legal opcodes
 - [x] PPU registers (ch 6.1) — CTRL/MASK/STATUS/OAMADDR/OAMDATA/SCROLL/ADDR/DATA + OAM DMA, wired through the bus
-- [ ] PPU clock + NMI interrupt (ch 6.2)  ← you are here
-- [ ] Rendering CHR tiles (ch 6.3) / background (ch 6.4)
+- [x] PPU clock + NMI interrupt (ch 6.2) — `ppu.tick()` runs 3× per CPU cycle, raises vblank NMI at scanline 241, CPU services it via the $FFFA vector
+- [ ] Rendering CHR tiles (ch 6.3) / background (ch 6.4)  ← you are here
   - [ ] Scrolling
 - [ ] Unofficial/illegal opcodes (optional; needed to finish the rest of `nestest`)
 

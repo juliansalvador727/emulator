@@ -550,6 +550,19 @@ impl CPU {
         }
     }
 
+    fn interrupt_nmi(&mut self) {
+        self.stack_push_u16(self.program_counter);
+        let mut flag = self.status.clone();
+        flag.set(CpuFlags::BREAK, false);
+        flag.set(CpuFlags::BREAK2, true);
+
+        self.stack_push(flag.bits);
+        self.status.insert(CpuFlags::INTERRUPT_DISABLE);
+
+        self.bus.tick(2);
+        self.program_counter = self.mem_read_u16(0xfffA);
+    }
+
     pub fn run(&mut self) {
         self.run_with_callback(|_| {});
     }
@@ -562,6 +575,10 @@ impl CPU {
         let ref opcodes: HashMap<u8, &'static opcodes::OpCode> = *opcodes::OPCODES_MAP;
 
         loop {
+            if let Some(_nmi) = self.bus.poll_nmi_status() {
+                self.interrupt_nmi();
+            }
+
             callback(self);
 
             let code = self.mem_read(self.program_counter);
@@ -849,6 +866,7 @@ impl CPU {
                 0x00 => return,
                 _ => todo!(),
             }
+            self.bus.tick(opcode.cycles);
 
             if program_counter_state == self.program_counter {
                 self.program_counter += (opcode.len - 1) as u16;

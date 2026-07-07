@@ -14,6 +14,10 @@ pub struct NesPPU {
     pub scroll: ScrollRegister,
     pub oam_addr: u8,
     internal_data_buf: u8,
+
+    scanline: u16,
+    cycles: usize,
+    pub nmi_interrupt: Option<u8>,
 }
 
 impl NesPPU {
@@ -31,7 +35,37 @@ impl NesPPU {
             scroll: ScrollRegister::new(),
             oam_addr: 0,
             internal_data_buf: 0,
+            scanline: 0,
+            cycles: 0,
+            nmi_interrupt: None,
         }
+    }
+
+    pub fn tick(&mut self, cycles: u8) -> bool {
+        self.cycles += cycles as usize;
+        if self.cycles >= 341 {
+            self.cycles = self.cycles - 341;
+            self.scanline += 1;
+
+            if self.scanline == 241 {
+                self.status.set_vblank_status(true);
+                if self.ctrl.generate_vblank_nmi() {
+                    self.nmi_interrupt = Some(1);
+                }
+            }
+
+            if self.scanline >= 262 {
+                self.scanline = 0;
+                self.nmi_interrupt = None;
+                self.status.reset_vblank_status();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn poll_nmi_interrupt(&mut self) -> Option<u8> {
+        self.nmi_interrupt.take()
     }
 
     pub fn new_empty_rom() -> Self {
@@ -247,6 +281,10 @@ impl ControlRegister {
         } else {
             32
         }
+    }
+
+    pub fn generate_vblank_nmi(&self) -> bool {
+        self.contains(ControlRegister::GENERATE_NMI)
     }
 
     pub fn update(&mut self, data: u8) {
