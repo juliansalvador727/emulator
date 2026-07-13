@@ -1,61 +1,113 @@
-## NES Emulator Progress
+# Rust NES Emulator
 
-Following [bugzmanov/nes_ebook](https://github.com/bugzmanov/nes_ebook).
+A playable NES emulator written in Rust. It currently combines a complete
+official 6502 instruction set with dot-timed PPU state transitions, scanline
+composition, mapper-controlled banking and IRQs, controller input, and
+five-channel audio.
 
-**Current chapter: 6.4 (rendering the background) — complete. Next up: ch7 (sprites + joypad → playable games).**
+The emulator is NTSC-oriented and uses SDL2 for video, keyboard input, and
+audio. NES documentation and test ROMs are the sources of truth for hardware
+behaviour.
 
-- [x] 6502 CPU (all official opcodes)
-- [x] Bus
-- [x] Running Snake
-- [x] Cartridge Support (iNES format)
-- [x] CPU trace + `nestest` validation — matches the reference log for all 5003 legal opcodes
-- [x] PPU registers (ch 6.1) — CTRL/MASK/STATUS/OAMADDR/OAMDATA/SCROLL/ADDR/DATA + OAM DMA, wired through the bus
-- [x] PPU clock + NMI interrupt (ch 6.2) — `ppu.tick()` runs 3× per CPU cycle, raises vblank NMI at scanline 241, CPU services it via the $FFFA vector
-- [x] Rendering CHR tiles (ch 6.3) — `render::show_tile` decodes a tile's two bitplanes into a `Frame`; `cargo run -- tiles` blits it to an SDL window
-- [x] Rendering the background (ch 6.4) — `Bus` fires a per-frame callback at vblank; `render::render` draws the nametable to a 256×240 `Frame`, with per-tile palettes from the attribute table (`bg_palette`)
-- [~] ch7 — makes Pac-Man / Donkey Kong playable  ← you are here
-  - [x] Joypad input — `Joypad` wired into the bus at `$4016`; keyboard mapped in `run_game`
-  - [ ] Sprite rendering — draw `oam_data` on top of the background in `render::render`
-  - [ ] Scrolling (ch8) — SMB1
-- [x] APU (per [NESDev](https://www.nesdev.org/wiki/APU), not the ebook) — all five channels (pulse ×2, triangle, noise, DMC) in `src/apu/`, ticked per CPU cycle from the bus; frame counter with IRQ, DMC DMA with CPU stall, non-linear mixer + 90/440 Hz high-pass and 14 kHz low-pass filters, downsampled into an SDL2 `AudioQueue`. Frame-counter/DMC IRQs vector through `$FFFE` (CPU IRQ support added alongside). The game loop is paced by the audio queue (the DAC is the master clock), not vsync, so game speed and pitch stay exact and latency stays at ~70 ms
-- [ ] Unofficial/illegal opcodes (optional; needed to finish the rest of `nestest`)
+## Current support
 
-## Commands
+- All official 6502 opcodes, CPU interrupts, and `nestest` trace validation
+- Dot-based PPU timeline with vblank/NMI races, loopy scrolling, sprite-0 hit
+  timing, odd-frame skip, and scanline rendering
+- Background and sprite rendering, including 8×16 sprites, priority, clipping,
+  and the eight-sprites-per-line limit
+- NROM (0), MMC1 (1), UxROM (2), CNROM (3), MMC3 (4), AxROM (7), and GxROM (66)
+- MMC3 scanline IRQs, currently using one clock at dot 260 rather than full A12
+  edge detection
+- Pulse, triangle, noise, and DMC audio with IRQs, DMA, filtering, and SDL2
+  playback
+- One standard controller through `$4016`
+- Headless performance probes and deterministic visual regression tests
 
-All commands run from the `nes_emulator/` directory:
+The test suite currently contains 142 passing tests. The prioritized remaining
+work is tracked in [`nes_emulator/TODO.md`](nes_emulator/TODO.md).
+
+## Requirements
+
+- A current Rust toolchain
+- SDL2 development libraries
+
+On Debian or Ubuntu:
+
+```bash
+sudo apt install libsdl2-dev
+```
+
+ROM images are not required to build or run the unit tests. Only use ROMs that
+you are legally permitted to use.
+
+## Build and test
+
+Run commands from the Rust project directory:
 
 ```bash
 cd nes_emulator
-
-# Build the project
-cargo build
-
-# Run the unit + trace tests (expect: 95 passed)
+cargo build --release
 cargo test
+```
 
-# Run a game ROM (with sound). Esc to quit.
-# (needs SDL2 on the system: `sudo apt install libsdl2-dev` on Debian/WSL)
-cargo run                        # defaults to games/pacman.nes
-cargo run -- games/mario.nes     # or any ROM path
+Run a game by passing its path:
 
-# Dump the CPU trace while running nestest (the ch 5.1 deliverable)
-cargo run -- nestest
+```bash
+cargo run --release -- games/pacman.nes
+cargo run --release -- /path/to/game.nes
+```
 
-# Headless audio debug probe: run a ROM with scripted joypad input, logging
-# every APU register write and per-frame output RMS + channel state to
-# stderr. PROBE_SHOTS=<dir> additionally dumps BMP screenshots.
-cargo run --release -- probe games/mario.nes "start@120-135,right@350-" 2100 2>probe.log
+With no argument, the emulator tries `games/pacman.nes`.
 
-# View a CHR tile in a window (the ch 6.3 deliverable).
-# Optional ROM filename (must have CHR ROM); defaults to nestest.nes.
-# Esc or window-close to quit.
-cargo run -- tiles                # nestest.nes
-cargo run -- tiles pacman.nes     # any ROM you drop in nes_emulator/
+### Controls
 
-# Validate the trace against the reference log.
-# It matches for all 5003 legal opcodes, then stops at the first illegal
-# opcode (0x04 *NOP) — that's expected until you implement illegal opcodes.
+| NES control | Keyboard |
+|---|---|
+| D-pad | Arrow keys |
+| A | A |
+| B | S |
+| Select | Space |
+| Start | Enter |
+| Quit | Escape |
+
+## Validation and diagnostics
+
+Run the bundled `nestest` trace mode:
+
+```bash
+cd nes_emulator
 cargo run -- nestest > mynes.log 2>/dev/null
 diff <(sed 's/ PPU:.*//' nestest.log | head -n "$(wc -l < mynes.log)") mynes.log
-# ^ empty output = perfect match
 ```
+
+The trace matches all 5,003 official-opcode entries and stops when `nestest`
+reaches its first unofficial opcode.
+
+Run a headless optimized probe with optional scripted input:
+
+```bash
+cargo run --release -- probe games/mario.nes "start@120-135,right@350-" 2100
+```
+
+The probe reports frame timing, audio production and drift, frame hashes, DMA
+activity, and visible-time PPU writes. It can also create deterministic BMPs
+and compare them against reviewed baselines. See
+[`nes_emulator/probes/README.md`](nes_emulator/probes/README.md) for all probe
+options and the visual-regression runner.
+
+Inspect a CHR tile in an SDL window:
+
+```bash
+cargo run -- tiles
+cargo run -- tiles /path/to/game.nes
+```
+
+## Known limitations
+
+- The compositor still renders a scanline as one unit; mid-scanline pixel
+  effects are not yet reproduced.
+- MMC3 IRQs need fetch-driven A12 edge detection.
+- OAM DMA copies data but does not yet model its full 513/514-cycle CPU stall.
+- Unofficial 6502 opcodes, NES 2.0, PAL/Dendy timing, battery saves, save
+  states, and a second controller remain to be implemented.

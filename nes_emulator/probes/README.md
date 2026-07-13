@@ -55,6 +55,5 @@ cargo run --release -- probe games/mario.nes "start@120-135" 904
 
 The output contains frames 897 through 903. Inspect the matching CSV rows for
 `oam_dmas`, `visible_ppu_writes`, and the last register/scanline/dot. Sprite
-overflow is not yet exact in the scanline renderer and remains part of P1; a
-future overflow implementation should add its status to this same report.
-
+overflow is not yet exact in the scanline renderer. Its implementation and the
+corresponding capture-report extension are tracked centrally in `../TODO.md`.
