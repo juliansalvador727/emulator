@@ -8,7 +8,7 @@ lower-priority backlog at the end of this file.
 
 Current verified baseline (2026-07-13):
 
-- 163 passing Rust tests.
+- 167 passing Rust tests.
 - All official 6502 opcodes; `nestest` matches 5,003 official-opcode entries.
 - NROM, MMC1, UxROM, CNROM, MMC3, AxROM, and GxROM/GNROM.
 - Dot-driven background and sprite rendering with mapper-visible PPU fetches.
@@ -101,8 +101,8 @@ status-bar splits no longer exhibit one-line jitter.
 
 ## P1 — Implement real DMA and CPU/PPU/APU bus timing
 
-- [ ] Give OAM DMA its real 513/514 CPU-cycle stall based on CPU parity.
-- [ ] Advance the PPU and APU while the CPU is stalled.
+- [x] Give OAM DMA its real 513/514 CPU-cycle stall based on CPU parity.
+- [x] Advance the PPU and APU while the CPU is stalled.
 - [ ] Model OAM DMA reads/writes on alternating CPU cycles and preserve the
   current OAMADDR wrapping behavior.
 - [ ] Define and test DMC DMA/OAM DMA arbitration, including DMC steals during

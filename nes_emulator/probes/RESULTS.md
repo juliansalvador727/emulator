@@ -6,7 +6,7 @@ on the target host before changing PPU timing.
 
 ## Deterministic timing validation
 
-The Rust suite now has 163 passing tests. P0 coverage records exact
+The Rust suite now has 167 passing tests. P0 coverage records exact
 mapper-visible background, prefetch, dummy, and sprite fetch addresses/dots;
 blanked rendering; sprite-zero left-edge and x=255 behavior; vblank/NMI races;
 odd-frame skipping; all background/sprite pattern-table combinations; PPUDATA
@@ -15,24 +15,26 @@ acknowledge/level behavior.
 
 `test-roms/run_p0_validation.sh` provides hash-checked execution and revisioned
 TSV results for external blargg/nesdev ROMs. The binaries remain outside this
-checkout; the remaining P0 roadmap entries stay open until the configured
-suite passes completely.
+checkout. The configured suite now passes completely; broader compatibility
+work remains tracked in the P0 roadmap.
 
 An exploratory run used `christopherpow/nes-test-roms` commit
 `95d8f621ae55cee0d09b91519a8989ae0e64753b`; the checked-in manifest records
-the individual ROM hashes. Results after fixing mapper-visible `$2006`, `$2007`
-post-increment, and empty-slot sprite fetch addresses were:
+the individual ROM hashes. Results after fixing dynamic CPU branch/page-cross
+cycles, OAM-DMA stalls, CPU-visible register phase, vblank/NMI edges, odd-frame
+sampling, sprite evaluation, mapper-visible `$2006`/`$2007` activity, and
+empty-slot sprite fetch addresses were:
 
 | Suite | Passed | Remaining first failure |
 | --- | ---: | --- |
-| `ppu_vbl_nmi` combined | 0/10 | 01 #2, VBL period is way off |
-| `sprite_hit_tests_2005.10.05` | 8/11 | 07 #3; timing ROMs 09/10 also fail |
-| `sprite_overflow_tests` | 0/5 | 1 #5; later ROMs depend on earlier passes |
-| `mmc3_irq_tests` (revision B) | 3/5 | Details #7 and scanline timing #2 |
+| `ppu_vbl_nmi` combined | 10/10 | None |
+| `sprite_hit_tests_2005.10.05` | 11/11 | None |
+| `sprite_overflow_tests` | 5/5 | None |
+| `mmc3_irq_tests` (revision B) | 5/5 | None |
 
-MMC3 counter clocking, manual `$2006`/`$2007` A12 clocking, and revision-B
-zero-latch behavior now pass their dedicated ROMs. Remaining failures are kept
-visible rather than being treated as a completed P0 acceptance run.
+All 22 configured cases pass, including MMC3 counter/manual A12 clocking,
+revision-B zero-latch behavior, sprite-hit/overflow timing, vblank/NMI races,
+and exact odd/even frame timing.
 
 ## Two emulated minutes, headless
 

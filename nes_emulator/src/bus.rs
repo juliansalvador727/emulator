@@ -19,6 +19,7 @@ pub struct Bus<'call> {
     pub apu: NesAPU,
 
     cycles: usize,
+    oam_dma_pending: bool,
     gameloop_callback: Box<dyn FnMut(&NesPPU, &mut NesAPU, &mut Joypad) + 'call>,
     joypad1: Joypad,
 }
@@ -36,6 +37,7 @@ impl<'a> Bus<'a> {
             ppu: ppu,
             apu: NesAPU::new(),
             cycles: 0,
+            oam_dma_pending: false,
             gameloop_callback: Box::from(gameloop_callback),
             joypad1: Joypad::new(),
         }
@@ -44,6 +46,20 @@ impl<'a> Bus<'a> {
         self.cycles += cycles as usize;
         self.apu.tick(cycles);
         let mut frame_complete = self.ppu.tick(cycles * 3);
+
+        // OAM DMA halts the CPU for 513 cycles, plus one alignment cycle when
+        // it starts on an odd CPU cycle. The PPU and APU continue to run.
+        // Defer this until the instruction containing the $4014 write has
+        // completed so the halt begins at the following CPU-cycle boundary.
+        if self.oam_dma_pending {
+            self.oam_dma_pending = false;
+            let stall = 513 + (self.cycles & 1);
+            self.cycles += stall;
+            for _ in 0..stall {
+                self.apu.tick(1);
+                frame_complete |= self.ppu.tick(3);
+            }
+        }
 
         // DMC sample fetch: when the APU's memory reader wants a byte, the
         // bus reads it and stalls the CPU. Hardware stalls 1-4 cycles
@@ -77,6 +93,11 @@ impl<'a> Bus<'a> {
     // mapper (MMC3 scanline counter, acked by a write to $E000).
     pub fn poll_irq_status(&self) -> bool {
         self.apu.irq_pending() || self.mapper.borrow().irq_pending()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cpu_cycles(&self) -> usize {
+        self.cycles
     }
 }
 
@@ -128,7 +149,8 @@ impl Mem for Bus<'_> {
                 self.ppu.write_to_mask(data);
             }
 
-            0x2002 => panic!("attempt to write to PPU status register"),
+            // PPUSTATUS is read-only; writes are ignored by the hardware.
+            0x2002 => {}
 
             0x2003 => {
                 self.ppu.write_to_oam_addr(data);
@@ -161,6 +183,7 @@ impl Mem for Bus<'_> {
                     buffer[i as usize] = self.mem_read(hi + i);
                 }
                 self.ppu.write_oam_dma(&buffer);
+                self.oam_dma_pending = true;
             }
 
             // APU registers ($4014 is OAM DMA above, $4016 the joypad below;
@@ -247,5 +270,27 @@ mod test {
             bus.tick(1);
         }
         assert_eq!(callbacks.get(), 1);
+    }
+
+    #[test]
+    fn oam_dma_stalls_cpu_while_ppu_and_apu_keep_running() {
+        let mut bus = test_bus();
+        bus.mem_write(0x4014, 0x00);
+        bus.tick(4);
+
+        assert_eq!(bus.cycles, 4 + 513);
+
+        let mut odd_bus = test_bus();
+        odd_bus.tick(1);
+        odd_bus.mem_write(0x4014, 0x00);
+        odd_bus.tick(4);
+
+        assert_eq!(odd_bus.cycles, 1 + 4 + 514);
+    }
+
+    #[test]
+    fn writes_to_read_only_ppustatus_are_ignored() {
+        let mut bus = test_bus();
+        bus.mem_write(0x2002, 0xff);
     }
 }

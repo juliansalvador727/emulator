@@ -45,9 +45,11 @@ pub struct NesPPU {
     scanline: u16,
     dot: u16,
     odd_frame: bool,
+    odd_skip_armed: bool,
     total_dots: u64,
     suppress_vblank: bool,
     pub nmi_interrupt: Option<u8>,
+    nmi_interrupt_at: u64,
 
     // Background fetch latches and the four 16-bit pixel shifters. The high
     // byte contains the currently visible tile; the low byte is reloaded with
@@ -98,9 +100,11 @@ impl NesPPU {
             scanline: 0,
             dot: 0,
             odd_frame: false,
+            odd_skip_armed: false,
             total_dots: 0,
             suppress_vblank: false,
             nmi_interrupt: None,
+            nmi_interrupt_at: 0,
             next_tile_id: 0,
             next_tile_attr: 0,
             next_tile_lo: 0,
@@ -160,6 +164,14 @@ impl NesPPU {
     // address-bus activity all originate from this timeline.
     fn clock_dot(&mut self) -> bool {
         let render_line = self.scanline < 240 || self.scanline == 261;
+        if self.scanline == 261 && self.dot == 0 {
+            self.odd_skip_armed = false;
+        } else if self.scanline == 261 && self.dot == 337 {
+            // PPUMASK is sampled before the skipped-clock point. A rendering
+            // enable that lands after this dot is too late to shorten the
+            // current odd frame.
+            self.odd_skip_armed = self.odd_frame && self.rendering_enabled();
+        }
         if render_line && self.rendering_enabled() {
             if (1..=256).contains(&self.dot) || (321..=336).contains(&self.dot) {
                 self.clock_background_pipeline();
@@ -195,30 +207,30 @@ impl NesPPU {
             }
         }
 
-        if self.scanline == 241 && self.dot == 1 {
+        if self.scanline == 241 && self.dot == 0 {
             if !self.suppress_vblank {
                 self.status.set_vblank_status(true);
                 if self.ctrl.generate_vblank_nmi() {
                     self.nmi_interrupt = Some(1);
+                    self.nmi_interrupt_at = self.total_dots.wrapping_add(3);
                 }
             }
             self.suppress_vblank = false;
         } else if self.scanline == 261 {
-            if self.dot == 1 {
+            if self.dot == 0 {
                 self.status.reset_vblank_status();
                 self.status.set_sprite_zero_hit(false);
                 self.status.set_sprite_overflow(false);
-                self.nmi_interrupt = None;
             }
         }
 
-        // On odd rendered NTSC frames the pre-render line omits dot 340.
-        let last_dot = if self.scanline == 261 && self.odd_frame && self.rendering_enabled() {
-            339
-        } else {
-            340
-        };
-        let frame_complete = if self.dot == last_dot {
+        // On odd rendered NTSC frames the pre-render line omits dot 340. Test
+        // the skip at dot 339, but always let dot 340 end the line if rendering
+        // was enabled too late; deriving a mutable `last_dot` could otherwise
+        // strand the raster beyond dot 340 when PPUMASK changes at the edge.
+        let frame_end =
+            self.dot == 340 || (self.scanline == 261 && self.dot == 339 && self.odd_skip_armed);
+        let frame_complete = if frame_end {
             if render_line && self.rendering_enabled() {
                 self.current_sprites = self.next_sprites;
                 self.next_sprites = [SpriteUnit::default(); 8];
@@ -343,8 +355,8 @@ impl NesPPU {
             let candidate_y = self.sprite_eval_latch as usize;
             if line != 0 && line > candidate_y && line <= candidate_y + height {
                 self.status.set_sprite_overflow(true);
-                self.sprite_eval_m = (self.sprite_eval_m + 1) & 3;
             }
+            self.sprite_eval_m = (self.sprite_eval_m + 1) & 3;
             self.sprite_eval_n += 1;
         }
     }
@@ -507,6 +519,13 @@ impl NesPPU {
     }
 
     pub fn poll_nmi_interrupt(&mut self) -> Option<u8> {
+        // The vblank edge is synchronized into the CPU clock domain. Keep it
+        // pending immediately so a later PPUSTATUS read cannot erase an edge
+        // that has already crossed that boundary, but expose it after the
+        // synchronization delay (three PPU dots in this timeline).
+        if self.nmi_interrupt.is_some() && self.total_dots < self.nmi_interrupt_at {
+            return None;
+        }
         self.nmi_interrupt.take()
     }
 
@@ -528,10 +547,21 @@ impl NesPPU {
         self.ctrl.update(value);
         self.loopy.write_ctrl(value);
         // Enabling NMI during an active vblank produces an immediate NMI edge.
-        if !generated_nmi && self.ctrl.generate_vblank_nmi() && self.status.is_in_vblank() {
+        if !generated_nmi
+            && self.ctrl.generate_vblank_nmi()
+            && self.status.is_in_vblank()
+            // In this dot-at-a-time representation, state dot 0 is the
+            // boundary where pre-render clearing is visible to a CPU write.
+            && !(self.scanline == 261 && self.dot == 0)
+        {
             self.nmi_interrupt = Some(1);
+            self.nmi_interrupt_at = self.total_dots.wrapping_add(6);
+            // An NMI edge caused by enabling PPUCTRL during vblank is
+            // recognized after the following CPU instruction.
         } else if !self.ctrl.generate_vblank_nmi() {
-            self.nmi_interrupt = None;
+            if self.total_dots < self.nmi_interrupt_at {
+                self.nmi_interrupt = None;
+            }
         }
     }
 
@@ -546,11 +576,13 @@ impl NesPPU {
         let data = self.status.snapshot();
         // A read immediately before vblank suppresses that frame's vblank flag
         // and NMI. A read on dot 1 clears the just-set flag/NMI below.
-        if self.scanline == 241 && self.dot == 0 {
+        if self.scanline == 241 && self.dot <= 1 {
             self.suppress_vblank = true;
         }
         self.status.reset_vblank_status();
-        self.nmi_interrupt = None;
+        if self.total_dots < self.nmi_interrupt_at {
+            self.nmi_interrupt = None;
+        }
         self.loopy.reset_latch();
         data
     }
@@ -849,12 +881,11 @@ pub mod test {
         ppu.dot = 0;
         ppu.write_to_ctrl(0x80);
 
-        ppu.tick(1); // dot 0
-        assert!(!ppu.status.is_in_vblank());
+        ppu.tick(1); // enter dot 1
+        assert!(ppu.status.is_in_vblank());
         assert_eq!(ppu.poll_nmi_interrupt(), None);
 
-        ppu.tick(1); // dot 1
-        assert!(ppu.status.is_in_vblank());
+        ppu.tick(2); // synchronize the NMI edge into the CPU domain
         assert_eq!(ppu.poll_nmi_interrupt(), Some(1));
     }
 
@@ -873,12 +904,14 @@ pub mod test {
     }
 
     #[test]
-    fn enabling_nmi_during_vblank_raises_an_edge() {
+    fn enabling_nmi_during_vblank_raises_an_edge_after_the_next_instruction() {
         let mut ppu = NesPPU::new_empty_rom();
         ppu.status.set_vblank_status(true);
 
         ppu.write_to_ctrl(0x80);
 
+        assert_eq!(ppu.poll_nmi_interrupt(), None);
+        ppu.tick(6);
         assert_eq!(ppu.poll_nmi_interrupt(), Some(1));
     }
 
