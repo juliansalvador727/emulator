@@ -8,6 +8,15 @@ use registers::status::StatusRegister;
 
 pub mod registers;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProbeDiagnostics {
+    pub oam_dma_count: u64,
+    pub visible_register_writes: u64,
+    pub last_register: u16,
+    pub last_scanline: u16,
+    pub last_dot: usize,
+}
+
 pub struct NesPPU {
     pub mapper: SharedMapper,
     pub palette_table: [u8; 32],
@@ -30,6 +39,7 @@ pub struct NesPPU {
     // can be composited: `composite_scanline` detaches it to hand `&self` to
     // the compositor, then puts it back. It is always `Some` between calls.
     frame: Option<Frame>,
+    probe_diagnostics: ProbeDiagnostics,
 }
 
 impl NesPPU {
@@ -54,6 +64,7 @@ impl NesPPU {
             cycles: 0,
             nmi_interrupt: None,
             frame: Some(Frame::new()),
+            probe_diagnostics: ProbeDiagnostics::default(),
         }
     }
 
@@ -63,6 +74,22 @@ impl NesPPU {
         self.frame
             .as_ref()
             .expect("frame is detached only transiently during a scanline render")
+    }
+
+    /// Cumulative counters used by the headless probe when an intermittent
+    /// visual glitch needs to be correlated with DMA or a visible-time PPU
+    /// register write. They deliberately do not affect emulation state.
+    pub fn probe_diagnostics(&self) -> ProbeDiagnostics {
+        self.probe_diagnostics
+    }
+
+    fn note_register_write(&mut self, register: u16) {
+        if self.scanline < 240 {
+            self.probe_diagnostics.visible_register_writes += 1;
+            self.probe_diagnostics.last_register = register;
+            self.probe_diagnostics.last_scanline = self.scanline;
+            self.probe_diagnostics.last_dot = self.cycles;
+        }
     }
 
     pub fn tick(&mut self, cycles: u8) -> bool {
@@ -165,15 +192,18 @@ impl NesPPU {
     }
 
     pub fn write_to_ppu_addr(&mut self, value: u8) {
+        self.note_register_write(0x2006);
         self.loopy.write_addr(value);
     }
 
     pub fn write_to_ctrl(&mut self, value: u8) {
+        self.note_register_write(0x2000);
         self.ctrl.update(value);
         self.loopy.write_ctrl(value);
     }
 
     pub fn write_to_mask(&mut self, value: u8) {
+        self.note_register_write(0x2001);
         self.mask.update(value);
     }
 
@@ -187,10 +217,12 @@ impl NesPPU {
     }
 
     pub fn write_to_oam_addr(&mut self, value: u8) {
+        self.note_register_write(0x2003);
         self.oam_addr = value;
     }
 
     pub fn write_to_oam_data(&mut self, value: u8) {
+        self.note_register_write(0x2004);
         self.oam_data[self.oam_addr as usize] = value;
         self.oam_addr = self.oam_addr.wrapping_add(1);
     }
@@ -200,12 +232,14 @@ impl NesPPU {
     }
 
     pub fn write_to_scroll(&mut self, value: u8) {
+        self.note_register_write(0x2005);
         self.loopy.write_scroll(value);
     }
 
     // OAM DMA: copy a 256-byte page (supplied by the bus from CPU RAM)
     // into OAM starting at the current oam_addr.
     pub fn write_oam_dma(&mut self, data: &[u8; 256]) {
+        self.probe_diagnostics.oam_dma_count += 1;
         for x in data.iter() {
             self.oam_data[self.oam_addr as usize] = *x;
             self.oam_addr = self.oam_addr.wrapping_add(1);
@@ -217,6 +251,7 @@ impl NesPPU {
     }
 
     pub fn write_to_data(&mut self, value: u8) {
+        self.note_register_write(0x2007);
         let addr = self.loopy.current();
         match addr {
             0..=0x1fff => self.mapper.borrow_mut().ppu_write(addr, value),

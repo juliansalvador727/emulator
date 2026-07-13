@@ -1,3 +1,4 @@
+#[derive(Clone)]
 pub struct Frame {
     pub data: Vec<u8>,
 }

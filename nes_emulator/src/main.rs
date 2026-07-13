@@ -37,7 +37,7 @@ use sdl2::pixels::PixelFormatEnum;
 
 // Runs a game ROM, presenting the PPU's frame to an SDL2 window.
 // The PPU composites each scanline into its own frame as it crosses the line;
-// the bus fires the callback once per frame (at vblank), where we just blit
+// the bus fires the callback once per completed frame, where we just blit
 // the finished frame and pace the loop.
 fn run_game(rom_path: &str) {
     // Keep PulseAudio's server-side buffer bounded. Very small values make
@@ -92,11 +92,11 @@ fn run_game(rom_path: &str) {
 
     let sample_bytes = mem::size_of::<f32>() as u32;
 
-    // Frame pacing: one NTSC NES frame (29780.5 CPU cycles) is 1/60.0988 s.
+    // Frame pacing: this scanline model runs at 1/60.0984867 s per frame.
     // When audio is available, a tiny backlog correction keeps long-run
     // emulation speed locked to the host DAC without touching the APU sample
     // clock, so pitch stays stable.
-    let frame_duration = std::time::Duration::from_nanos(16_639_267);
+    let frame_duration = std::time::Duration::from_nanos(16_639_354);
     let frame_duration_secs = frame_duration.as_secs_f64();
     let bytes_per_second = sample_rate as f64 * sample_bytes as f64;
     let mut next_frame = std::time::Instant::now();
@@ -109,7 +109,7 @@ fn run_game(rom_path: &str) {
     let mut frames: u64 = 0;
     let mut samples_produced: u64 = 0;
 
-    // Called by the bus at each vblank: present the PPU's finished frame,
+    // Called by the bus at each completed video frame: present the PPU frame,
     // queue the frame's audio, pace the loop, and drain the SDL event queue
     // (updating the joypad) so the window stays responsive.
     let bus = Bus::new(
@@ -148,7 +148,11 @@ fn run_game(rom_path: &str) {
             } else {
                 let error_secs =
                     (backlog as f64 - audio::PACE_TARGET_QUEUED_BYTES as f64) / bytes_per_second;
-                let correction_secs = (error_secs * 0.02).clamp(-0.00075, 0.00075);
+                // Follow even unusually slow/fast host sinks instead of
+                // allowing the pending queue to grow until samples are
+                // dropped. With a correctly clocked 44.1 kHz sink this
+                // correction remains close to zero.
+                let correction_secs = (error_secs * 0.05).clamp(-0.003, 0.003);
                 std::time::Duration::from_secs_f64(frame_duration_secs + correction_secs)
             };
 
@@ -269,11 +273,16 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
         Some("nestest") => run_nestest(),
-        Some("probe") => probe::run_probe(
-            args.get(2).expect("probe needs a ROM path"),
-            args.get(3).map(|s| s.as_str()).unwrap_or(""),
-            args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1800),
-        ),
+        Some("probe") => {
+            if let Err(err) = probe::run_probe(
+                args.get(2).expect("probe needs a ROM path"),
+                args.get(3).map(|s| s.as_str()).unwrap_or(""),
+                args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1800),
+            ) {
+                eprintln!("probe failed: {err}");
+                std::process::exit(1);
+            }
+        }
         Some("tiles") => run_tiles(args.get(2).map(|s| s.as_str()).unwrap_or("nestest.nes")),
         Some(rom_path) => run_game(rom_path),
         None => run_game("games/pacman.nes"),

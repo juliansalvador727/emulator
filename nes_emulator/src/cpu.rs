@@ -588,6 +588,19 @@ impl<'a> CPU<'a> {
     where
         F: FnMut(&mut CPU),
     {
+        self.run_until(|cpu| {
+            callback(cpu);
+            false
+        });
+    }
+
+    /// Run until `callback` asks the CPU to stop. This is primarily useful for
+    /// deterministic automation (for example, stopping a ROM probe at an exact
+    /// video frame) without terminating the whole process from a bus callback.
+    pub fn run_until<F>(&mut self, mut callback: F)
+    where
+        F: FnMut(&mut CPU) -> bool,
+    {
         // we borrow the opscode data structure without taking ownership
         let ref opcodes: HashMap<u8, &'static opcodes::OpCode> = *opcodes::OPCODES_MAP;
 
@@ -600,7 +613,9 @@ impl<'a> CPU<'a> {
                 self.interrupt_irq();
             }
 
-            callback(self);
+            if callback(self) {
+                return;
+            }
 
             let code = self.mem_read(self.program_counter);
             self.program_counter += 1;

@@ -154,6 +154,7 @@ fn pump_thread(rx: Receiver<Vec<f32>>, stats: Arc<AudioStats>) {
     let mut bytes_queued = 0u64;
     let mut last_consumed = 0u64;
     let mut last_progress = Instant::now();
+    let mut underflow_at: Option<Instant> = None;
 
     loop {
         loop {
@@ -174,6 +175,16 @@ fn pump_thread(rx: Receiver<Vec<f32>>, stats: Arc<AudioStats>) {
 
         if let Some(dev) = &device {
             let mut queued = dev.size();
+            if started && queued == 0 && pending.is_empty() {
+                underflow_at.get_or_insert_with(Instant::now);
+            } else if queued > 0 {
+                if let Some(since) = underflow_at.take() {
+                    let missed = (since.elapsed().as_secs_f64() * SAMPLE_RATE as f64) as u64;
+                    stats
+                        .underflow_samples
+                        .fetch_add(missed.max(1), Ordering::Relaxed);
+                }
+            }
             let consumed = bytes_queued.saturating_sub(queued as u64);
             if consumed > last_consumed || queued == 0 {
                 last_consumed = consumed;
@@ -202,6 +213,7 @@ fn pump_thread(rx: Receiver<Vec<f32>>, stats: Arc<AudioStats>) {
                     eprintln!("audio queue failed; reopening device");
                     device = None;
                     started = false;
+                    underflow_at = None;
                     stats.reopens.fetch_add(1, Ordering::Relaxed);
                     stats
                         .backlog_bytes
@@ -230,6 +242,7 @@ fn pump_thread(rx: Receiver<Vec<f32>>, stats: Arc<AudioStats>) {
                     dev.clear();
                     device = None;
                     started = false;
+                    underflow_at = None;
                     bytes_queued = 0;
                     last_consumed = 0;
                     pending.clear();
@@ -245,6 +258,7 @@ fn pump_thread(rx: Receiver<Vec<f32>>, stats: Arc<AudioStats>) {
                 Ok(dev) => {
                     device = Some(dev);
                     started = false;
+                    underflow_at = None;
                     bytes_queued = 0;
                     last_consumed = 0;
                     last_progress = Instant::now();

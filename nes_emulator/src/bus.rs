@@ -41,11 +41,9 @@ impl<'a> Bus<'a> {
         }
     }
     pub fn tick(&mut self, cycles: u8) {
-        let nmi_before = self.ppu.nmi_interrupt.is_some();
-
         self.cycles += cycles as usize;
         self.apu.tick(cycles);
-        self.ppu.tick(cycles * 3);
+        let mut frame_complete = self.ppu.tick(cycles * 3);
 
         // DMC sample fetch: when the APU's memory reader wants a byte, the
         // bus reads it and stalls the CPU. Hardware stalls 1-4 cycles
@@ -58,11 +56,14 @@ impl<'a> Bus<'a> {
             self.apu.dmc_dma_load(value);
             self.cycles += 4;
             self.apu.tick(4);
-            self.ppu.tick(12);
+            frame_complete |= self.ppu.tick(12);
         }
 
-        let nmi_after = self.ppu.nmi_interrupt.is_some();
-        if !nmi_before && nmi_after {
+        // Presentation and audio draining are video-frame events, independent
+        // of whether a game enables NMI. Tying this callback to an NMI edge
+        // silently skipped frames (and accumulated audio) during NMI-disabled
+        // transitions, making profiling and host playback drift.
+        if frame_complete {
             (self.gameloop_callback)(&self.ppu, &mut self.apu, &mut self.joypad1);
         }
     }
@@ -230,5 +231,21 @@ mod test {
         bus.mem_write(0x4015, 0x10); // enable DMC
         bus.tick(1); // services the fetch immediately
         assert_eq!(bus.mem_read(0x4015) & 0x10, 0); // 0 bytes remaining
+    }
+
+    #[test]
+    fn frame_callback_does_not_depend_on_nmi_enable() {
+        let callbacks = std::rc::Rc::new(std::cell::Cell::new(0));
+        let callback_count = callbacks.clone();
+        let mut bus = Bus::new(test_rom(vec![]), move |_, _, _| {
+            callback_count.set(callback_count.get() + 1);
+        });
+
+        // One NTSC PPU frame is 262 * 341 dots, advanced three dots per CPU
+        // cycle. PPUCTRL remains at its reset value, with NMI disabled.
+        for _ in 0..29_781 {
+            bus.tick(1);
+        }
+        assert_eq!(callbacks.get(), 1);
     }
 }

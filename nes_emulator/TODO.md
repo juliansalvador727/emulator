@@ -2,21 +2,25 @@
 
 Current baseline: the Rust emulator has official 6502 opcodes, APU/DMC DMA,
 NROM/MMC1/MMC3 and several simple mappers, scanline rendering, and loopy
-scrolling. `cargo test` currently has 132 passing tests. The C emulator in
+scrolling. `cargo test` currently has 136 passing tests. The C emulator in
 `../NES/` is a useful implementation reference, but NES test ROMs remain the
 source of truth for behaviour.
 
 ## P0 — Stabilize the current renderer
 
-- [ ] Profile a release build with representative NROM, MMC1, and MMC3 ROMs.
+- [x] Profile a release build with representative NROM, MMC1, and MMC3 ROMs.
   Record emulated frames/sec, host frame time, audio queue depth, dropped
   samples, and screenshots before further PPU work. The immediate goal is a
   steady 60 FPS with no audio underruns or dropped samples.
   - Rust: `src/main.rs`, `src/audio.rs`, `src/probe.rs`
   - Acceptance: `cargo run --release -- probe ...` is repeatable; screenshots
     and audio statistics can be compared in CI or manually.
+  - Completed: the probe now emits per-frame CSV plus a summary containing
+    emulated FPS, host frame-time average/p95/max, audio queue min/max/end,
+    sample-clock drift, drops, underflows, and device reopens. Two-minute
+    release results are recorded in `probes/RESULTS.md`.
 
-- [ ] Add ROM-level visual regression coverage. The unit tests cover individual
+- [x] Add ROM-level visual regression coverage. The unit tests cover individual
   pixels, but they cannot catch a HUD split, a bad CHR bank, or a stale scanline
   in a real game.
   - Use the existing `PROBE_SHOTS` path to make deterministic BMPs.
@@ -25,11 +29,19 @@ source of truth for behaviour.
     hashes and expected probe scripts.
   - Acceptance: fixed frame numbers have reviewed image baselines and no audio
     queue drift during a multi-minute probe.
+  - Completed: `probes/run_visual_regressions.sh` verifies ROM SHA-256 values
+    and byte-compares reviewed frames 180/360/600 for SMB1, Zelda, and SMB2.
+    The probe's frame callback is now independent of NMI enable, fixing skipped
+    presentation/audio drains; 7,200-frame runs have +0.089 sample clock drift.
 
-- [ ] Investigate any remaining top/occasional artifacts with a frame capture
+- [x] Investigate any remaining top/occasional artifacts with a frame capture
   before changing timing again. Check whether they correlate with OAM DMA,
   sprite overflow, or a mid-frame PPU write. The `$FF` OAM-Y wrap bug is fixed,
   so further artifacts should have a reproducible capture attached.
+  - Completed: `PROBE_CAPTURE_FRAME`/`PROBE_CAPTURE_RADIUS` save the surrounding
+    frames and CSV event context. The reproducible SMB2 transition capture has
+    normal OAM DMA and no visible-time PPU writes, pointing to the P1 MMC3 A12/
+    dot-timing work; command and findings are in `probes/RESULTS.md`.
 
 ## P1 — PPU timing and correctness
 
