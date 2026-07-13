@@ -36,6 +36,14 @@ All 22 configured cases pass, including MMC3 counter/manual A12 clocking,
 revision-B zero-latch behavior, sprite-hit/overflow timing, vblank/NMI races,
 and exact odd/even frame timing.
 
+This result was reproduced on revision `6ec8976c8df0b1a708b5d6afe59defa2a5dc5ce6`
+with `NES_TEST_ROMS_ROOT=../nes-test-roms`; the full suite again passed 22/22.
+
+The dedicated `scrolltest/scroll.nes` ROM (SHA-256
+`04ebe8b768ffc31fc1fa18a21f2e1884d0d3df2588f5efee53e881a339874db7`)
+was also run headlessly for 180 frames. The reviewed output showed its complete
+multidirectional-scrolling test pattern without seams or blank regions.
+
 ## Two emulated minutes, headless
 
 Each run covered 7,200 completed frames. All produced 5,283,327 samples with
@@ -50,6 +58,8 @@ only +0.089 sample of cumulative clock drift after the warm-up frame.
 This leaves ample CPU/rendering margin for a 60.0985 FPS presentation target.
 The nine reviewed BMPs in `baselines/` cover frames 180, 360, and 600 for
 each case and are checked byte-for-byte by `run_visual_regressions.sh`.
+The suite was rerun while closing P0; all nine current images matched, including
+the three MMC3/SMB2 frames, with zero baseline failures.
 
 ## Artifact capture
 

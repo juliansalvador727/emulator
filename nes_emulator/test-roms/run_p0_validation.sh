@@ -22,21 +22,27 @@ while IFS='|' read -r id rom expected_hash max_instructions; do
     esac
     case_count=$((case_count + 1))
 
-    if [ ! -f "$rom" ]; then
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$revision" "$configuration" "$id" "$expected_hash" MISSING "$rom" >>"$results"
-        echo "$id: missing $rom" >&2
+    rom_path=$rom
+    if [ ! -f "$rom_path" ] && [ -n "${NES_TEST_ROMS_ROOT:-}" ]; then
+        relative_rom=${rom#test-roms/local/}
+        rom_path=${NES_TEST_ROMS_ROOT%/}/$relative_rom
+    fi
+
+    if [ ! -f "$rom_path" ]; then
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$revision" "$configuration" "$id" "$expected_hash" MISSING "$rom_path" >>"$results"
+        echo "$id: missing $rom_path" >&2
         continue
     fi
 
-    actual_hash=$(sha256sum "$rom" | cut -d ' ' -f 1)
+    actual_hash=$(sha256sum "$rom_path" | cut -d ' ' -f 1)
     if [ "$actual_hash" != "$expected_hash" ]; then
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$revision" "$configuration" "$id" "$actual_hash" HASH_MISMATCH "$rom" >>"$results"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$revision" "$configuration" "$id" "$actual_hash" HASH_MISMATCH "$rom_path" >>"$results"
         echo "$id: hash mismatch ($actual_hash, expected $expected_hash)" >&2
         continue
     fi
 
     output=${TMPDIR:-/tmp}/nes-p0-$id-$$.log
-    if target/release/julian_nes_emulator test-rom "$rom" "$max_instructions" >"$output" 2>&1; then
+    if target/release/julian_nes_emulator test-rom "$rom_path" "$max_instructions" >"$output" 2>&1; then
         result=PASS
     else
         result=FAIL

@@ -77,6 +77,13 @@ upstream revision), then run:
 ./test-roms/run_p0_validation.sh
 ```
 
+Alternatively, point the runner at an existing checkout of the pinned test-ROM
+repository instead of copying ROMs into `test-roms/local/`:
+
+```sh
+NES_TEST_ROMS_ROOT=../nes-test-roms ./test-roms/run_p0_validation.sh
+```
+
 The runner rejects hash mismatches and writes a tab-separated report containing
 the emulator Git revision, NTSC configuration, case, ROM hash, result, and
 diagnostic. Set `P0_RESULTS` to retain that report at a specific path. Missing,

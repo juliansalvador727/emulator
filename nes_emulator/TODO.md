@@ -48,7 +48,7 @@ this section is focused on edge-case fidelity and test-ROM validation.
   renderer migration.
 - [x] Add focused tests for each fetch phase, scrolling, sprite-zero, overflow,
   vblank/NMI, rendering blanking, mapper-visible accesses, and odd frames.
-- [ ] Run established PPU test ROMs for scrolling, sprite-zero, overflow,
+- [x] Run established PPU test ROMs for scrolling, sprite-zero, overflow,
   vblank/NMI, and odd-frame behavior through `test-roms/run_p0_validation.sh`.
 - [x] Re-run release probes and reviewed visual regressions after each vertical
   slice; investigate deliberate baseline changes rather than blindly replacing
@@ -74,7 +74,7 @@ scanline schedule.
   remain deferred until cartridge/submapper metadata can identify them.
 - [x] Remove the dot-260 approximation and its tests once edge-driven tests are
   in place.
-- [ ] Validate with MMC3 IRQ test ROMs and SMB2/SMB3-style status-bar splits;
+- [x] Validate with MMC3 IRQ test ROMs and SMB2/SMB3-style status-bar splits;
   compare against the captured SMB2 transition documented in
   `probes/RESULTS.md`.
 
