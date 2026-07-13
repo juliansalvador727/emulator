@@ -1,9 +1,8 @@
 # Rust NES Emulator
 
 A playable NES emulator written in Rust. It currently combines a complete
-official 6502 instruction set with dot-timed PPU state transitions, scanline
-composition, mapper-controlled banking and IRQs, controller input, and
-five-channel audio.
+official 6502 instruction set with a dot-driven PPU renderer, mapper-controlled
+banking and IRQs, controller input, and five-channel audio.
 
 The emulator is NTSC-oriented and uses SDL2 for video, keyboard input, and
 audio. NES documentation and test ROMs are the sources of truth for hardware
@@ -12,19 +11,18 @@ behaviour.
 ## Current support
 
 - All official 6502 opcodes, CPU interrupts, and `nestest` trace validation
-- Dot-based PPU timeline with vblank/NMI races, loopy scrolling, sprite-0 hit
-  timing, odd-frame skip, and scanline rendering
+- Dot-driven PPU rendering with fetch-timed loopy scrolling, sprite evaluation,
+  sprite-0 hit timing, vblank/NMI races, and odd-frame skipping
 - Background and sprite rendering, including 8×16 sprites, priority, clipping,
   and the eight-sprites-per-line limit
 - NROM (0), MMC1 (1), UxROM (2), CNROM (3), MMC3 (4), AxROM (7), and GxROM (66)
-- MMC3 scanline IRQs, currently using one clock at dot 260 rather than full A12
-  edge detection
+- Fetch-driven MMC3 IRQs using qualified PPU A12 edges
 - Pulse, triangle, noise, and DMC audio with IRQs, DMA, filtering, and SDL2
   playback
 - One standard controller through `$4016`
 - Headless performance probes and deterministic visual regression tests
 
-The test suite currently contains 142 passing tests. The prioritized remaining
+The test suite currently contains 179 passing tests. The prioritized remaining
 work is tracked in [`nes_emulator/TODO.md`](nes_emulator/TODO.md).
 
 ## Requirements
@@ -105,9 +103,9 @@ cargo run -- tiles /path/to/game.nes
 
 ## Known limitations
 
-- The compositor still renders a scanline as one unit; mid-scanline pixel
-  effects are not yet reproduced.
-- MMC3 IRQs need fetch-driven A12 edge detection.
-- OAM DMA copies data but does not yet model its full 513/514-cycle CPU stall.
+- Rendering-time `$2004/$2007` restrictions and exact PPUMASK transition timing
+  remain incomplete.
+- OAM DMA has its 513/514-cycle stall, but not alternating bus cycles or complete
+  DMC-DMA arbitration.
 - Unofficial 6502 opcodes, NES 2.0, PAL/Dendy timing, battery saves, save
   states, and a second controller remain to be implemented.

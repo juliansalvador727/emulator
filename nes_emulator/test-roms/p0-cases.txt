@@ -3,6 +3,7 @@
 # 95d8f621ae55cee0d09b91519a8989ae0e64753b. Binaries are not committed;
 # copy these directories beneath test-roms/local/ before running the suite.
 ppu-vbl-nmi|test-roms/local/ppu_vbl_nmi/ppu_vbl_nmi.nes|8dbab1be785585c399cf055ef02147b788ab75fd80e81cf9568a2feafc03fb7d|50000000
+ppu-open-bus|test-roms/local/ppu_open_bus/ppu_open_bus.nes|d4208a3ff6340532dd0fced7f9d408d5b6585853a0ddc9c1f64ee1722ef08e67|50000000
 sprite-hit-01|test-roms/local/sprite_hit_tests_2005.10.05/01.basics.nes|51819e8e502bd88fe3b7244198a074dbeef2e848f66c587be04b04f1f0d4bb52|50000000
 sprite-hit-02|test-roms/local/sprite_hit_tests_2005.10.05/02.alignment.nes|125bbb3ce1e67370f1f4559c2ad3221e52a3e98880b9789400292b5f3a8b39e6|50000000
 sprite-hit-03|test-roms/local/sprite_hit_tests_2005.10.05/03.corners.nes|9dd57776bc6267fe6183c5521d67cbe3fccc6662ae545eb2c419949bf39644d3|50000000

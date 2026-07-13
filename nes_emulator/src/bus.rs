@@ -108,9 +108,9 @@ impl Mem for Bus<'_> {
                 let mirror_down_addr = addr & 0b00000111_11111111;
                 self.cpu_vram[mirror_down_addr as usize]
             }
-            0x2000 | 0x2001 | 0x2003 | 0x2005 | 0x2006 | 0x4014 => {
-                panic!("Attempt to read from write-only PPU address {:x}", addr);
-            }
+            // Reads from nominally write-only PPU ports expose the PPU's
+            // internal I/O latch without refreshing it.
+            0x2000 | 0x2001 | 0x2003 | 0x2005 | 0x2006 => self.ppu.read_io_data_bus(),
             0x2002 => self.ppu.read_status(),
             0x2004 => self.ppu.read_oam_data(),
             0x2007 => self.ppu.read_data(),
@@ -149,8 +149,8 @@ impl Mem for Bus<'_> {
                 self.ppu.write_to_mask(data);
             }
 
-            // PPUSTATUS is read-only; writes are ignored by the hardware.
-            0x2002 => {}
+            // PPUSTATUS is read-only, but writes still drive the PPU I/O bus.
+            0x2002 => self.ppu.write_to_status(data),
 
             0x2003 => {
                 self.ppu.write_to_oam_addr(data);
@@ -289,8 +289,11 @@ mod test {
     }
 
     #[test]
-    fn writes_to_read_only_ppustatus_are_ignored() {
+    fn writes_to_read_only_ppustatus_drive_the_ppu_io_bus() {
         let mut bus = test_bus();
-        bus.mem_write(0x2002, 0xff);
+        bus.mem_write(0x2002, 0xa5);
+
+        assert_eq!(bus.mem_read(0x2000), 0xa5);
+        assert_eq!(bus.mem_read(0x3ff9), 0xa5);
     }
 }

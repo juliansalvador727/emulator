@@ -8,6 +8,12 @@ use registers::status::StatusRegister;
 
 pub mod registers;
 
+// The 2C02's CPU-facing I/O bus is a dynamic latch. Hardware measurements
+// vary with console and temperature (roughly 3-30 ms), so use a deterministic
+// 10 ms NTSC value. Decay is applied lazily when the CPU next observes or
+// drives the latch; this is equivalent to clocking it on every PPU dot.
+const PPU_IO_BUS_DECAY_DOTS: u64 = 53_693;
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProbeDiagnostics {
     pub oam_dma_count: u64,
@@ -39,6 +45,8 @@ pub struct NesPPU {
     pub status: StatusRegister,
     pub oam_addr: u8,
     internal_data_buf: u8,
+    io_data_bus: u8,
+    io_data_bus_refreshed_at: [u64; 8],
 
     // Current NTSC raster position. Dots are numbered 0..=340 and scanlines
     // 0..=261, with 261 being the pre-render line.
@@ -97,6 +105,8 @@ impl NesPPU {
             status: StatusRegister::new(),
             oam_addr: 0,
             internal_data_buf: 0,
+            io_data_bus: 0,
+            io_data_bus_refreshed_at: [0; 8],
             scanline: 0,
             dot: 0,
             odd_frame: false,
@@ -146,6 +156,37 @@ impl NesPPU {
             self.probe_diagnostics.last_scanline = self.scanline;
             self.probe_diagnostics.last_dot = self.dot as usize;
         }
+    }
+
+    fn decay_io_data_bus(&mut self) {
+        for bit in 0..8 {
+            if self.io_data_bus & (1 << bit) != 0
+                && self
+                    .total_dots
+                    .wrapping_sub(self.io_data_bus_refreshed_at[bit])
+                    >= PPU_IO_BUS_DECAY_DOTS
+            {
+                self.io_data_bus &= !(1 << bit);
+            }
+        }
+    }
+
+    fn drive_io_data_bus(&mut self, value: u8, driven_bits: u8) {
+        self.decay_io_data_bus();
+        self.io_data_bus = (self.io_data_bus & !driven_bits) | (value & driven_bits);
+        for bit in 0..8 {
+            if driven_bits & (1 << bit) != 0 {
+                self.io_data_bus_refreshed_at[bit] = self.total_dots;
+            }
+        }
+    }
+
+    /// Read a nominally write-only PPU register. No PPU circuitry drives the
+    /// bus during this access, so the current (possibly decayed) latch value is
+    /// returned without refreshing it.
+    pub fn read_io_data_bus(&mut self) -> u8 {
+        self.decay_io_data_bus();
+        self.io_data_bus
     }
 
     pub fn tick(&mut self, cycles: u8) -> bool {
@@ -471,7 +512,7 @@ impl NesPPU {
             (bg, _) if sprite_behind => bg_palette as usize * 4 + bg as usize,
             (_, sp) => 0x10 + sprite_palette as usize * 4 + sp as usize,
         };
-        let color = SYSTEM_PALLETE[(self.palette_table[palette_index] & 0x3f) as usize];
+        let color = self.output_color(self.palette_table[palette_index]);
         self.frame.set_pixel(x, self.scanline as usize, color);
 
         for sprite in &mut self.current_sprites {
@@ -487,13 +528,50 @@ impl NesPPU {
         }
     }
 
+    fn output_color(&self, palette_value: u8) -> (u8, u8, u8) {
+        // Greyscale is an index mask in the 2C02, not an RGB conversion.
+        let palette_value = if self.mask.is_grayscale() {
+            palette_value & 0x30
+        } else {
+            palette_value & 0x3f
+        };
+        let (mut red, mut green, mut blue) = SYSTEM_PALLETE[palette_value as usize];
+
+        // The NTSC emphasis signals primarily attenuate the two channels not
+        // being emphasized. Compose the three signals so combinations retain
+        // their tint while an all-bits mask darkens the whole image.
+        if self.mask.emphasise_red() {
+            green = attenuate(green);
+            blue = attenuate(blue);
+        }
+        if self.mask.emphasise_green() {
+            red = attenuate(red);
+            blue = attenuate(blue);
+        }
+        if self.mask.emphasise_blue() {
+            red = attenuate(red);
+            green = attenuate(green);
+        }
+
+        (red, green, blue)
+    }
+
+    fn palette_index(addr: u16) -> usize {
+        let index = ((addr - 0x3f00) & 0x1f) as usize;
+        if index >= 0x10 && index & 0x03 == 0 {
+            index - 0x10
+        } else {
+            index
+        }
+    }
+
     fn ppu_bus_read(&mut self, addr: u16) -> u8 {
         let addr = addr & 0x3fff;
         self.mapper.borrow_mut().on_ppu_bus_access(addr, self.total_dots);
         match addr {
             0x0000..=0x1fff => self.mapper.borrow_mut().ppu_read(addr),
             0x2000..=0x3eff => self.vram[self.mirror_vram_addr(addr) as usize],
-            0x3f00..=0x3fff => self.palette_table[(addr as usize - 0x3f00) & 0x1f],
+            0x3f00..=0x3fff => self.palette_table[Self::palette_index(addr)],
             _ => unreachable!(),
         }
     }
@@ -508,11 +586,7 @@ impl NesPPU {
                 self.vram[mirrored] = value;
             }
             0x3f00..=0x3fff => {
-                let mut index = (addr as usize - 0x3f00) & 0x1f;
-                if matches!(index, 0x10 | 0x14 | 0x18 | 0x1c) {
-                    index -= 0x10;
-                }
-                self.palette_table[index] = value;
+                self.palette_table[Self::palette_index(addr)] = value;
             }
             _ => unreachable!(),
         }
@@ -535,6 +609,7 @@ impl NesPPU {
     }
 
     pub fn write_to_ppu_addr(&mut self, value: u8) {
+        self.drive_io_data_bus(value, 0xff);
         self.note_register_write(0x2006);
         if self.loopy.write_addr(value) {
             self.notify_ppu_address_bus();
@@ -542,6 +617,7 @@ impl NesPPU {
     }
 
     pub fn write_to_ctrl(&mut self, value: u8) {
+        self.drive_io_data_bus(value, 0xff);
         self.note_register_write(0x2000);
         let generated_nmi = self.ctrl.generate_vblank_nmi();
         self.ctrl.update(value);
@@ -566,6 +642,7 @@ impl NesPPU {
     }
 
     pub fn write_to_mask(&mut self, value: u8) {
+        self.drive_io_data_bus(value, 0xff);
         self.note_register_write(0x2001);
         self.mask.update(value);
     }
@@ -573,7 +650,11 @@ impl NesPPU {
     // Reading PPUSTATUS clears vblank and resets the single shared $2005/$2006
     // write latch.
     pub fn read_status(&mut self) -> u8 {
-        let data = self.status.snapshot();
+        // PPUSTATUS drives only bits 7-5. Bits 4-0 retain their independent
+        // open-bus values and decay ages.
+        let status = self.status.snapshot();
+        self.drive_io_data_bus(status, 0xe0);
+        let data = self.io_data_bus;
         // A read immediately before vblank suppresses that frame's vblank flag
         // and NMI. A read on dot 1 clears the just-set flag/NMI below.
         if self.scanline == 241 && self.dot <= 1 {
@@ -587,22 +668,37 @@ impl NesPPU {
         data
     }
 
+    pub fn write_to_status(&mut self, value: u8) {
+        // PPUSTATUS is read-only, but a CPU write still drives the PPU I/O bus.
+        self.drive_io_data_bus(value, 0xff);
+    }
+
     pub fn write_to_oam_addr(&mut self, value: u8) {
+        self.drive_io_data_bus(value, 0xff);
         self.note_register_write(0x2003);
         self.oam_addr = value;
     }
 
     pub fn write_to_oam_data(&mut self, value: u8) {
+        self.drive_io_data_bus(value, 0xff);
         self.note_register_write(0x2004);
         self.oam_data[self.oam_addr as usize] = value;
         self.oam_addr = self.oam_addr.wrapping_add(1);
     }
 
-    pub fn read_oam_data(&self) -> u8 {
-        self.oam_data[self.oam_addr as usize]
+    pub fn read_oam_data(&mut self) -> u8 {
+        let mut value = self.oam_data[self.oam_addr as usize];
+        // Attribute bytes physically implement only bits 7-5 and 1-0. The
+        // unimplemented middle bits read as zero rather than open bus.
+        if self.oam_addr & 0x03 == 0x02 {
+            value &= 0xe3;
+        }
+        self.drive_io_data_bus(value, 0xff);
+        value
     }
 
     pub fn write_to_scroll(&mut self, value: u8) {
+        self.drive_io_data_bus(value, 0xff);
         self.note_register_write(0x2005);
         self.loopy.write_scroll(value);
     }
@@ -622,6 +718,7 @@ impl NesPPU {
     }
 
     pub fn write_to_data(&mut self, value: u8) {
+        self.drive_io_data_bus(value, 0xff);
         self.note_register_write(0x2007);
         let addr = self.loopy.current();
         self.ppu_bus_write(addr, value);
@@ -630,15 +727,25 @@ impl NesPPU {
     }
 
     pub fn read_data(&mut self) -> u8 {
-        let addr = self.loopy.current();
+        let addr = self.loopy.current() & 0x3fff;
         self.increment_vram_addr();
 
         let result = if addr < 0x3f00 {
             let result = self.internal_data_buf;
             self.internal_data_buf = self.ppu_bus_read(addr);
+            self.drive_io_data_bus(result, 0xff);
             result
         } else {
-            let result = self.ppu_bus_read(addr);
+            let palette = self.ppu_bus_read(addr);
+            let palette = if self.mask.is_grayscale() {
+                palette & 0x30
+            } else {
+                palette & 0x3f
+            };
+            // Palette RAM drives only six data lines. The high two retain
+            // their existing values and decay ages.
+            self.drive_io_data_bus(palette, 0x3f);
+            let result = self.io_data_bus;
             // Palette reads are immediate but still refill the delayed buffer
             // from the mirrored nametable address beneath palette space.
             self.internal_data_buf = self.ppu_bus_read(addr - 0x1000);
@@ -692,6 +799,10 @@ impl NesPPU {
     pub fn sync_scroll_for_test(&mut self) {
         self.loopy.copy_all_for_test();
     }
+}
+
+fn attenuate(channel: u8) -> u8 {
+    ((channel as u16 * 3) / 4) as u8
 }
 
 #[cfg(test)]
@@ -1191,6 +1302,173 @@ pub mod test {
         ppu.write_to_data(0x66);
 
         assert_eq!(ppu.vram[0x0305], 0x66);
+    }
+
+    #[test]
+    fn nametable_space_3000_through_3eff_mirrors_2000_through_2eff() {
+        let mut ppu = NesPPU::new_empty_rom();
+
+        ppu.write_to_ppu_addr(0x30);
+        ppu.write_to_ppu_addr(0x05);
+        ppu.write_to_data(0x66);
+        ppu.write_to_ppu_addr(0x20);
+        ppu.write_to_ppu_addr(0x05);
+        ppu.read_data();
+        assert_eq!(ppu.read_data(), 0x66);
+
+        ppu.write_to_ppu_addr(0x2e);
+        ppu.write_to_ppu_addr(0xff);
+        ppu.write_to_data(0x77);
+        ppu.write_to_ppu_addr(0x3e);
+        ppu.write_to_ppu_addr(0xff);
+        ppu.read_data();
+        ppu.write_to_ppu_addr(0x20);
+        ppu.write_to_ppu_addr(0x00);
+        assert_eq!(ppu.read_data(), 0x77);
+    }
+
+    #[test]
+    fn palette_universal_background_entries_alias_on_reads_and_writes() {
+        let mut ppu = NesPPU::new_empty_rom();
+
+        for (offset, value) in [(0x00, 0x01), (0x04, 0x12), (0x08, 0x23), (0x0c, 0x34)] {
+            ppu.write_to_ppu_addr(0x3f);
+            ppu.write_to_ppu_addr(offset);
+            ppu.write_to_data(value);
+
+            ppu.write_to_ppu_addr(0x3f);
+            ppu.write_to_ppu_addr(0x10 + offset);
+            assert_eq!(ppu.read_data(), value);
+        }
+    }
+
+    #[test]
+    fn palette_ram_mirrors_through_3fff() {
+        let mut ppu = NesPPU::new_empty_rom();
+
+        ppu.write_to_ppu_addr(0x3f);
+        ppu.write_to_ppu_addr(0x20);
+        ppu.write_to_data(0x21);
+        ppu.write_to_ppu_addr(0x3f);
+        ppu.write_to_ppu_addr(0x00);
+        assert_eq!(ppu.read_data(), 0x21);
+
+        ppu.write_to_ppu_addr(0x3f);
+        ppu.write_to_ppu_addr(0xff);
+        ppu.write_to_data(0x32);
+        ppu.write_to_ppu_addr(0x3f);
+        ppu.write_to_ppu_addr(0x1f);
+        assert_eq!(ppu.read_data(), 0x32);
+    }
+
+    #[test]
+    fn palette_read_refills_buffer_from_underlying_nametable() {
+        let mut ppu = NesPPU::new_empty_rom();
+        let underlying = ppu.mirror_vram_addr(0x2f05) as usize;
+        ppu.vram[underlying] = 0x5a;
+        ppu.palette_table[5] = 0x2a;
+
+        ppu.write_to_ppu_addr(0x3f);
+        ppu.write_to_ppu_addr(0x05);
+        assert_eq!(ppu.read_data(), 0x2a);
+
+        ppu.write_to_ppu_addr(0x20);
+        ppu.write_to_ppu_addr(0x00);
+        assert_eq!(ppu.read_data(), 0x5a);
+    }
+
+    #[test]
+    fn palette_read_combines_six_bit_value_with_ppu_io_bus_high_bits() {
+        let mut ppu = NesPPU::new_empty_rom();
+        ppu.palette_table[0] = 0x2a;
+
+        // The low address write is the last value on the I/O bus. $3FC0
+        // mirrors $3F00 and leaves both high bits set for the palette read.
+        ppu.write_to_ppu_addr(0x3f);
+        ppu.write_to_ppu_addr(0xc0);
+        assert_eq!(ppu.read_data(), 0xea);
+    }
+
+    #[test]
+    fn grayscale_masks_palette_reads_and_pixel_palette_indices() {
+        let mut ppu = NesPPU::new_empty_rom();
+        ppu.palette_table[1] = 0x2f;
+        ppu.write_to_mask(0x01);
+
+        ppu.write_to_ppu_addr(0x3f);
+        ppu.write_to_ppu_addr(0x01);
+        assert_eq!(ppu.read_data(), 0x20);
+        assert_eq!(ppu.output_color(0x2f), SYSTEM_PALLETE[0x20]);
+    }
+
+    #[test]
+    fn emphasis_attenuates_the_other_rgb_channels() {
+        let mut ppu = NesPPU::new_empty_rom();
+
+        ppu.write_to_mask(0x20);
+        assert_eq!(ppu.output_color(0x30), (0xff, 0xbf, 0xbf));
+        ppu.write_to_mask(0x40);
+        assert_eq!(ppu.output_color(0x30), (0xbf, 0xff, 0xbf));
+        ppu.write_to_mask(0x80);
+        assert_eq!(ppu.output_color(0x30), (0xbf, 0xbf, 0xff));
+    }
+
+    #[test]
+    fn ppustatus_preserves_low_bits_from_the_ppu_io_bus() {
+        let mut ppu = NesPPU::new_empty_rom();
+        ppu.status.set_vblank_status(true);
+        ppu.write_to_status(0x1b);
+
+        assert_eq!(ppu.read_status(), 0x9b);
+    }
+
+    #[test]
+    fn write_only_register_reads_do_not_refresh_the_io_bus() {
+        let mut ppu = NesPPU::new_empty_rom();
+        ppu.write_to_ctrl(0xa5);
+
+        ppu.total_dots = PPU_IO_BUS_DECAY_DOTS - 1;
+        assert_eq!(ppu.read_io_data_bus(), 0xa5);
+        ppu.total_dots += 1;
+        assert_eq!(ppu.read_io_data_bus(), 0x00);
+    }
+
+    #[test]
+    fn ppustatus_refreshes_only_the_three_status_bits() {
+        let mut ppu = NesPPU::new_empty_rom();
+        ppu.write_to_status(0x1f);
+        ppu.status.set_vblank_status(true);
+
+        ppu.total_dots = PPU_IO_BUS_DECAY_DOTS - 1;
+        assert_eq!(ppu.read_status(), 0x9f);
+        ppu.total_dots += 1;
+        assert_eq!(ppu.read_io_data_bus(), 0x80);
+    }
+
+    #[test]
+    fn palette_reads_refresh_only_the_six_palette_bits() {
+        let mut ppu = NesPPU::new_empty_rom();
+        ppu.palette_table[0] = 0x2a;
+        ppu.write_to_ppu_addr(0x3f);
+        ppu.write_to_ppu_addr(0x00);
+        ppu.write_to_status(0xc0);
+
+        ppu.total_dots = PPU_IO_BUS_DECAY_DOTS - 1;
+        assert_eq!(ppu.read_data(), 0xea);
+
+        ppu.total_dots += 1;
+        assert_eq!(ppu.read_io_data_bus(), 0x2a);
+    }
+
+    #[test]
+    fn oam_attribute_reads_clear_unimplemented_bits() {
+        let mut ppu = NesPPU::new_empty_rom();
+        ppu.write_to_oam_addr(0x02);
+        ppu.write_to_oam_data(0xff);
+        ppu.write_to_oam_addr(0x02);
+
+        assert_eq!(ppu.read_oam_data(), 0xe3);
+        assert_eq!(ppu.read_io_data_bus(), 0xe3);
     }
 
     #[test]

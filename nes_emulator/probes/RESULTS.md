@@ -6,12 +6,14 @@ on the target host before changing PPU timing.
 
 ## Deterministic timing validation
 
-The Rust suite now has 167 passing tests. P0 coverage records exact
+The Rust suite now has 179 passing tests. P0 coverage records exact
 mapper-visible background, prefetch, dummy, and sprite fetch addresses/dots;
 blanked rendering; sprite-zero left-edge and x=255 behavior; vblank/NMI races;
 odd-frame skipping; all background/sprite pattern-table combinations; PPUDATA
 A12 activity; the eight-dot MMC3 low filter; and IRQ latch/reload/enable/
-acknowledge/level behavior.
+acknowledge/level behavior. PPU register coverage also includes palette
+mirroring, greyscale/emphasis output, the CPU-facing I/O latch, partial-bit
+refresh, deterministic decay, and OAM attribute read masking.
 
 `test-roms/run_p0_validation.sh` provides hash-checked execution and revisioned
 TSV results for external blargg/nesdev ROMs. The binaries remain outside this
@@ -28,11 +30,12 @@ empty-slot sprite fetch addresses were:
 | Suite | Passed | Remaining first failure |
 | --- | ---: | --- |
 | `ppu_vbl_nmi` combined | 10/10 | None |
+| `ppu_open_bus` | 1/1 | None |
 | `sprite_hit_tests_2005.10.05` | 11/11 | None |
 | `sprite_overflow_tests` | 5/5 | None |
 | `mmc3_irq_tests` (revision B) | 5/5 | None |
 
-All 22 configured cases pass, including MMC3 counter/manual A12 clocking,
+All 23 configured cases pass, including PPU open-bus behavior, MMC3 counter/manual A12 clocking,
 revision-B zero-latch behavior, sprite-hit/overflow timing, vblank/NMI races,
 and exact odd/even frame timing.
 

@@ -8,7 +8,7 @@ lower-priority backlog at the end of this file.
 
 Current verified baseline (2026-07-13):
 
-- 167 passing Rust tests.
+- 179 passing Rust tests.
 - All official 6502 opcodes; `nestest` matches 5,003 official-opcode entries.
 - NROM, MMC1, UxROM, CNROM, MMC3, AxROM, and GxROM/GNROM.
 - Dot-driven background and sprite rendering with mapper-visible PPU fetches.
@@ -83,14 +83,14 @@ status-bar splits no longer exhibit one-line jitter.
 
 ## P1 — Finish PPU register and memory behavior
 
-- [ ] Mirror `$3000-$3EFF` to `$2000-$2EFF` for reads and writes instead of
+- [x] Mirror `$3000-$3EFF` to `$2000-$2EFF` for reads and writes instead of
   panicking.
-- [ ] Correct palette behavior:
+- [x] Correct palette behavior:
   - `$3F10/$3F14/$3F18/$3F1C` aliases on both reads and writes;
   - palette-space mirroring through `$3FFF`;
   - buffered-read interaction and open-bus high bits;
   - PPUMASK grayscale and color-emphasis output.
-- [ ] Model PPU open bus and decay closely enough for the relevant test ROMs.
+- [x] Model PPU open bus and decay closely enough for the relevant test ROMs.
 - [ ] Complete `$2002/$2004/$2007` behavior during rendering, including OAM
   access restrictions/corruption and rendering-time `$2007` address changes.
 - [ ] Model delayed PPUMASK rendering enable/disable effects and exact left-edge
