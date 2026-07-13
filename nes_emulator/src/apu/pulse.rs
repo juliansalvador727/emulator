@@ -17,6 +17,7 @@ const DUTY_TABLE: [[u8; 8]; 4] = [
     [1, 0, 0, 1, 1, 1, 1, 1], // 25% negated
 ];
 
+#[derive(Clone)]
 pub struct Pulse {
     // Pulse 1's sweep adds the ones' complement of the change amount,
     // pulse 2 the two's complement (see sweep_target()).

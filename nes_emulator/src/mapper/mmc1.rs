@@ -20,6 +20,7 @@ use crate::cartridge::{Mirroring, Rom};
 // PRG-RAM lives at $6000-$7FFF. CHR is 4 KB-banked ROM, or a flat 8 KB of
 // CHR-RAM when the cartridge ships no CHR (the bank registers then don't matter
 // since the RAM is only 8 KB).
+#[derive(Clone)]
 pub struct Mmc1 {
     prg_rom: Vec<u8>,
     chr: Vec<u8>,

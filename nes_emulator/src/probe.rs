@@ -172,6 +172,8 @@ struct FrameRow {
     cumulative_samples: u64,
     hash: u64,
     audio_backlog: u32,
+    audio_queued: u32,
+    audio_pending: u32,
     oam_dmas: u64,
     visible_writes: u64,
     last_register: u16,
@@ -216,17 +218,19 @@ fn write_report(path: &Path, rows: &[FrameRow]) -> Result<(), String> {
             .map_err(|err| format!("create {}: {err}", parent.display()))?;
     }
     let mut out = String::from(
-        "frame,host_ms,samples,cumulative_samples,frame_hash,audio_backlog_bytes,oam_dmas,visible_ppu_writes,last_register,last_scanline,last_dot\n",
+        "frame,host_ms,samples,cumulative_samples,frame_hash,audio_backlog_bytes,audio_queued_bytes,audio_pending_bytes,oam_dmas,visible_ppu_writes,last_register,last_scanline,last_dot\n",
     );
     for row in rows {
         out.push_str(&format!(
-            "{},{:.6},{},{},{:016x},{},{},{},0x{:04x},{},{}\n",
+            "{},{:.6},{},{},{:016x},{},{},{},{},{},0x{:04x},{},{}\n",
             row.frame,
             row.host_ms,
             row.samples,
             row.cumulative_samples,
             row.hash,
             row.audio_backlog,
+            row.audio_queued,
+            row.audio_pending,
             row.oam_dmas,
             row.visible_writes,
             row.last_register,
@@ -262,8 +266,23 @@ pub fn run_probe(rom_path: &str, script: &str, max_frames: u32) -> Result<(), St
         error: None,
     }));
 
-    let audio_pump = config.realtime.then(AudioPump::start);
+    let audio_config = audio::AudioConfig::from_env()?;
+    let audio_pump = config
+        .realtime
+        .then(|| AudioPump::start_with_config(audio_config.clone()));
     let audio_stats = audio_pump.as_ref().map(|pump| pump.stats.clone());
+    let audio_chunk_pump = audio_pump.clone();
+    let audio_pacer = Rc::new(RefCell::new(audio::AudioPacer::new()));
+    let callback_audio_pacer = Rc::clone(&audio_pacer);
+    let chunk_audio_pacer = Rc::clone(&audio_pacer);
+    let audio_chunk_samples = if config.realtime {
+        audio_config.delivery_samples
+    } else {
+        usize::MAX
+    };
+    let chunk_samples_since_frame = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let callback_chunk_samples = chunk_samples_since_frame.clone();
+    let delivered_chunk_samples = chunk_samples_since_frame.clone();
     let callback_state = Rc::clone(&state);
     let callback_done = Rc::clone(&done);
     let callback_config = Rc::clone(&config);
@@ -273,7 +292,7 @@ pub fn run_probe(rom_path: &str, script: &str, max_frames: u32) -> Result<(), St
     let mut next_frame = Instant::now();
     let frame_duration = Duration::from_secs_f64(1.0 / NES_FPS);
 
-    let bus = Bus::new(rom, move |ppu, apu, joypad| {
+    let bus = Bus::new_with_audio(rom, move |ppu, apu, joypad| {
         frame_no += 1;
         for button in [
             JoypadButton::BUTTON_A,
@@ -295,12 +314,18 @@ pub fn run_probe(rom_path: &str, script: &str, max_frames: u32) -> Result<(), St
 
         let now = Instant::now();
         let samples = apu.drain_samples();
-        cumulative_samples += samples.len() as u64;
+        let frame_samples = samples.len() as u64
+            + callback_chunk_samples.swap(0, std::sync::atomic::Ordering::Relaxed);
+        cumulative_samples += frame_samples;
         let diag = ppu.probe_diagnostics();
         let hash = frame_hash(ppu.frame());
         let backlog = audio_pump
             .as_ref()
             .map_or(audio::BACKLOG_UNAVAILABLE, AudioPump::backlog_bytes);
+        let queued = audio_pump
+            .as_ref()
+            .map_or(audio::BACKLOG_UNAVAILABLE, AudioPump::queued_bytes);
+        let pending = audio_pump.as_ref().map_or(0, AudioPump::pending_bytes);
 
         let mut state = callback_state.borrow_mut();
         let previous_diag = state.previous_diag;
@@ -308,10 +333,12 @@ pub fn run_probe(rom_path: &str, script: &str, max_frames: u32) -> Result<(), St
         state.rows.push(FrameRow {
             frame: frame_no,
             host_ms,
-            samples: samples.len(),
+            samples: frame_samples as usize,
             cumulative_samples,
             hash,
             audio_backlog: backlog,
+            audio_queued: queued,
+            audio_pending: pending,
             oam_dmas: diag.oam_dma_count - previous_diag.oam_dma_count,
             visible_writes: diag.visible_register_writes - previous_diag.visible_register_writes,
             last_register: diag.last_register,
@@ -391,27 +418,37 @@ pub fn run_probe(rom_path: &str, script: &str, max_frames: u32) -> Result<(), St
         drop(state);
 
         if let Some(pump) = &audio_pump {
+            let residual_samples = samples.len();
             pump.push(samples);
-            let pace_duration = if backlog == audio::BACKLOG_UNAVAILABLE {
-                frame_duration
+            callback_audio_pacer
+                .borrow_mut()
+                .pace(residual_samples, pump);
+            if pump.backlog_bytes() == audio::BACKLOG_UNAVAILABLE {
+                next_frame += frame_duration;
+                let now = Instant::now();
+                if now < next_frame {
+                    std::thread::sleep(next_frame - now);
+                } else {
+                    next_frame = now;
+                }
             } else {
-                let bytes_per_second =
-                    audio::SAMPLE_RATE as f64 * std::mem::size_of::<f32>() as f64;
-                let error_secs =
-                    (backlog as f64 - audio::PACE_TARGET_QUEUED_BYTES as f64) / bytes_per_second;
-                let correction_secs = (error_secs * 0.05).clamp(-0.003, 0.003);
-                Duration::from_secs_f64(frame_duration.as_secs_f64() + correction_secs)
-            };
-            next_frame += pace_duration;
-            let now = Instant::now();
-            if now < next_frame {
-                std::thread::sleep(next_frame - now);
-            } else {
-                next_frame = now;
+                next_frame = Instant::now();
             }
         }
         if frame_no >= max_frames || callback_state.borrow().error.is_some() {
             callback_done.set(true);
+        }
+    }, audio_chunk_samples, move |samples| {
+        delivered_chunk_samples.fetch_add(
+            samples.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if let Some(pump) = &audio_chunk_pump {
+            let sample_count = samples.len();
+            pump.push(samples);
+            chunk_audio_pacer
+                .borrow_mut()
+                .pace(sample_count, pump);
         }
     });
 

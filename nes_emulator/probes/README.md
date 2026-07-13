@@ -10,10 +10,11 @@ The final `PROBE_SUMMARY` records emulated FPS, average/p95/max host frame
 time, generated samples and long-run sample drift. Audio queue fields are
 `4294967295` (`BACKLOG_UNAVAILABLE`) in the default headless mode.
 
-Set `PROBE_REALTIME=1` to pace at the NTSC frame rate and feed the real SDL
-audio pump. That mode additionally records queue minimum/maximum/end depth,
-dropped samples, estimated underflow samples, and device reopens. It needs a
-working SDL audio device; CI can use `SDL_AUDIODRIVER=dummy` to exercise the
+Set `PROBE_REALTIME=1` to use the windowed frontend's sub-frame SDL audio pump
+and chunk pacer. That mode additionally records queue minimum/maximum/end
+depth, dropped samples, estimated underflow samples, and device reopens. Select
+`NES_AUDIO_PROFILE=low|balanced` exactly as in the windowed emulator. It needs
+a working SDL audio device; CI can use `SDL_AUDIODRIVER=dummy` to exercise the
 pipeline without speakers.
 
 ## Deterministic images and reports
@@ -26,7 +27,8 @@ pipeline without speakers.
   corresponding baseline and returns a non-zero status on a missing or changed
   image.
 - `PROBE_REPORT=<path.csv>` writes per-frame timing, sample count, frame hash,
-  audio depth, OAM DMA count, and visible-time PPU-register-write context.
+  total/SDL/pending audio depths, OAM DMA count, and visible-time PPU-register-
+  write context.
 - `PROBE_VERBOSE=1` mirrors a compact per-frame record to stderr.
 - `PROBE_TRACE_WRITES=1` logs APU register writes; it is off by default so it
   cannot perturb profiling.

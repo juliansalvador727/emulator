@@ -5,6 +5,7 @@ use crate::cartridge::{Mirroring, Rom};
 // 16 KB banks (low bits of any write to $8000-$FFFF); $C000-$FFFF is hardwired
 // to the last 16 KB bank. CHR is always 8 KB of CHR-RAM. Mirroring is fixed by
 // the header.
+#[derive(Clone)]
 pub struct Uxrom {
     prg_rom: Vec<u8>,
     chr: Vec<u8>,

@@ -1,6 +1,7 @@
 // The PPU's shared scrolling/addressing state (usually called the "loopy"
 // registers). $2000, $2005 and $2006 all feed the temporary address `t`; the
 // renderer walks the current address `v` and uses `x` as the fine-X offset.
+#[derive(Clone)]
 pub struct LoopyRegister {
     v: u16,
     t: u16,

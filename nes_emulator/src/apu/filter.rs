@@ -7,6 +7,7 @@
 
 use std::f32::consts::PI;
 
+#[derive(Clone)]
 pub struct HighPassFilter {
     alpha: f32,
     prev_input: f32,
@@ -32,6 +33,7 @@ impl HighPassFilter {
     }
 }
 
+#[derive(Clone)]
 pub struct LowPassFilter {
     alpha: f32,
     prev_output: f32,

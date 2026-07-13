@@ -21,6 +21,22 @@ pub struct Bus<'call> {
     cycles: usize,
     oam_dma_pending: bool,
     gameloop_callback: Box<dyn FnMut(&NesPPU, &mut NesAPU, &mut Joypad) + 'call>,
+    audio_chunk_samples: Option<usize>,
+    audio_callback: Box<dyn FnMut(Vec<f32>) + 'call>,
+    audio_delivery_enabled: bool,
+    host_frame_ready: bool,
+    joypad1: Joypad,
+}
+
+pub struct BusSnapshot {
+    cpu_vram: [u8; 2048],
+    mapper: SharedMapper,
+    ppu: NesPPU,
+    apu: NesAPU,
+    cycles: usize,
+    oam_dma_pending: bool,
+    audio_delivery_enabled: bool,
+    host_frame_ready: bool,
     joypad1: Joypad,
 }
 
@@ -29,6 +45,23 @@ impl<'a> Bus<'a> {
     where
         F: FnMut(&NesPPU, &mut NesAPU, &mut Joypad) + 'call,
     {
+        Self::new_with_audio(rom, gameloop_callback, usize::MAX, |_| {})
+    }
+
+    /// Construct a bus that forwards completed audio chunks independently of
+    /// video frames. `audio_chunk_samples` is a host-delivery quantum, not an
+    /// emulation timing parameter; the APU still runs at the CPU clock.
+    pub fn new_with_audio<'call, F, A>(
+        rom: Rom,
+        gameloop_callback: F,
+        audio_chunk_samples: usize,
+        audio_callback: A,
+    ) -> Bus<'call>
+    where
+        F: FnMut(&NesPPU, &mut NesAPU, &mut Joypad) + 'call,
+        A: FnMut(Vec<f32>) + 'call,
+    {
+        assert!(audio_chunk_samples > 0);
         let mapper = mapper::from_rom(rom);
         let ppu = NesPPU::new(Rc::clone(&mapper));
         Bus {
@@ -39,13 +72,34 @@ impl<'a> Bus<'a> {
             cycles: 0,
             oam_dma_pending: false,
             gameloop_callback: Box::from(gameloop_callback),
+            audio_chunk_samples: (audio_chunk_samples != usize::MAX)
+                .then_some(audio_chunk_samples),
+            audio_callback: Box::from(audio_callback),
+            audio_delivery_enabled: true,
+            host_frame_ready: false,
             joypad1: Joypad::new(),
         }
     }
+
+    #[inline]
+    fn deliver_audio_chunks(&mut self) {
+        let Some(chunk_samples) = self.audio_chunk_samples else {
+            return;
+        };
+        if !self.audio_delivery_enabled {
+            return;
+        }
+        while self.apu.buffered_samples() >= chunk_samples {
+            let samples = self.apu.drain_sample_chunk(chunk_samples);
+            (self.audio_callback)(samples);
+        }
+    }
+
     pub fn tick(&mut self, cycles: u8) {
         self.cycles += cycles as usize;
         self.apu.tick(cycles);
-        let mut frame_complete = self.ppu.tick(cycles * 3);
+        self.ppu.tick(cycles * 3);
+        let mut frame_ready = self.ppu.take_frame_ready();
 
         // OAM DMA halts the CPU for 513 cycles, plus one alignment cycle when
         // it starts on an odd CPU cycle. The PPU and APU continue to run.
@@ -57,7 +111,8 @@ impl<'a> Bus<'a> {
             self.cycles += stall;
             for _ in 0..stall {
                 self.apu.tick(1);
-                frame_complete |= self.ppu.tick(3);
+                self.ppu.tick(3);
+                frame_ready |= self.ppu.take_frame_ready();
             }
         }
 
@@ -72,16 +127,69 @@ impl<'a> Bus<'a> {
             self.apu.dmc_dma_load(value);
             self.cycles += 4;
             self.apu.tick(4);
-            frame_complete |= self.ppu.tick(12);
+            self.ppu.tick(12);
+            frame_ready |= self.ppu.take_frame_ready();
         }
 
-        // Presentation and audio draining are video-frame events, independent
-        // of whether a game enables NMI. Tying this callback to an NMI edge
-        // silently skipped frames (and accumulated audio) during NMI-disabled
-        // transitions, making profiling and host playback drift.
-        if frame_complete {
+        self.deliver_audio_chunks();
+
+        // Presentation, input sampling, and audio delivery happen at the start
+        // of vblank, before the CPU can service the NMI and poll the controller.
+        // The event remains independent of NMI enable so transitions with NMI
+        // disabled cannot skip host frames or accumulate audio.
+        if frame_ready {
+            self.host_frame_ready = true;
             (self.gameloop_callback)(&self.ppu, &mut self.apu, &mut self.joypad1);
         }
+    }
+
+    pub fn take_host_frame_ready(&mut self) -> bool {
+        std::mem::take(&mut self.host_frame_ready)
+    }
+
+    pub fn ppu(&self) -> &NesPPU {
+        &self.ppu
+    }
+
+    pub fn joypad_mut(&mut self) -> &mut Joypad {
+        &mut self.joypad1
+    }
+
+    pub fn joypad(&self) -> &Joypad {
+        &self.joypad1
+    }
+
+    pub fn set_audio_delivery_enabled(&mut self, enabled: bool) {
+        self.audio_delivery_enabled = enabled;
+    }
+
+    pub fn snapshot(&self) -> BusSnapshot {
+        let cloned_mapper = self.mapper.borrow().as_ref().clone_box();
+        let mapper = Rc::new(std::cell::RefCell::new(cloned_mapper));
+        let ppu = self.ppu.clone_with_mapper(Rc::clone(&mapper));
+        BusSnapshot {
+            cpu_vram: self.cpu_vram,
+            mapper,
+            ppu,
+            apu: self.apu.clone(),
+            cycles: self.cycles,
+            oam_dma_pending: self.oam_dma_pending,
+            audio_delivery_enabled: self.audio_delivery_enabled,
+            host_frame_ready: self.host_frame_ready,
+            joypad1: self.joypad1.clone(),
+        }
+    }
+
+    pub fn restore(&mut self, snapshot: BusSnapshot) {
+        self.cpu_vram = snapshot.cpu_vram;
+        self.mapper = snapshot.mapper;
+        self.ppu = snapshot.ppu;
+        self.apu = snapshot.apu;
+        self.cycles = snapshot.cycles;
+        self.oam_dma_pending = snapshot.oam_dma_pending;
+        self.audio_delivery_enabled = snapshot.audio_delivery_enabled;
+        self.host_frame_ready = snapshot.host_frame_ready;
+        self.joypad1 = snapshot.joypad1;
     }
 
     pub fn poll_nmi_status(&mut self) -> Option<u8> {
@@ -257,19 +365,59 @@ mod test {
     }
 
     #[test]
-    fn frame_callback_does_not_depend_on_nmi_enable() {
+    fn frame_callback_fires_at_vblank_without_nmi_enabled() {
         let callbacks = std::rc::Rc::new(std::cell::Cell::new(0));
         let callback_count = callbacks.clone();
         let mut bus = Bus::new(test_rom(vec![]), move |_, _, _| {
             callback_count.set(callback_count.get() + 1);
         });
 
-        // One NTSC PPU frame is 262 * 341 dots, advanced three dots per CPU
-        // cycle. PPUCTRL remains at its reset value, with NMI disabled.
-        for _ in 0..29_781 {
+        // The first vblank begins while the raster is still well short of the
+        // end-of-frame wrap. PPUCTRL remains at reset with NMI disabled.
+        for _ in 0..27_393 {
             bus.tick(1);
         }
+        assert_eq!(callbacks.get(), 0);
+        bus.tick(1);
         assert_eq!(callbacks.get(), 1);
+    }
+
+    #[test]
+    fn vblank_callback_input_is_visible_to_the_next_controller_poll() {
+        let mut bus = Bus::new(test_rom(vec![]), |_, _, joypad| {
+            joypad.set_button_pressed_status(crate::joypad::JoypadButton::BUTTON_A, true);
+        });
+
+        for _ in 0..27_394 {
+            bus.tick(1);
+        }
+        bus.mem_write(0x4016, 1);
+        bus.mem_write(0x4016, 0);
+        assert_eq!(bus.mem_read(0x4016), 1);
+    }
+
+    #[test]
+    fn audio_chunks_are_delivered_before_a_video_frame_completes() {
+        let delivered = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let callback_delivered = delivered.clone();
+        let mut bus = Bus::new_with_audio(
+            test_rom(vec![]),
+            |_, _, _| {},
+            256,
+            move |samples| {
+                assert_eq!(samples.len(), 256);
+                callback_delivered.set(callback_delivered.get() + samples.len());
+            },
+        );
+        bus.apu.set_sample_rate(crate::audio::SAMPLE_RATE);
+
+        // 11,000 CPU cycles produce about 271 samples, well before the first
+        // vblank at ~27,394 cycles.
+        for _ in 0..220 {
+            bus.tick(50);
+        }
+        assert_eq!(delivered.get(), 256);
+        assert!(bus.apu.buffered_samples() < 256);
     }
 
     #[test]

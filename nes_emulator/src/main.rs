@@ -18,13 +18,10 @@ extern crate lazy_static;
 #[macro_use]
 extern crate bitflags;
 
-use apu::NesAPU;
 use bus::Bus;
 use cartridge::Rom;
 use cpu::CPU;
-use joypad::Joypad;
 use joypad::JoypadButton;
-use ppu::NesPPU;
 use render::show_tile;
 use trace::trace;
 
@@ -36,17 +33,25 @@ use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 use sdl2::pixels::PixelFormatEnum;
 
-// Runs a game ROM, presenting the PPU's frame to an SDL2 window.
-// The PPU composites each scanline into its own frame as it crosses the line;
-// the bus fires the callback once per completed frame, where we just blit
-// the finished frame and pace the loop.
-fn run_game(rom_path: &str) {
-    // Keep PulseAudio's server-side buffer bounded. Very small values make
-    // WSLg's sink stop calling SDL's callback after a short run; 80 ms is
-    // below Pulse's default while leaving the sink breathing room.
+// Runs a game ROM, presenting the PPU's frame to an SDL2 window. The frontend
+// stops the CPU at each vblank boundary, samples input before the game's NMI
+// handler, and advances audio in small wall-clock-paced chunks.
+fn run_game(
+    rom_path: &str,
+    audio_config: audio::AudioConfig,
+    latency_debug: bool,
+    run_ahead_frames: u8,
+) {
+    // Keep PulseAudio's server-side buffer bounded. The profile selects 40 ms
+    // natively and the established 80 ms WSLg-safe fallback unless overridden.
     if std::env::var_os("PULSE_LATENCY_MSEC").is_none() {
         // SAFETY: called before SDL init spawns any threads.
-        unsafe { std::env::set_var("PULSE_LATENCY_MSEC", "80") };
+        unsafe {
+            std::env::set_var(
+                "PULSE_LATENCY_MSEC",
+                audio_config.pulse_latency_ms.to_string(),
+            )
+        };
     }
 
     let sdl_context = sdl2::init().unwrap();
@@ -72,7 +77,9 @@ fn run_game(rom_path: &str) {
     // All audio-device work happens on the pump's own thread (see
     // src/audio.rs); the game loop just pushes samples and reads the
     // backlog gauge, so a wedged sound server can never stall gameplay.
-    let audio_pump = audio::AudioPump::start();
+    let audio_pump = audio::AudioPump::start_with_config(audio_config.clone());
+    let audio_chunk_pump = audio_pump.clone();
+    let audio_chunk_samples = audio_config.delivery_samples;
     let sample_rate = audio::SAMPLE_RATE;
 
     let rom_path = resolve_rom_path(rom_path);
@@ -98,102 +105,164 @@ fn run_game(rom_path: &str) {
     // emulation speed locked to the host DAC without touching the APU sample
     // clock, so pitch stays stable.
     let frame_duration = std::time::Duration::from_nanos(16_639_354);
-    let frame_duration_secs = frame_duration.as_secs_f64();
-    let bytes_per_second = sample_rate as f64 * sample_bytes as f64;
     let mut next_frame = std::time::Instant::now();
 
     // NES_AUDIO_DEBUG=1: log the audio pipeline state once per second to
     // stderr, for chasing pacing/latency drift (the SDL queue depth is the
     // host-side audio latency).
-    let debug_audio = std::env::var("NES_AUDIO_DEBUG").is_ok();
+    let debug_audio = latency_debug
+        || std::env::var("NES_AUDIO_DEBUG").is_ok()
+        || std::env::var("NES_LATENCY_DEBUG").is_ok();
     let run_start = std::time::Instant::now();
     let mut frames: u64 = 0;
-    let mut samples_produced: u64 = 0;
+    let samples_produced = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let chunk_samples_produced = samples_produced.clone();
+    let audio_pacer = std::rc::Rc::new(std::cell::RefCell::new(audio::AudioPacer::new()));
+    let chunk_audio_pacer = audio_pacer.clone();
 
-    // Called by the bus at each completed video frame: present the PPU frame,
-    // queue the frame's audio, pace the loop, and drain the SDL event queue
-    // (updating the joypad) so the window stays responsive.
-    let bus = Bus::new(
+    if debug_audio {
+        eprintln!(
+            "LATENCY audio_profile={:?} pulse={}ms device_request={} samples delivery={} target={} samples high_water={} samples run_ahead={}",
+            audio_config.profile,
+            audio_config.pulse_latency_ms,
+            audio_config.device_samples,
+            audio_config.delivery_samples,
+            audio_config.target_queued_samples(),
+            audio_config.high_water_samples(),
+            run_ahead_frames,
+        );
+    }
+
+    // Host presentation is driven explicitly below so a snapshot can be
+    // advanced speculatively without recursively entering an SDL callback.
+    let bus = Bus::new_with_audio(
         rom,
-        move |ppu: &NesPPU, apu: &mut NesAPU, joypad: &mut Joypad| {
-            texture.update(None, &ppu.frame().data, 256 * 3).unwrap();
-            canvas.copy(&texture, None, None).unwrap();
-            canvas.present();
-
-            let samples = apu.drain_samples();
-            frames += 1;
-            samples_produced += samples.len() as u64;
-            let backlog = audio_pump.backlog_bytes();
-            audio_pump.push(samples);
-
-            if debug_audio && frames % 60 == 0 {
-                let elapsed = run_start.elapsed().as_secs_f64();
-                eprintln!(
-                    "AUDIO t={:7.2}s frames={} fps={:.4} backlog={}B ({:.1}ms) produced={} ({:.1}/s) reopens={} dropped={} underflows={} lock_misses={}",
-                    elapsed,
-                    frames,
-                    frames as f64 / elapsed,
-                    backlog,
-                    backlog as f64 / (sample_rate as f64 * sample_bytes as f64) * 1000.0,
-                    samples_produced,
-                    samples_produced as f64 / elapsed,
-                    audio_pump.stats.reopens.load(std::sync::atomic::Ordering::Relaxed),
-                    audio_pump.stats.dropped_samples.load(std::sync::atomic::Ordering::Relaxed),
-                    audio_pump.stats.underflow_samples.load(std::sync::atomic::Ordering::Relaxed),
-                    audio_pump.stats.lock_miss_samples.load(std::sync::atomic::Ordering::Relaxed),
-                );
-            }
-
-            let pace_duration = if backlog == audio::BACKLOG_UNAVAILABLE {
-                frame_duration
-            } else {
-                let error_secs =
-                    (backlog as f64 - audio::PACE_TARGET_QUEUED_BYTES as f64) / bytes_per_second;
-                // Follow even unusually slow/fast host sinks instead of
-                // allowing the pending queue to grow until samples are
-                // dropped. With a correctly clocked 44.1 kHz sink this
-                // correction remains close to zero.
-                let correction_secs = (error_secs * 0.05).clamp(-0.003, 0.003);
-                std::time::Duration::from_secs_f64(frame_duration_secs + correction_secs)
-            };
-
-            next_frame += pace_duration;
-            let now = std::time::Instant::now();
-            if now < next_frame {
-                std::thread::sleep(next_frame - now);
-            } else {
-                // Fell behind (e.g. the window was dragged); resync rather than
-                // fast-forwarding to catch up.
-                next_frame = now;
-            }
-
-            for event in event_pump.poll_iter() {
-                match event {
-                    Event::Quit { .. }
-                    | Event::KeyDown {
-                        keycode: Some(Keycode::Escape),
-                        ..
-                    } => std::process::exit(0),
-                    Event::KeyDown { keycode, .. } => {
-                        if let Some(button) = keycode.and_then(|k| key_map.get(&k)) {
-                            joypad.set_button_pressed_status(*button, true);
-                        }
-                    }
-                    Event::KeyUp { keycode, .. } => {
-                        if let Some(button) = keycode.and_then(|k| key_map.get(&k)) {
-                            joypad.set_button_pressed_status(*button, false);
-                        }
-                    }
-                    _ => { /* do nothing */ }
-                }
-            }
+        |_, _, _| {},
+        audio_chunk_samples,
+        move |samples| {
+            let sample_count = samples.len();
+            chunk_samples_produced.fetch_add(
+                sample_count as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            audio_chunk_pump.push(samples);
+            chunk_audio_pacer
+                .borrow_mut()
+                .pace(sample_count, &audio_chunk_pump);
         },
     );
 
     let mut cpu = CPU::new(bus);
     cpu.bus.apu.set_sample_rate(sample_rate);
     cpu.reset();
-    cpu.run();
+    cpu.run_until_frame_ready();
+    let mut run_ahead_frame: Option<render::frame::Frame> = None;
+
+    loop {
+        let present_started = std::time::Instant::now();
+        let frame = run_ahead_frame
+            .as_ref()
+            .unwrap_or_else(|| cpu.bus.ppu().frame());
+        texture.update(None, &frame.data, 256 * 3).unwrap();
+        canvas.copy(&texture, None, None).unwrap();
+        canvas.present();
+        let present_us = present_started.elapsed().as_micros();
+
+        // Forward the sub-chunk remainder at vblank. Most samples have already
+        // reached the pump through Bus::new_with_audio.
+        let samples = cpu.bus.apu.drain_samples();
+        samples_produced.fetch_add(
+            samples.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let residual_samples = samples.len();
+        audio_pump.push(samples);
+        audio_pacer
+            .borrow_mut()
+            .pace(residual_samples, &audio_pump);
+        let backlog = audio_pump.backlog_bytes();
+        frames += 1;
+
+        if debug_audio && frames % 60 == 0 {
+            let elapsed = run_start.elapsed().as_secs_f64();
+            let produced = samples_produced.load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "LATENCY t={:7.2}s frames={} fps={:.4} present={}us audio_total={}B ({:.1}ms) queued={}B pending={}B target={}B device={} samples input_to_poll={}us produced={} ({:.1}/s) reopens={} dropped={} underflows={} lock_misses={}",
+                elapsed,
+                frames,
+                frames as f64 / elapsed,
+                present_us,
+                backlog,
+                backlog as f64 / (sample_rate as f64 * sample_bytes as f64) * 1000.0,
+                audio_pump.queued_bytes(),
+                audio_pump.pending_bytes(),
+                audio_pump.pace_target_queued_bytes(),
+                audio_pump.stats.device_samples.load(std::sync::atomic::Ordering::Relaxed),
+                cpu.bus.joypad().last_input_to_poll_us().unwrap_or(0),
+                produced,
+                produced as f64 / elapsed,
+                audio_pump.stats.reopens.load(std::sync::atomic::Ordering::Relaxed),
+                audio_pump.stats.dropped_samples.load(std::sync::atomic::Ordering::Relaxed),
+                audio_pump.stats.underflow_samples.load(std::sync::atomic::Ordering::Relaxed),
+                audio_pump.stats.lock_miss_samples.load(std::sync::atomic::Ordering::Relaxed),
+            );
+        }
+
+        if backlog == audio::BACKLOG_UNAVAILABLE {
+            next_frame += frame_duration;
+            let now = std::time::Instant::now();
+            if now < next_frame {
+                std::thread::sleep(next_frame - now);
+            } else {
+                next_frame = now;
+            }
+        } else {
+            // Sub-frame audio delivery is the master clock once a device is
+            // available. Avoid an additional whole-frame sleep here.
+            next_frame = std::time::Instant::now();
+        }
+
+        for event in event_pump.poll_iter() {
+            match event {
+                Event::Quit { .. }
+                | Event::KeyDown {
+                    keycode: Some(Keycode::Escape),
+                    ..
+                } => std::process::exit(0),
+                Event::KeyDown { keycode, .. } => {
+                    if let Some(button) = keycode.and_then(|k| key_map.get(&k)) {
+                        cpu.bus
+                            .joypad_mut()
+                            .set_button_pressed_status(*button, true);
+                    }
+                }
+                Event::KeyUp { keycode, .. } => {
+                    if let Some(button) = keycode.and_then(|k| key_map.get(&k)) {
+                        cpu.bus
+                            .joypad_mut()
+                            .set_button_pressed_status(*button, false);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if run_ahead_frames == 1 {
+            let snapshot = cpu.snapshot();
+            cpu.bus.set_audio_delivery_enabled(false);
+            cpu.run_until_frame_ready();
+            cpu.run_until_frame_ready();
+            run_ahead_frame = Some(cpu.bus.ppu().frame().clone());
+            cpu.restore(snapshot);
+        } else {
+            run_ahead_frame = None;
+        }
+
+        // Advance the canonical machine exactly one frame. Speculative audio
+        // was retained only in the discarded snapshot branch, so playback is
+        // never duplicated.
+        cpu.run_until_frame_ready();
+    }
 }
 
 fn resolve_rom_path(rom_path: &str) -> PathBuf {
@@ -270,6 +339,82 @@ fn run_tiles(rom_path: &str) {
     }
 }
 
+fn parse_game_options(args: &[String]) -> Result<(audio::AudioConfig, bool, u8), String> {
+    let mut profile = None;
+    let mut pulse_latency_ms = None;
+    let mut latency_debug = false;
+    let mut run_ahead_frames = std::env::var("NES_RUN_AHEAD_FRAMES")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<u8>()
+                .map_err(|_| "NES_RUN_AHEAD_FRAMES must be 0 or 1".to_string())
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if let Some(value) = arg.strip_prefix("--audio-profile=") {
+            profile = Some(audio::AudioProfile::parse(value)?);
+        } else if arg == "--audio-profile" {
+            i += 1;
+            let value = args
+                .get(i)
+                .ok_or_else(|| "--audio-profile needs low or balanced".to_string())?;
+            profile = Some(audio::AudioProfile::parse(value)?);
+        } else if let Some(value) = arg.strip_prefix("--audio-latency-ms=") {
+            pulse_latency_ms = Some(
+                value
+                    .parse::<u32>()
+                    .map_err(|_| "--audio-latency-ms must be an integer".to_string())?,
+            );
+        } else if arg == "--audio-latency-ms" {
+            i += 1;
+            let value = args
+                .get(i)
+                .ok_or_else(|| "--audio-latency-ms needs a value".to_string())?;
+            pulse_latency_ms = Some(
+                value
+                    .parse::<u32>()
+                    .map_err(|_| "--audio-latency-ms must be an integer".to_string())?,
+            );
+        } else if arg == "--latency-debug" {
+            latency_debug = true;
+        } else if let Some(value) = arg.strip_prefix("--run-ahead=") {
+            run_ahead_frames = value
+                .parse::<u8>()
+                .map_err(|_| "--run-ahead must be 0 or 1".to_string())?;
+        } else if arg == "--run-ahead" {
+            i += 1;
+            let value = args
+                .get(i)
+                .ok_or_else(|| "--run-ahead needs 0 or 1".to_string())?;
+            run_ahead_frames = value
+                .parse::<u8>()
+                .map_err(|_| "--run-ahead must be 0 or 1".to_string())?;
+        } else {
+            return Err(format!("unknown game option {arg}"));
+        }
+        i += 1;
+    }
+
+    let mut config = audio::AudioConfig::from_env()?;
+    if let Some(profile) = profile {
+        config = audio::AudioConfig::for_profile(profile);
+    }
+    if let Some(latency_ms) = pulse_latency_ms {
+        if latency_ms == 0 {
+            return Err("--audio-latency-ms must be greater than zero".into());
+        }
+        config.pulse_latency_ms = latency_ms;
+    }
+    if run_ahead_frames > 1 {
+        return Err("run-ahead currently supports only 0 or 1 frame".into());
+    }
+    Ok((config, latency_debug, run_ahead_frames))
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
@@ -296,7 +441,56 @@ fn main() {
             }
         }
         Some("tiles") => run_tiles(args.get(2).map(|s| s.as_str()).unwrap_or("nestest.nes")),
-        Some(rom_path) => run_game(rom_path),
-        None => run_game("games/pacman.nes"),
+        Some(rom_path) => match parse_game_options(&args[2..]) {
+            Ok((audio_config, latency_debug, run_ahead_frames)) => {
+                run_game(rom_path, audio_config, latency_debug, run_ahead_frames)
+            }
+            Err(err) => {
+                eprintln!("game options: {err}");
+                std::process::exit(2);
+            }
+        },
+        None => match parse_game_options(&[]) {
+            Ok((audio_config, latency_debug, run_ahead_frames)) => {
+                run_game(
+                    "games/pacman.nes",
+                    audio_config,
+                    latency_debug,
+                    run_ahead_frames,
+                )
+            }
+            Err(err) => {
+                eprintln!("audio configuration: {err}");
+                std::process::exit(2);
+            }
+        },
+    }
+}
+
+#[cfg(test)]
+mod frontend_tests {
+    use super::*;
+
+    #[test]
+    fn game_options_select_low_latency_and_one_frame_run_ahead() {
+        let args = vec![
+            "--audio-profile".to_string(),
+            "low".to_string(),
+            "--audio-latency-ms=25".to_string(),
+            "--run-ahead".to_string(),
+            "1".to_string(),
+            "--latency-debug".to_string(),
+        ];
+        let (config, debug, run_ahead) = parse_game_options(&args).unwrap();
+        assert_eq!(config.profile, audio::AudioProfile::LowLatency);
+        assert_eq!(config.pulse_latency_ms, 25);
+        assert!(debug);
+        assert_eq!(run_ahead, 1);
+    }
+
+    #[test]
+    fn game_options_reject_more_than_one_run_ahead_frame() {
+        let args = vec!["--run-ahead=2".to_string()];
+        assert!(parse_game_options(&args).is_err());
     }
 }

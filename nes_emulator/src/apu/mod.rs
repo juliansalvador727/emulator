@@ -27,6 +27,7 @@ const CPU_HZ: f64 = 1_789_773.0;
 
 const DEFAULT_SAMPLE_RATE: u32 = 44100;
 
+#[derive(Clone)]
 pub struct NesAPU {
     pub pulse1: Pulse,
     pub pulse2: Pulse,
@@ -259,6 +260,20 @@ impl NesAPU {
     // callback queues them on the SDL audio device).
     pub fn drain_samples(&mut self) -> Vec<f32> {
         std::mem::take(&mut self.samples)
+    }
+
+    /// Number of mixed host samples waiting for delivery. Frontends use this
+    /// to forward small chunks during a video frame instead of making audio
+    /// wait for the next vblank callback.
+    pub fn buffered_samples(&self) -> usize {
+        self.samples.len()
+    }
+
+    /// Remove the oldest `count` samples while retaining any newer remainder.
+    /// Callers must not request more samples than `buffered_samples()` reports.
+    pub fn drain_sample_chunk(&mut self, count: usize) -> Vec<f32> {
+        assert!(count <= self.samples.len());
+        self.samples.drain(..count).collect()
     }
 }
 

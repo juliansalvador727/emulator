@@ -5,6 +5,7 @@ use crate::cartridge::{Mirroring, Rom};
 // plus single-screen nametable mirroring picked by the same register. Bits 0-2
 // of a write select the 32 KB PRG bank; bit 4 selects which single nametable is
 // mirrored. CHR is always 8 KB of CHR-RAM.
+#[derive(Clone)]
 pub struct Axrom {
     prg_rom: Vec<u8>,
     chr: Vec<u8>,

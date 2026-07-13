@@ -1,4 +1,4 @@
 id|rom|sha256|mapper|script|frames|shot_frames
-smb1|games/mario.nes|f61548fdf1670cffefcc4f0b7bdcdd9eaba0c226e3b74f8666071496988248de|0|start@120-135,right@300-600|600|180,360,600
-zelda|games/zelda.nes|8f72dc2e98572eb4ba7c3a902bca5f69c448fc4391837e5f8f0d4556280440ac|1|start@120-135,start@240-255|600|180,360,600
-smb2|games/smario2.nes|6ba64ff651ede7eea2f6142f681b5f03df496456523e3712f8cd5bbee8f2f2ae|4|start@120-135,right@300-600|600|180,360,600
+smb1|games/mario.nes|f61548fdf1670cffefcc4f0b7bdcdd9eaba0c226e3b74f8666071496988248de|0|start@121-136,right@301-601|600|180,360,600
+zelda|games/zelda.nes|8f72dc2e98572eb4ba7c3a902bca5f69c448fc4391837e5f8f0d4556280440ac|1|start@121-136,start@241-256|600|180,360,600
+smb2|games/smario2.nes|6ba64ff651ede7eea2f6142f681b5f03df496456523e3712f8cd5bbee8f2f2ae|4|start@121-136,right@301-601|600|180,360,600

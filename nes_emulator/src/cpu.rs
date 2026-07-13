@@ -7,7 +7,7 @@ e.g. read data from 0x8000 into A reg:
 LDA $8000      <=>    ad 00 80
 */
 
-use crate::bus::Bus;
+use crate::bus::{Bus, BusSnapshot};
 use crate::opcodes;
 use std::collections::HashMap;
 
@@ -65,6 +65,17 @@ pub struct CPU<'a> {
     additional_cycles: u8,
 }
 
+pub struct CpuSnapshot {
+    register_a: u8,
+    register_x: u8,
+    register_y: u8,
+    status: CpuFlags,
+    program_counter: u16,
+    stack_pointer: u8,
+    additional_cycles: u8,
+    bus: BusSnapshot,
+}
+
 pub trait Mem {
     fn mem_read(&mut self, addr: u16) -> u8;
 
@@ -113,6 +124,30 @@ impl<'a> CPU<'a> {
             bus,
             additional_cycles: 0,
         }
+    }
+
+    pub fn snapshot(&self) -> CpuSnapshot {
+        CpuSnapshot {
+            register_a: self.register_a,
+            register_x: self.register_x,
+            register_y: self.register_y,
+            status: self.status,
+            program_counter: self.program_counter,
+            stack_pointer: self.stack_pointer,
+            additional_cycles: self.additional_cycles,
+            bus: self.bus.snapshot(),
+        }
+    }
+
+    pub fn restore(&mut self, snapshot: CpuSnapshot) {
+        self.register_a = snapshot.register_a;
+        self.register_x = snapshot.register_x;
+        self.register_y = snapshot.register_y;
+        self.status = snapshot.status;
+        self.program_counter = snapshot.program_counter;
+        self.stack_pointer = snapshot.stack_pointer;
+        self.additional_cycles = snapshot.additional_cycles;
+        self.bus.restore(snapshot.bus);
     }
 
     pub fn get_absolute_address(&mut self, mode: &AddressingMode, addr: u16) -> u16 {
@@ -628,6 +663,13 @@ impl<'a> CPU<'a> {
         });
     }
 
+    /// Run to the next host-facing vblank boundary. The bus raises this event
+    /// independently of NMI enable; execution stops before any NMI-handler
+    /// instruction can poll the controller.
+    pub fn run_until_frame_ready(&mut self) {
+        self.run_until(|cpu| cpu.bus.take_host_frame_ready());
+    }
+
     /// Run until `callback` asks the CPU to stop. This is primarily useful for
     /// deterministic automation (for example, stopping a ROM probe at an exact
     /// video frame) without terminating the whole process from a bus callback.
@@ -1096,5 +1138,54 @@ mod test {
 
         assert_eq!(cpu.register_a, 0x55);
         assert_eq!(cpu.bus.cpu_cycles(), 7); // LDX (2) + crossing LDA abs,X (5)
+    }
+
+    #[test]
+    fn snapshot_restore_replays_a_frame_deterministically() {
+        // JMP $8000 keeps the CPU alive without changing machine state beyond
+        // timing. Interrupts remain masked by the power-on status flags.
+        let bus = Bus::new(test::test_rom(vec![0x4c, 0x00, 0x80]), |_, _, _| {});
+        let mut cpu = CPU::new(bus);
+        cpu.run_until_frame_ready();
+        cpu.mem_write(0x6000, 0x12);
+        let snapshot = cpu.snapshot();
+
+        cpu.run_until_frame_ready();
+        let expected_frame = cpu.bus.ppu().frame().data.clone();
+        let expected_cycles = cpu.bus.cpu_cycles();
+        cpu.mem_write(0x6000, 0x34);
+
+        cpu.restore(snapshot);
+        assert_eq!(cpu.mem_read(0x6000), 0x12);
+        cpu.run_until_frame_ready();
+        assert_eq!(cpu.bus.ppu().frame().data, expected_frame);
+        assert_eq!(cpu.bus.cpu_cycles(), expected_cycles);
+    }
+
+    #[test]
+    fn speculative_frames_do_not_reach_the_audio_callback() {
+        let delivered = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let callback_delivered = delivered.clone();
+        let bus = Bus::new_with_audio(
+            test::test_rom(vec![0x4c, 0x00, 0x80]),
+            |_, _, _| {},
+            256,
+            move |samples| callback_delivered.set(callback_delivered.get() + samples.len()),
+        );
+        let mut cpu = CPU::new(bus);
+        cpu.bus.apu.set_sample_rate(crate::audio::SAMPLE_RATE);
+        cpu.run_until_frame_ready();
+        cpu.bus.apu.drain_samples();
+        delivered.set(0);
+
+        let snapshot = cpu.snapshot();
+        cpu.bus.set_audio_delivery_enabled(false);
+        cpu.run_until_frame_ready();
+        cpu.run_until_frame_ready();
+        assert_eq!(delivered.get(), 0);
+
+        cpu.restore(snapshot);
+        cpu.run_until_frame_ready();
+        assert!(delivered.get() >= 512);
     }
 }

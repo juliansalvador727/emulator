@@ -5,6 +5,7 @@ use crate::cartridge::{Mirroring, Rom};
 // (a 16 KB image is mirrored into both halves); CHR is a fixed 8 KB window,
 // either ROM or, when the cartridge ships none, 8 KB of CHR-RAM. Optional
 // 8 KB of PRG-RAM lives at $6000-$7FFF.
+#[derive(Clone)]
 pub struct Nrom {
     prg_rom: Vec<u8>,
     chr: Vec<u8>,

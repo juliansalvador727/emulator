@@ -39,6 +39,7 @@ struct SpriteUnit {
     valid: bool,
 }
 
+#[derive(Clone)]
 pub struct NesPPU {
     pub mapper: SharedMapper,
     pub palette_table: [u8; 32],
@@ -68,6 +69,10 @@ pub struct NesPPU {
     odd_frame: bool,
     odd_skip_armed: bool,
     total_dots: u64,
+    // Host-facing presentation event. This is intentionally separate from
+    // both frame wrap and the NMI line: a completed image is ready when
+    // vblank starts even if the game has disabled NMI.
+    frame_ready: bool,
     suppress_vblank: bool,
     pub nmi_interrupt: Option<u8>,
     nmi_interrupt_at: u64,
@@ -129,6 +134,7 @@ impl NesPPU {
             odd_frame: false,
             odd_skip_armed: false,
             total_dots: 0,
+            frame_ready: false,
             suppress_vblank: false,
             nmi_interrupt: None,
             nmi_interrupt_at: 0,
@@ -157,6 +163,20 @@ impl NesPPU {
     // visible line has been composited during this frame's ticks.
     pub fn frame(&self) -> &Frame {
         &self.frame
+    }
+
+    /// Consume the host presentation event raised at the start of vblank.
+    /// The CPU has not serviced the corresponding NMI yet, so a frontend can
+    /// sample controller input here and make it visible to the game's vblank
+    /// handler without adding an avoidable frame of latency.
+    pub(crate) fn take_frame_ready(&mut self) -> bool {
+        std::mem::take(&mut self.frame_ready)
+    }
+
+    pub(crate) fn clone_with_mapper(&self, mapper: SharedMapper) -> Self {
+        let mut clone = self.clone();
+        clone.mapper = mapper;
+        clone
     }
 
     /// Cumulative counters used by the headless probe when an intermittent
@@ -300,6 +320,10 @@ impl NesPPU {
         }
 
         if self.scanline == 241 && self.dot == 0 {
+            // All 240 visible lines are complete. Notify the host separately
+            // from NMI generation so presentation and input sampling occur at
+            // the real vblank boundary even when NMI is disabled.
+            self.frame_ready = true;
             if !self.suppress_vblank {
                 self.status.set_vblank_status(true);
                 if self.ctrl.generate_vblank_nmi() {
@@ -943,7 +967,7 @@ pub mod test {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     struct RecordingMapper {
         chr: Vec<u8>,
         accesses: Rc<RefCell<Vec<(u16, u64)>>>,

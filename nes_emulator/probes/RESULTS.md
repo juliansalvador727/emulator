@@ -6,7 +6,7 @@ on the target host before changing PPU timing.
 
 ## Deterministic timing validation
 
-The Rust suite now has 196 passing tests. P0/P1 coverage records exact
+The Rust suite now has 205 passing tests. P0/P1 coverage records exact
 mapper-visible background, prefetch, dummy, and sprite fetch addresses/dots;
 blanked rendering; sprite-zero left-edge and x=255 behavior; vblank/NMI races;
 odd-frame skipping; all background/sprite pattern-table combinations; PPUDATA
@@ -110,3 +110,12 @@ The 7,200-frame dummy-sink run completed in 127.768 seconds at the sink-locked
 8,396 bytes, with zero dropped samples, underflow samples, or device reopens.
 The below-nominal rate reflects this dummy sink's effective clock, not renderer
 capacity; backlog pacing intentionally follows the host DAC to preserve audio.
+
+The latency frontend added after that long baseline moves input/presentation to
+the start of vblank, delivers audio in 256-sample chunks, and exposes `low` and
+`balanced` profiles. A 360-frame low-profile dummy-sink smoke test completed
+with zero dropped samples or device reopens and a measured application queue of
+640-3,724 bytes (3.6-21.1 ms). The dummy sink reported 99 underflow samples and
+ran at its own 63.1 FPS effective clock, so this is an integration smoke test,
+not a real-device latency claim. The sandboxed Pulse device remained
+unavailable; real-device acceptance must be rerun on the target host.

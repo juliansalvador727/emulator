@@ -22,7 +22,7 @@ behaviour.
 - One standard controller through `$4016`
 - Headless performance probes and deterministic visual regression tests
 
-The test suite currently contains 179 passing tests. The prioritized remaining
+The test suite currently contains 205 passing tests. The prioritized remaining
 work is tracked in [`nes_emulator/TODO.md`](nes_emulator/TODO.md).
 
 ## Requirements
@@ -55,6 +55,24 @@ Run a game by passing its path:
 cargo run --release -- games/pacman.nes
 cargo run --release -- /path/to/game.nes
 ```
+
+For the lowest host latency on a native audio stack, select the low-latency
+profile and optional one-frame run-ahead:
+
+```bash
+cargo run --release -- games/mario.nes \
+  --audio-profile low --audio-latency-ms 40 --run-ahead 1
+```
+
+`low` uses 256-sample delivery chunks with a roughly 17 ms SDL target and a
+29 ms application-side ceiling. `balanced` retains the larger WSLg-safe device
+period and is selected automatically under WSL; use it explicitly if the low
+profile reports underflows or device reopens. `--audio-latency-ms` controls the
+PulseAudio request, while `--latency-debug` reports presentation time, SDL
+queued/pending audio, adaptive target depth, and sampled-input-to-controller-
+poll time once per second. The equivalent environment variables are
+`NES_AUDIO_PROFILE`, `NES_AUDIO_LATENCY_MS`, `NES_RUN_AHEAD_FRAMES`, and
+`NES_LATENCY_DEBUG`.
 
 With no argument, the emulator tries `games/pacman.nes`.
 

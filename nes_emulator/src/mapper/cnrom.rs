@@ -4,6 +4,7 @@ use crate::cartridge::{Mirroring, Rom};
 // Mapper 3 (CNROM): fixed PRG (16 KB mirrored or 32 KB, like NROM), with 8 KB
 // CHR-ROM bank switching. Any write to $8000-$FFFF selects the 8 KB CHR bank.
 // Mirroring is fixed by the header.
+#[derive(Clone)]
 pub struct Cnrom {
     prg_rom: Vec<u8>,
     chr: Vec<u8>,

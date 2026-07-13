@@ -24,6 +24,7 @@ use crate::cartridge::{Mirroring, Rom};
 //   $C001 odd   IRQ reload      (force a reload on the next clock)
 //   $E000 even  IRQ disable + acknowledge (clears the pending line)
 //   $E001 odd   IRQ enable
+#[derive(Clone)]
 pub struct Mmc3 {
     prg_rom: Vec<u8>,
     chr: Vec<u8>,

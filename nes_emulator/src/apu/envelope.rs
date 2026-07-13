@@ -4,6 +4,7 @@
 // frame clock the divider counts down; each time it fires, the decay level
 // steps 15 -> 0, wrapping back to 15 when the loop flag is set.
 
+#[derive(Clone)]
 pub struct Envelope {
     // Register fields ($4000/$4004/$400C bits 5-0). The loop flag is the
     // same bit as the channel's length counter halt flag.

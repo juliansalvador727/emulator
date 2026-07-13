@@ -4,6 +4,7 @@ use crate::cartridge::{Mirroring, Rom};
 // Mapper 66 (GxROM/GNROM): a single register (any write to $8000-$FFFF) selects
 // both a 32 KB PRG bank (bits 4-5) and an 8 KB CHR bank (bits 0-1). Mirroring is
 // fixed by the header.
+#[derive(Clone)]
 pub struct Gnrom {
     prg_rom: Vec<u8>,
     chr: Vec<u8>,

@@ -25,7 +25,7 @@ use uxrom::Uxrom;
 // dot pipeline drives CHR space ($0000-$1FFF) plus nametable mirroring. Writes to
 // PRG ROM space are how bank switches arrive, so they land in `cpu_write`
 // rather than being errors.
-pub trait Mapper {
+pub trait Mapper: MapperClone {
     fn cpu_read(&mut self, addr: u16) -> u8; // $6000-$FFFF: PRG-RAM + PRG-ROM
     fn cpu_write(&mut self, addr: u16, data: u8); // bank-register writes land here
     fn ppu_read(&mut self, addr: u16) -> u8; // $0000-$1FFF CHR
@@ -40,6 +40,25 @@ pub trait Mapper {
     // for mappers with no IRQ source.
     fn irq_pending(&self) -> bool {
         false
+    }
+}
+
+pub trait MapperClone {
+    fn clone_box(&self) -> Box<dyn Mapper>;
+}
+
+impl<T> MapperClone for T
+where
+    T: Mapper + Clone + 'static,
+{
+    fn clone_box(&self) -> Box<dyn Mapper> {
+        Box::new(self.clone())
+    }
+}
+
+impl Clone for Box<dyn Mapper> {
+    fn clone(&self) -> Self {
+        self.clone_box()
     }
 }
 

@@ -28,6 +28,7 @@ const FOUR_STEP_LENGTH: u32 = 29830; // IRQ, wrap 14915
 const STEP5: u32 = 37281; // quarter + half       18640.5
 const FIVE_STEP_LENGTH: u32 = 37282; //           18641
 
+#[derive(Clone)]
 pub struct FrameCounter {
     cycle: u32, // CPU cycles into the current sequence
     five_step: bool,

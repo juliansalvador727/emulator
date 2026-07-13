@@ -12,10 +12,13 @@ bitflags! {
     }
 }
 
+#[derive(Clone)]
 pub struct Joypad {
     strobe: bool,
     button_index: u8,
     button_status: JoypadButton,
+    last_input_sampled_at: Option<std::time::Instant>,
+    last_input_to_poll_us: Option<u64>,
 }
 
 impl Joypad {
@@ -24,6 +27,8 @@ impl Joypad {
             strobe: false,
             button_index: 0,
             button_status: JoypadButton::from_bits_truncate(0),
+            last_input_sampled_at: None,
+            last_input_to_poll_us: None,
         }
     }
     pub fn write(&mut self, data: u8) {
@@ -34,6 +39,16 @@ impl Joypad {
     }
 
     pub fn read(&mut self) -> u8 {
+        if !self.strobe && self.button_index == 0 {
+            if let Some(sampled_at) = self.last_input_sampled_at {
+                self.last_input_to_poll_us = Some(
+                    sampled_at
+                        .elapsed()
+                        .as_micros()
+                        .min(u128::from(u64::MAX)) as u64,
+                );
+            }
+        }
         if self.button_index > 7 {
             return 1;
         }
@@ -45,7 +60,14 @@ impl Joypad {
     }
 
     pub fn set_button_pressed_status(&mut self, button: JoypadButton, pressed: bool) {
+        if self.button_status.contains(button) != pressed {
+            self.last_input_sampled_at = Some(std::time::Instant::now());
+        }
         self.button_status.set(button, pressed);
+    }
+
+    pub fn last_input_to_poll_us(&self) -> Option<u64> {
+        self.last_input_to_poll_us
     }
 }
 

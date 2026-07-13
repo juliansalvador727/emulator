@@ -13,6 +13,7 @@ const SEQUENCE: [u8; 32] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
 ];
 
+#[derive(Clone)]
 pub struct Triangle {
     // $4008 bit 7: halts the length counter and controls whether the linear
     // counter reload flag is cleared after a quarter-frame clock.
