@@ -25,8 +25,21 @@ struct BackgroundTile {
 // work together in all four logical nametables.
 //
 // Returns whether an opaque sprite-0 pixel overlaps an opaque background pixel
-// on this line. The PPU turns that into PPUSTATUS bit 6 after compositing it.
+// on this line. Timing-aware PPU code uses `render_scanline_with_sprite_zero`
+// below to retain the horizontal position of the first overlap.
 pub fn render_scanline(ppu: &NesPPU, frame: &mut Frame, line: usize) -> bool {
+    render_scanline_with_sprite_zero(ppu, frame, line).is_some()
+}
+
+// Render a line and return the x coordinate of its first sprite-0/background
+// overlap. Keeping this detail out of the public renderer API preserves the
+// existing focused compositor tests while allowing PPUSTATUS to change on the
+// corresponding PPU dot rather than at a scanline boundary.
+pub(crate) fn render_scanline_with_sprite_zero(
+    ppu: &NesPPU,
+    frame: &mut Frame,
+    line: usize,
+) -> Option<usize> {
     let (v, fine_x) = ppu.render_scroll();
     let backdrop = palette_color(ppu, ppu.palette_table[0]);
     let mut background_opaque = [false; 256];
@@ -71,7 +84,7 @@ pub fn render_scanline(ppu: &NesPPU, frame: &mut Frame, line: usize) -> bool {
     }
 
     if !ppu.mask.show_sprites() {
-        return false;
+        return None;
     }
 
     // Sprite evaluation is ordered by OAM index: the first opaque sprite at a
@@ -79,7 +92,7 @@ pub fn render_scanline(ppu: &NesPPU, frame: &mut Frame, line: usize) -> bool {
     // the first eight sprites on a line participate, matching the PPU limit.
     let mut sprite_pixels = [None; 256];
     let mut selected = 0;
-    let mut sprite_zero_hit = false;
+    let mut sprite_zero_hit = None;
     let height = if ppu.ctrl.sprite_size_16() { 16 } else { 8 };
 
     for sprite in 0..64 {
@@ -134,8 +147,8 @@ pub fn render_scanline(ppu: &NesPPU, frame: &mut Frame, line: usize) -> bool {
 
     for x in 0..256 {
         if let Some(sprite) = sprite_pixels[x] {
-            if sprite.sprite_zero && background_opaque[x] && x < 255 {
-                sprite_zero_hit = true;
+            if sprite.sprite_zero && background_opaque[x] && x < 255 && sprite_zero_hit.is_none() {
+                sprite_zero_hit = Some(x);
             }
             if !sprite.behind_background || !background_opaque[x] {
                 frame.set_pixel(x, line, sprite.color);

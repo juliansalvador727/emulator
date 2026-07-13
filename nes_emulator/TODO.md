@@ -1,10 +1,9 @@
 # Rust NES Emulator — Next Steps
 
 Current baseline: the Rust emulator has official 6502 opcodes, APU/DMC DMA,
-NROM/MMC1/MMC3 and several simple mappers, scanline rendering, and loopy
-scrolling. `cargo test` currently has 136 passing tests. The C emulator in
-`../NES/` is a useful implementation reference, but NES test ROMs remain the
-source of truth for behaviour.
+NROM/MMC1/MMC3 and several simple mappers, a dot-timed PPU layer around the
+scanline renderer, and loopy scrolling. `cargo test` currently has 142 passing
+tests. NES documentation and test ROMs are the sources of truth for behaviour.
 
 ## P0 — Stabilize the current renderer
 
@@ -45,18 +44,22 @@ source of truth for behaviour.
 
 ## P1 — PPU timing and correctness
 
-- [ ] Move from scanline-boundary state updates to a dot-based PPU state
+- [x] Move from scanline-boundary state updates to a dot-based PPU state
   machine, or introduce a narrow dot-timing layer around the current renderer.
-  The C PPU already models dots, visible/pre-render lines, and odd-frame skip
-  in `../NES/src/ppu.c`.
   - Needed for exact `$2005/$2006` split timing, sprite-0 timing, vblank/NMI
     races, and mapper IRQ timing.
   - Acceptance: pass standard PPU timing tests for vblank/NMI, sprite-0 hit,
     scroll, and odd-frame behaviour.
+  - Completed: the PPU now advances through individual dots. Vblank/status/NMI,
+    loopy increments and reloads, scanline composition, sprite-0 assertion,
+    mapper clocks, and the NTSC odd-frame skip occur at explicit raster dots.
+    Focused unit tests cover vblank and NMI transitions, suppression, sprite-0
+    timing, scroll transfers, and the short odd frame. Timing ROM validation
+    remains part of ongoing PPU hardening.
 
 - [ ] Replace the MMC3 "once per visible scanline" IRQ approximation with A12
-  edge detection driven by background/sprite fetches. The C reference calls
-  `on_scanline` around dot 260; real MMC3 reload/IRQ behaviour is edge-based.
+  edge detection driven by background/sprite fetches. The current timing layer
+  calls `on_scanline` at dot 260; real MMC3 reload/IRQ behaviour is edge-based.
   - Rust: `src/ppu/mod.rs`, `src/mapper/mmc3.rs`
   - Acceptance: MMC3 IRQ test ROMs and status-bar splits are stable without
     one-line jitter.
@@ -70,9 +73,8 @@ source of truth for behaviour.
   - Acceptance: targeted register tests plus relevant blargg/nesdev PPU ROMs.
 
 - [ ] Implement real OAM DMA timing: 513/514 CPU-cycle stalls, parity, and PPU/
-  APU progression while DMA runs. The C implementation has this in
-  `../NES/src/ppu.c::dma`; Rust currently copies the page through the bus but
-  does not model the full stall.
+  APU progression while DMA runs. Rust currently copies the page through the
+  bus but does not model the full stall.
 
 ## P1 — Compatibility beyond the current cartridge set
 
@@ -83,17 +85,15 @@ source of truth for behaviour.
     needs them;
   - battery-backed PRG-RAM persistence.
 
-- [ ] Add the highest-value missing mappers, using the C implementations as
-  banking references and adding unit + ROM tests for each.
-  - C implementations available now: Color Dreams/mapper 11, CPROM/13,
-    mapper 75 (VRC1), mapper 180, and mapper 185.
+- [ ] Add the highest-value missing mappers with unit and ROM tests for each.
+  - Candidates include Color Dreams/mapper 11, CPROM/13, mapper 75 (VRC1),
+    mapper 180, and mapper 185.
   - Choose the next mapper from the desired game library rather than by mapper
     number; document each ROM that motivates it.
 
 - [ ] Improve cartridge parsing: NES 2.0, submappers, PRG/CHR RAM size flags,
-  battery saves, and stricter iNES validation. The C loader tracks mapper
-  format/submapper and TV type in `../NES/src/mappers/mapper.h`; Rust currently
-  rejects NES 2.0 in `src/cartridge.rs`.
+  battery saves, TV/region metadata, and stricter iNES validation. Rust
+  currently rejects NES 2.0 in `src/cartridge.rs`.
 
 ## P1 — CPU and APU test-ROM compatibility
 
@@ -104,27 +104,24 @@ source of truth for behaviour.
 
 - [ ] Validate APU timing with test ROMs, especially `$4017` parity/delay, DMC
   DMA stalls, IRQ acknowledgement, mixer levels, and filter/sample-rate
-  behaviour. The C APU has NTSC/PAL tables and a cycle-oriented implementation
-  in `../NES/src/apu.c`; use it as a comparison aid, not a behavioural oracle.
+  behaviour. Add PAL timing tables when region support is introduced.
 
 ## P2 — Broader hardware and product features
 
-- [ ] Add PAL/Dendy timing and region selection. The C emulator supports NTSC,
-  PAL, Dendy, and dual-region metadata; Rust is currently NTSC-oriented.
+- [ ] Add PAL/Dendy timing and region selection; Rust is currently
+  NTSC-oriented.
 - [ ] Add second-controller support and any required peripherals (zapper,
   Four Score) for the target library.
 - [ ] Add save states, reset/power-cycle semantics, and configurable battery
   save locations.
-- [ ] Consider NSF playback and Game Genie support only if they are product
-  goals. Both exist in the C emulator (`nsf.*`, `genie.*`) but are independent
-  of core game emulation.
+- [ ] Consider NSF playback and Game Genie support only if they become product
+  goals; both are independent of core game emulation.
 
 ## Working rules
 
 - Keep `cargo test` green; add a focused unit test for every hardware fix.
 - For timing work, add a ROM-level probe or a test-ROM result in addition to a
   unit test.
-- Keep the C reference links in commit messages or code comments, but verify
-  against NES documentation/test ROMs when they disagree.
+- Verify hardware behaviour against NES documentation and test ROMs.
 - Do performance work with `--release`; debug-mode frame rate is not a useful
   emulator-speed metric.

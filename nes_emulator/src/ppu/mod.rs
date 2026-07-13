@@ -30,8 +30,13 @@ pub struct NesPPU {
     pub oam_addr: u8,
     internal_data_buf: u8,
 
+    // Current NTSC raster position. Dots are numbered 0..=340 and scanlines
+    // 0..=261, with 261 being the pre-render line.
     scanline: u16,
-    cycles: usize,
+    dot: u16,
+    odd_frame: bool,
+    pending_sprite_zero_hit_dot: Option<u16>,
+    suppress_vblank: bool,
     pub nmi_interrupt: Option<u8>,
 
     // The PPU renders directly into this frame, one scanline at a time, as it
@@ -61,7 +66,10 @@ impl NesPPU {
             oam_addr: 0,
             internal_data_buf: 0,
             scanline: 0,
-            cycles: 0,
+            dot: 0,
+            odd_frame: false,
+            pending_sprite_zero_hit_dot: None,
+            suppress_vblank: false,
             nmi_interrupt: None,
             frame: Some(Frame::new()),
             probe_diagnostics: ProbeDiagnostics::default(),
@@ -88,83 +96,92 @@ impl NesPPU {
             self.probe_diagnostics.visible_register_writes += 1;
             self.probe_diagnostics.last_register = register;
             self.probe_diagnostics.last_scanline = self.scanline;
-            self.probe_diagnostics.last_dot = self.cycles;
+            self.probe_diagnostics.last_dot = self.dot as usize;
         }
     }
 
     pub fn tick(&mut self, cycles: u8) -> bool {
-        self.cycles += cycles as usize;
         let mut frame_complete = false;
+        for _ in 0..cycles {
+            frame_complete |= self.clock_dot();
+        }
+        frame_complete
+    }
 
-        // The bus advances the PPU in chunks (`ppu.tick(cycles * 3)`), so a
-        // single call can carry the PPU past more than one 341-cycle scanline
-        // boundary. Loop so every completed line is rendered and none skipped.
-        while self.cycles >= 341 {
-            self.cycles -= 341;
+    fn rendering_enabled(&self) -> bool {
+        self.mask.show_background() || self.mask.show_sprites()
+    }
 
-            // We just crossed the end of `self.scanline`. Composite it now
-            // (visible lines are 0..=239) so scroll / ctrl / CHR banks / OAM are
-            // sampled as they stand at this line, capturing mid-frame changes
-            // that a single vblank snapshot could never see.
-            if self.scanline < 240 {
-                let line = self.scanline as usize;
-                let sprite_zero_hit = self.composite_scanline(line);
-
-                // Sprite-0 hit: set as soon as the line carrying the first
-                // opaque sprite-0-over-opaque-background pixel is crossed, so
-                // the CPU (which busy-polls $2002) can react — e.g. change the
-                // scroll to split the screen — before the next lines composite.
-                if sprite_zero_hit {
-                    self.status.set_sprite_zero_hit(true);
-                }
-
-                // `v` walks vertically through the background while the
-                // horizontal pieces are reloaded from `t` for the next line.
-                // This is the scanline-level equivalent of the C PPU's dot
-                // 256/257 loopy updates.
-                if self.mask.show_background() {
-                    self.loopy.increment_y();
-                }
-                if self.mask.show_background() || self.mask.show_sprites() {
-                    self.loopy.copy_horizontal();
-                }
-
-                // Clock the mapper's scanline counter (MMC3 IRQ). Real hardware
-                // drives this off A12 toggling during a rendered line, so it
-                // only ticks when rendering is enabled; approximate that as
-                // once per visible line while background or sprites are on.
-                if self.mask.show_background() || self.mask.show_sprites() {
-                    self.mapper.borrow_mut().on_scanline();
-                }
+    // Advance one PPU dot. The scanline compositor remains deliberately
+    // coarse, but state changes now occur at their hardware raster positions,
+    // providing a narrow timing layer for register races and mapper work.
+    fn clock_dot(&mut self) -> bool {
+        if self.scanline < 240 {
+            if self.dot == 0 {
+                self.pending_sprite_zero_hit_dot = self
+                    .composite_scanline(self.scanline as usize)
+                    .map(|x| x as u16 + 1);
             }
 
-            self.scanline += 1;
+            if self.pending_sprite_zero_hit_dot == Some(self.dot) {
+                self.status.set_sprite_zero_hit(true);
+                self.pending_sprite_zero_hit_dot = None;
+            }
 
-            if self.scanline == 241 {
+            if self.dot == 256 && self.mask.show_background() {
+                self.loopy.increment_y();
+            }
+            if self.dot == 257 && self.rendering_enabled() {
+                self.loopy.copy_horizontal();
+            }
+            // This remains the existing scanline approximation until the next
+            // TODO item replaces it with fetch-driven A12 edge detection.
+            if self.dot == 260 && self.rendering_enabled() {
+                self.mapper.borrow_mut().on_scanline();
+            }
+        } else if self.scanline == 241 && self.dot == 1 {
+            if !self.suppress_vblank {
                 self.status.set_vblank_status(true);
-                self.status.set_sprite_zero_hit(false);
                 if self.ctrl.generate_vblank_nmi() {
                     self.nmi_interrupt = Some(1);
                 }
             }
-
-            if self.scanline >= 262 {
-                self.scanline = 0;
-                self.nmi_interrupt = None;
-                self.status.set_sprite_zero_hit(false);
+            self.suppress_vblank = false;
+        } else if self.scanline == 261 {
+            if self.dot == 1 {
                 self.status.reset_vblank_status();
-                // The real PPU copies vertical scroll bits during pre-render.
-                // Our scanline model performs that copy at the frame boundary,
-                // before scanline 0 is next composited.
-                if self.mask.show_background() || self.mask.show_sprites() {
-                    self.loopy.copy_vertical();
-                    self.loopy.copy_horizontal();
-                }
-                frame_complete = true;
+                self.status.set_sprite_zero_hit(false);
+                self.status.set_sprite_overflow(false);
+                self.nmi_interrupt = None;
+            }
+            if self.dot == 257 && self.rendering_enabled() {
+                self.loopy.copy_horizontal();
+            }
+            if (280..=304).contains(&self.dot) && self.rendering_enabled() {
+                self.loopy.copy_vertical();
             }
         }
 
-        frame_complete
+        // On odd rendered NTSC frames the pre-render line omits dot 340.
+        let last_dot = if self.scanline == 261 && self.odd_frame && self.rendering_enabled() {
+            339
+        } else {
+            340
+        };
+        if self.dot == last_dot {
+            self.dot = 0;
+            if self.scanline == 261 {
+                self.scanline = 0;
+                self.odd_frame = !self.odd_frame;
+                true
+            } else {
+                self.scanline += 1;
+                false
+            }
+        } else {
+            self.dot += 1;
+            false
+        }
     }
 
     // Render one visible scanline into the owned frame. The frame is detached
@@ -172,12 +189,12 @@ impl NesPPU {
     // OAM, palette, and CHR through the mapper) while writing pixels; it is
     // restored before returning. `take` swaps in `None`, so there is no
     // allocation on this path.
-    fn composite_scanline(&mut self, line: usize) -> bool {
+    fn composite_scanline(&mut self, line: usize) -> Option<usize> {
         let mut frame = self
             .frame
             .take()
             .expect("frame present at start of scanline render");
-        let sprite_zero_hit = render::render_scanline(self, &mut frame, line);
+        let sprite_zero_hit = render::render_scanline_with_sprite_zero(self, &mut frame, line);
         self.frame = Some(frame);
         sprite_zero_hit
     }
@@ -198,8 +215,15 @@ impl NesPPU {
 
     pub fn write_to_ctrl(&mut self, value: u8) {
         self.note_register_write(0x2000);
+        let generated_nmi = self.ctrl.generate_vblank_nmi();
         self.ctrl.update(value);
         self.loopy.write_ctrl(value);
+        // Enabling NMI during an active vblank produces an immediate NMI edge.
+        if !generated_nmi && self.ctrl.generate_vblank_nmi() && self.status.is_in_vblank() {
+            self.nmi_interrupt = Some(1);
+        } else if !self.ctrl.generate_vblank_nmi() {
+            self.nmi_interrupt = None;
+        }
     }
 
     pub fn write_to_mask(&mut self, value: u8) {
@@ -211,7 +235,13 @@ impl NesPPU {
     // write latch.
     pub fn read_status(&mut self) -> u8 {
         let data = self.status.snapshot();
+        // A read immediately before vblank suppresses that frame's vblank flag
+        // and NMI. A read on dot 1 clears the just-set flag/NMI below.
+        if self.scanline == 241 && self.dot == 0 {
+            self.suppress_vblank = true;
+        }
         self.status.reset_vblank_status();
+        self.nmi_interrupt = None;
         self.loopy.reset_latch();
         data
     }
@@ -378,6 +408,118 @@ pub mod test {
         ppu.tick(255);
         ppu.tick(86);
         assert!(mapper.borrow().irq_pending());
+    }
+
+    #[test]
+    fn vblank_starts_at_scanline_241_dot_1() {
+        let mut ppu = NesPPU::new_empty_rom();
+        ppu.scanline = 241;
+        ppu.dot = 0;
+        ppu.write_to_ctrl(0x80);
+
+        ppu.tick(1); // dot 0
+        assert!(!ppu.status.is_in_vblank());
+        assert_eq!(ppu.poll_nmi_interrupt(), None);
+
+        ppu.tick(1); // dot 1
+        assert!(ppu.status.is_in_vblank());
+        assert_eq!(ppu.poll_nmi_interrupt(), Some(1));
+    }
+
+    #[test]
+    fn status_read_just_before_vblank_suppresses_flag_and_nmi() {
+        let mut ppu = NesPPU::new_empty_rom();
+        ppu.scanline = 241;
+        ppu.dot = 0;
+        ppu.write_to_ctrl(0x80);
+
+        ppu.read_status();
+        ppu.tick(2); // process dots 0 and 1
+
+        assert!(!ppu.status.is_in_vblank());
+        assert_eq!(ppu.poll_nmi_interrupt(), None);
+    }
+
+    #[test]
+    fn enabling_nmi_during_vblank_raises_an_edge() {
+        let mut ppu = NesPPU::new_empty_rom();
+        ppu.status.set_vblank_status(true);
+
+        ppu.write_to_ctrl(0x80);
+
+        assert_eq!(ppu.poll_nmi_interrupt(), Some(1));
+    }
+
+    #[test]
+    fn sprite_zero_hit_is_asserted_at_the_overlap_dot() {
+        let mut ppu = NesPPU::new_empty_rom();
+        ppu.write_to_mask(0b0001_1110);
+        ppu.vram[0..33].fill(1);
+        // Tile 1 is opaque on its first row for both background and sprite.
+        ppu.mapper.borrow_mut().ppu_write(16, 0xff);
+        ppu.oam_data[0..4].copy_from_slice(&[0, 1, 0, 8]);
+        ppu.scanline = 1;
+        ppu.dot = 0;
+
+        ppu.tick(9); // process dots 0..=8
+        assert_eq!(ppu.status.snapshot() & 0x40, 0);
+        ppu.tick(1); // sprite x=8 becomes visible on PPU dot 9
+        assert_eq!(ppu.status.snapshot() & 0x40, 0x40);
+    }
+
+    #[test]
+    fn loopy_scroll_copies_happen_on_their_hardware_dots() {
+        let mut ppu = NesPPU::new_empty_rom();
+        ppu.write_to_mask(0x08);
+
+        // Establish v=0, then change only temporary horizontal scroll.
+        ppu.write_to_scroll(0);
+        ppu.write_to_scroll(0);
+        ppu.sync_scroll_for_test();
+        ppu.read_status();
+        ppu.write_to_scroll(0x28); // t coarse X = 5
+        ppu.scanline = 0;
+        ppu.dot = 256;
+        ppu.tick(1);
+        assert_eq!(ppu.loopy.current() & 0x001f, 0);
+        ppu.tick(1);
+        assert_eq!(ppu.loopy.current() & 0x001f, 5);
+
+        // Change temporary vertical scroll; it is copied during pre-render
+        // dots 280-304, not at the frame boundary.
+        ppu.read_status();
+        ppu.write_to_scroll(0);
+        ppu.write_to_scroll(0x28); // t coarse Y = 5
+        ppu.scanline = 261;
+        ppu.dot = 279;
+        ppu.tick(1);
+        assert_ne!((ppu.loopy.current() >> 5) & 0x1f, 5);
+        ppu.tick(1);
+        assert_eq!((ppu.loopy.current() >> 5) & 0x1f, 5);
+    }
+
+    #[test]
+    fn odd_rendered_frame_skips_pre_render_dot_340() {
+        let mut ppu = NesPPU::new_empty_rom();
+        ppu.write_to_mask(0x08);
+        ppu.scanline = 261;
+        ppu.dot = 0;
+
+        let mut even_dots = 0;
+        while !ppu.tick(1) {
+            even_dots += 1;
+        }
+        even_dots += 1;
+        assert_eq!(even_dots, 341);
+
+        ppu.scanline = 261;
+        ppu.dot = 0;
+        let mut odd_dots = 0;
+        while !ppu.tick(1) {
+            odd_dots += 1;
+        }
+        odd_dots += 1;
+        assert_eq!(odd_dots, 340);
     }
 
     #[test]
