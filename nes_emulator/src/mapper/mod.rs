@@ -6,12 +6,14 @@ use crate::cartridge::{Mirroring, Rom};
 pub mod axrom;
 pub mod cnrom;
 pub mod gnrom;
+pub mod mmc1;
 pub mod nrom;
 pub mod uxrom;
 
 use axrom::Axrom;
 use cnrom::Cnrom;
 use gnrom::Gnrom;
+use mmc1::Mmc1;
 use nrom::Nrom;
 use uxrom::Uxrom;
 
@@ -39,6 +41,7 @@ pub type SharedMapper = Rc<RefCell<Box<dyn Mapper>>>;
 pub fn from_rom(rom: Rom) -> SharedMapper {
     let mapper: Box<dyn Mapper> = match rom.mapper {
         0 => Box::new(Nrom::from_rom(rom)),
+        1 => Box::new(Mmc1::from_rom(rom)),
         2 => Box::new(Uxrom::from_rom(rom)),
         3 => Box::new(Cnrom::from_rom(rom)),
         7 => Box::new(Axrom::from_rom(rom)),

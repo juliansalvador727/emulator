@@ -5,7 +5,21 @@ cartridge mapper support to `nes_emulator/` (the Rust emulator following
 bugzmanov/nes_ebook). Everything below is grounded in the current code with
 file:line references. Read this top to bottom before touching anything.
 
-## Current state (steps 1 and 2 are DONE)
+## Current state (steps 1, 2, and 3 are DONE)
+
+**Update (step 3):** MMC1 (#1) is implemented and merged — `src/mapper/mmc1.rs`
+plus a `1 => Box::new(Mmc1::from_rom(rom))` arm in `from_rom`. It models the
+5-bit serial shift register, the Control/CHR0/CHR1/PRG internal registers, all
+three PRG bank modes (32 KB, fix-first, fix-last), both CHR modes (8 KB / two
+4 KB), and runtime mirroring (all four `Mirroring` variants). CHR-RAM carts use
+a flat 8 KB (bank regs ignored). The 512 KB SUROM high-PRG-bit trick and the
+same-CPU-cycle consecutive-write quirk are deliberately not modelled — no common
+MMC1 game needs them. **114 tests pass** (was 105). Verified live: `games/zelda.nes`
+boots to its animated title, and Start advances to the file-select screen (PRG
+banking + CHR-RAM + runtime mirroring all confirmed via the probe). Next up:
+**MMC3** (step 4).
+
+## Prior state (steps 1 and 2 are DONE)
 
 **Update (step 2):** UxROM (#2), CNROM (#3), AxROM (#7), and GNROM/GxROM (#66)
 are implemented and merged. Each is a self-contained file in `src/mapper/`
@@ -104,7 +118,7 @@ The plumbing is done, so each new mapper is now self-contained:
 | #2 UxROM | **DONE** | `mapper/uxrom.rs` — 16 KB PRG bank at `$8000`, fixed last bank |
 | #7 AxROM | **DONE** | `mapper/axrom.rs` — 32 KB PRG bank + single-screen mirroring |
 | #66 GNROM | **DONE** | `mapper/gnrom.rs` — one register: 32 KB PRG (bits 4-5) + 8 KB CHR (bits 0-1) |
-| #1 MMC1 | medium | 5-bit serial shift register, 4 control regs, runtime mirroring + PRG/CHR bank modes |
+| #1 MMC1 | **DONE** | `mapper/mmc1.rs` — 5-bit serial shift register, 4 control regs, runtime mirroring + PRG/CHR bank modes |
 | #4 MMC3 | hard | Banking is fine; the scanline IRQ is the problem (see caveats) |
 
 Simple mappers are a few dozen lines each. MMC1 ~half a day. MMC3 is the hard one.
@@ -132,15 +146,15 @@ are unaffected by this limitation.
    state" above.
 2. ~~**UxROM + CNROM + AxROM + GNROM.**~~ **DONE** — see the step-2 update at the
    top. Each is a new file in `src/mapper/` plus one `match` arm.
-3. **MMC1.** ← *start here next.* ~half a day (Zelda, Metroid, Mega Man 2,
-   Final Fantasy). `games/zelda.nes` is a mapper-1 cart already present. First one
-   with runtime `mirroring()` changes and a serial shift register.
-4. **MMC3.** ~1–2 days for banking + approximate IRQ; imperfect until the PPU is
-   dot-accurate. This is where `on_scanline()` finally gets wired up.
+3. ~~**MMC1.**~~ **DONE** — `mapper/mmc1.rs`, verified live on `games/zelda.nes`.
+   First one with runtime `mirroring()` changes and a serial shift register.
+4. **MMC3.** ← *start here next.* ~1–2 days for banking + approximate IRQ;
+   imperfect until the PPU is dot-accurate. This is where `on_scanline()` finally
+   gets wired up.
 
 ## Testing
 
-- `cargo test` must stay green (105 tests) at every step.
+- `cargo test` must stay green (114 tests) at every step.
 - The mapper-aware test scaffolding already exists: `cartridge.rs::test::test_rom`
   builds a mapper-0 ROM, and the `ppu/mod.rs` / `render/mod.rs` tests construct a
   PPU via `mapper::test_nrom(chr, mirroring)` (`mapper/mod.rs:42`). New mappers
