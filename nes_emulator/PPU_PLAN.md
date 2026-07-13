@@ -1,17 +1,14 @@
-# Making the PPU Scanline-Accurate — Handoff
+# PPU Scanline Accuracy — Current State & Handoff
 
-Context handoff for a future session. This describes how to move the Rust NES
-emulator (`nes_emulator/`, following bugzmanov/nes_ebook) from its current
-**whole-frame-at-vblank** renderer to a **scanline-accurate** one, which is the
-prerequisite for correct MMC3 (mapper #4) and for any mid-frame raster effect.
-Everything below is grounded in the current code with `file:line` references.
-Read it top to bottom before touching anything.
+The emulator is scanline-accurate through Phase 3: it renders visible lines as
+they complete, clocks MMC3's scanline IRQ, computes sprite-0 hits from actual
+opaque-pixel overlap, and uses loopy `v/t/x` state for scrolling.
 
-This is the companion to `MAPPER_PLAN.md`. That doc stops at MMC3 and points
-here: MMC3-the-mapper is an afternoon, but MMC3-that-looks-right is gated on the
-PPU rework described below.
+This is the companion to `MAPPER_PLAN.md`. It records the PPU half of the
+MMC3 work and the remaining timing limitations. Source locations are named by
+module rather than fragile line numbers.
 
-## Why this is needed
+## Why this was needed
 
 The NES PPU produces the image one scanline at a time, top to bottom, and games
 change PPU/mapper state *between* scanlines to do things a single snapshot can't
@@ -24,45 +21,31 @@ express:
   at a sprite-0 hit or IRQ so the HUD stays fixed while the level scrolls.
 - **Mid-frame CHR / palette swaps**: animation and split backgrounds.
 
-Our renderer samples every one of these **once**, at vblank, so none of them can
-appear. MMC1 was fine because its runtime changes (mirroring, banks) are set
-*before* a frame and stay stable *through* it — a vblank snapshot captures them
-(which is exactly why Zelda just worked). MMC3's whole point is changing state
-*within* a frame.
+The former whole-frame-at-vblank renderer sampled each of these only once, so
+the entire image reflected whichever PPU/mapper state happened to exist at
+vblank. MMC1 largely hid that limitation because its state is normally stable
+for a whole frame; MMC3 depends on changing state *within* one.
 
-## Current architecture (what has to change)
+## Current architecture
 
-Rendering is a single pass fired once per frame:
-
-- `NesPPU::tick()` (`ppu/mod.rs:55`) advances `cycles`/`scanline` over the 341-
-  cycle-per-line, 262-line frame. It sets vblank + the NMI at scanline 241
-  (`ppu/mod.rs:65`), approximates sprite-0 hit (`ppu/mod.rs:84`
-  `is_sprite_0_hit`), and returns `true` at frame end. **It does no rendering.**
-- The bus fires `gameloop_callback` on the NMI edge (`bus.rs:65`), and
-  `main.rs:120` calls `render::render(ppu, &mut frame)` **once**, then presents
-  the texture, queues audio, and paces the loop (`main.rs:120-129`).
-- `render::render` (`render/mod.rs:12`) reads the *current* PPU state for the
-  whole 256x240 image:
-  - scroll from `ppu.scroll.scroll_x/scroll_y` (`render/mod.rs:13`),
-  - nametable + pattern-table selection from `ppu.ctrl` (`render/mod.rs:23`,
-    `render/mod.rs:219`),
-  - CHR tiles through the shared mapper via `read_tile` (`render/mod.rs:117`),
-  - sprites from `ppu.oam_data` (`render/mod.rs:76`).
-  Because it runs once, whatever these hold at vblank is what the entire frame
-  gets.
-- Scroll is modelled as a simplified `scroll_x/scroll_y` u8 pair
-  (`ppu/registers/scroll.rs`) that is **separate** from the `$2006` address
-  (`ppu/registers/addr.rs`). Real hardware shares a single 15-bit internal
-  address (`v`), a temp latch (`t`), and fine-x (`x`); `$2000/$2005/$2006`
-  writes all funnel into `t`/`v`. Our split model is fine for a per-frame
-  snapshot but is the wrong shape for precise mid-frame scroll splits (see
-  Phase 3).
-- Interrupt plumbing today: NMI from the PPU (`bus.rs:70` `poll_nmi_status`) and
-  a level-triggered IRQ line from the APU only (`bus.rs:76` `poll_irq_status` →
-  `apu.irq_pending()`). The CPU polls both each instruction (`cpu.rs:595-600`),
-  IRQ masked by `INTERRUPT_DISABLE`. **There is no mapper IRQ source yet.**
-- `on_scanline()` exists on the `Mapper` trait as a default no-op
-  (`mapper/mod.rs:30`) with no caller — the hook waiting to be wired.
+- `NesPPU::tick()` advances the 341-cycle-per-line, 262-line frame. As each
+  visible line completes (0-239), it composites that line into the PPU-owned
+  `Frame`, computes sprite-0 hit for the line, and clocks `Mapper::on_scanline`
+  when either background or sprite rendering is enabled. It raises vblank/NMI
+  at scanline 241 and reports frame completion after the pre-render line.
+- `render::render_scanline` is the production compositor. It samples the
+  PPU's scroll, control, OAM, palette, nametable mirroring, and mapper-backed
+  CHR at that line.
+- The bus's NMI callback is presentation-only: `main.rs` and `probe.rs` read
+  `ppu.frame()` rather than invoke a renderer.
+- Scroll and PPUADDR share `LoopyRegister` (`ppu/registers/loopy.rs`): current
+  address `v`, temporary address `t`, fine-X `x`, and the common `$2005/$2006`
+  latch. `$2000/$2005/$2006` now feed the same state. At scanline boundaries
+  the PPU increments vertical scroll and reloads horizontal bits; it reloads
+  vertical bits at the frame boundary (the scanline-level analogue of the
+  pre-render copy).
+- The CPU's IRQ input is the OR of the APU and mapper level-triggered IRQ
+  lines (`bus.rs`). MMC3 acknowledges/disables its IRQ on a write to `$E000`.
 
 ## Target: scanline accuracy (and what it is *not*)
 
@@ -71,7 +54,7 @@ Aim for **scanline-accurate**, not dot-accurate. Render each visible scanline
 OAM as they stand *at that line*. This is the pragmatic bar: it's a fraction of
 the work of a per-dot PPU and unlocks essentially every commercial game.
 
-What scanline accuracy buys:
+What the implemented scanline model buys:
 - MMC3 IRQ can fire at the right line → status-bar splits hold still.
 - Mid-frame scroll / CHR / palette / mirroring changes become visible.
 - Sprite-0 hit gets a real per-line position instead of the current
@@ -84,34 +67,15 @@ game needs them):
   visible line" — same compromise the C emulator makes (`NES/src/ppu.c:292`,
   commented `// TODO cycle-accurate A12 based IRQ` in `mmc3.c:66`).
 - Split points that depend on the *exact* dot of a `$2005/$2006` write within a
-  line. Phase 3 (loopy `v/t/x`) gets the line right; the dot stays approximate.
+  line. Loopy state gets the line right; the dot stays approximate.
 
-## The plan (phased; keep `cargo test` green at every step — 117 tests)
+## Implementation history and remaining work
 
 ### Phase 0 — carve out a per-scanline renderer (no behaviour change) — ✅ DONE
-`render::render` now loops `for line in 0..240 { render_scanline(ppu, frame,
-line) }`, with the signature unchanged so `main.rs` and `probe.rs` are
-untouched. `render_scanline` (`render/mod.rs`) composites one line: nametable
-selection, the two background nametables via `render_name_table_line`, then
-`render_sprites_line`, all writing only to row `line`. The two per-line helpers
-compute the single source row that maps to `line` (background: `line -
-shift_y`; sprites: skip those not covering the line, mirror the read for
-v-flip) instead of scanning the whole table, and preserve the original reverse
-sprite iteration so priority/overlap is identical. Tile/palette helpers
-(`read_tile`, `bg_palette`, `sprite_palette`) are unchanged.
-
-Safety net (keep forever): the original single-pass renderer is embedded
-verbatim as a test-only `reference_render`, and three golden-frame tests
-(`golden_frame_no_scroll/_horizontal_scroll/_vertical_scroll`, +3 → 117 total)
-assert `render` is byte-identical to it on a busy NROM scene — varied
-CHR/nametable/attribute/palette data, all four sprite-flip combinations, an
-overlapping pair, corner/edge sprites, one clipped at the bottom — across both
-mirrorings. Verified: SMB1 (NROM) and Zelda (MMC1) still render correctly via
-the `PROBE_SHOTS` probe.
-
-Note: the per-line background path re-reads each tile row up to 8× (once per
-line). Harmless now; it disappears in Phase 1 when each scanline is rendered
-exactly once as the PPU crosses it.
+This phase originally extracted a per-line compositor from the old whole-frame
+renderer. Its rectangle-based nametable stitching was deliberately replaced in
+Phase 3 by direct loopy-address pixel sampling, because it could not represent
+simultaneous horizontal and vertical wrapping correctly.
 
 ### Phase 1 — render from inside the frame timing, sampling per line — ✅ DONE
 Rendering now lives in the scanline timeline instead of the vblank callback.
@@ -141,50 +105,92 @@ rendered (and, Phase 2, each will fire `on_scanline`). In practice one CPU
 instruction is ≤ ~21 PPU cycles so at most one line finishes per call, but the
 loop is correct regardless.
 
-`render::render` (the whole-frame loop) lost its production callers and moved
-into the render test module — its only remaining job is the golden comparison
-against `reference_render`. The three golden-frame tests still pass (117 total),
-and SMB1 (NROM), Pac-Man (NROM), and Zelda (MMC1) verified correct via the
-`PROBE_SHOTS` probe after the move.
+The former whole-frame renderer has no production callers. Phase 3 replaced its
+static-scene golden tests with focused loopy-scroll and sprite-composition
+tests; SMB1 (NROM), Pac-Man (NROM), and Zelda (MMC1) remain useful visual probe
+targets.
 
 After Phase 1, mid-frame CHR-bank and scroll changes that land *between*
 scanlines already show up, with no mapper changes.
 
-### Phase 2 — MMC3 IRQ (the payoff)
-- Call `self.mapper.borrow_mut().on_scanline()` once per **visible** rendered
-  scanline, only when rendering is enabled (background or sprites on). Mirror
-  the C timing (dot ~260, i.e. just after the visible portion of the line) —
-  approximated here as "at the end of each visible line."
-- Add a **mapper IRQ source**. Give the `Mapper` trait a way to expose a pending
-  IRQ (e.g. `fn irq_pending(&self) -> bool { false }`), OR it into
-  `bus.rs:76 poll_irq_status` alongside `apu.irq_pending()`. The CPU already
-  services that line (`cpu.rs:599`); no CPU change needed beyond the OR.
-- Implement MMC3 (`mapper/mmc3.rs`) with its IRQ latch/counter/enable, decrement
-  in `on_scanline`, and assert the line when the counter hits zero and IRQs are
-  enabled. Crib `NES/src/mappers/mmc3.c` (`load_MMC3`, `on_scanline` at
-  `mmc3.c:65`, register writes at `mmc3.c:120+`). Banking is the easy part; the
-  IRQ is why it waited for this rework.
+### Phase 2 — MMC3 IRQ (the payoff) — ✅ DONE
+- `NesPPU::tick` calls `self.mapper.borrow_mut().on_scanline()` once per
+  **visible** rendered line (`ppu/mod.rs`, right after `composite_scanline`),
+  gated on `mask.show_background() || mask.show_sprites()`. This approximates
+  the C timing (dot ~260) as "at the end of each visible line."
+- **Mapper IRQ source**: the `Mapper` trait gained `fn irq_pending(&self) ->
+  bool { false }` (`mapper/mod.rs`), OR'd into `bus.rs poll_irq_status`
+  alongside `apu.irq_pending()`. Level-triggered like the APU line; the CPU
+  already services it (`cpu.rs:599`), no CPU change.
+- MMC3 implemented in `mapper/mmc3.rs`: 8 KB PRG / 1 KB CHR banking with the
+  R0-R7 registers, PRG mode + CHR inversion, `$A000` mirroring, 8 KB PRG-RAM,
+  and the IRQ latch/counter/reload/enable. `on_scanline` reloads-or-decrements
+  and asserts `irq_line` at zero when enabled; a `$E000` write disables and
+  acknowledges (drops the line). Cribbed from `NES/src/mappers/mmc3.c`.
+- Tests: +11 MMC3 unit tests (banking, CHR inversion, IRQ timing/ack) and a
+  PPU/MMC3 integration test proving blank lines do not clock the IRQ while
+  rendered lines do. Sprite-0 overlap is covered by the Phase 3 compositor
+  tests → **132 total, all green**.
+  Verified: SMB2 (`smario2.nes`, MMC3) boots through title
+  → player-select → level start → scrolling gameplay with correct per-screen
+  CHR banking and no IRQ lockup; Zelda (MMC1) unaffected. Registered mapper `4`
+  in `mapper::from_rom`.
 
-### Phase 3 — loopy `v/t/x` scroll model (optional, for split correctness)
-Only if mid-frame scroll splits look wrong after Phase 2. Replace the separate
-`scroll_x/scroll_y` (`scroll.rs`) and `$2006` `AddrRegister` (`addr.rs`) with the
-hardware `v` (current), `t` (temp), and `x` (fine-x) registers; route
-`$2000/$2005/$2006` writes into `t`/`v` per the standard loopy rules and derive
-the per-scanline scroll from `v`. This is a wide change — it touches every PPU
-register write path and the ppu-register tests (`ppu/mod.rs` test module) — so
-do it as its own phase with its tests updated deliberately.
+### Phase 3 — loopy `v/t/x` scroll model — ✅ DONE
+`LoopyRegister` replaces the separate `$2005` scroll and `$2006` address
+models. It holds `v`, `t`, fine-X, and their shared write latch; `$2000`,
+`$2005`, and `$2006` writes now follow the standard loopy routing, and a
+PPUSTATUS read resets that one latch.
+
+The scanline renderer samples `(v, fine_x)` directly. Rather than choosing one
+of two rectangular nametable strips, it derives every background pixel's tile,
+attribute, and logical nametable from loopy state. Horizontal and vertical
+nametable wrapping therefore work together. The PPU advances fine/coarse Y and
+reloads horizontal bits after visible lines, then reloads vertical bits at the
+frame boundary. This follows the C implementation's ordering at scanline
+granularity rather than per dot.
+
+The same pass also corrected renderer behavior exposed by the C comparison:
+PPUMASK background/sprite and left-edge clipping are honored, sprites use OAM Y
+plus one, 8x16 sprites and the eight-sprite scanline limit are supported, and
+sprite background priority is composited correctly. Unused OAM sprites at Y
+`$FF` stay off screen instead of wrapping to the top row. Tests cover loopy
+writes, fine-X and nametable wrapping, masking, sprite priority/position,
+8x16 sprites, OAM-Y hiding, and the scanline limit; the suite remains **132
+tests, all green**.
+
+### Phase 2.5 — real sprite-0 hit (done alongside Phase 2)
+The Phase 1/2 renderer sampled scroll per line correctly, but SMB1's status-bar
+split still landed ~7 lines too early: the old `is_sprite_0_hit` fired at the
+sprite's *top edge* (`scanline == OAM_y`, pixels ignored), so the game changed
+scroll partway through the 32px status bar and its second row (score/time)
+scrolled with the playfield.
+
+Fixed by computing a **real** sprite-0 hit per scanline
+(`NesPPU::sprite_zero_hit_on_scanline`, `ppu/mod.rs`): it walks sprite 0's
+opaque pixels on the line and tests each against the background pixel actually
+drawn there (`background_opaque_at` / `background_color_index` sample the
+nametable through the current scroll, matching `render_scanline`'s selection via
+the shared `scanline_nametables`). The hit is set right after that line
+composites, so the CPU's `$2002` busy-poll reacts before the next lines render.
+Honors the x=255 quirk and the left-8px background clip. Phase 3 moved this
+check into the compositor so it shares the exact background/sprite pixels that
+are drawn. Verified: SMB1 status bar now holds fixed over the scrolling
+playfield; SMB2 (MMC3) and Zelda (MMC1) unaffected.
 
 ### Phase 4 — finer timing (optional, rarely needed)
-Per-dot sprite-0 hit and any per-dot effect. Skip unless a specific target game
-demands it; scanline accuracy covers the commercial library.
+Per-*dot* sprite-0 hit (exact cycle within the line) and any per-dot effect.
+Phase 2.5 makes the hit land on the correct *scanline*; the dot within it is
+still approximate. Skip unless a specific target game demands it; scanline
+accuracy covers the commercial library.
 
 ## Testing
 
-- `cargo test` stays green (117) at every phase.
-- **Phase 0 golden-frame tests** are the key guard: the test-only
-  `reference_render` (old single-pass) vs the new per-scanline loop must be
-  byte-identical on an NROM scene. Kept forever; they catch regressions in every
-  later phase.
+- `cargo test` is currently green with **131 tests**.
+- **Scroll and composition tests** cover loopy writes, fine-X, nametable
+  wrapping, PPUMASK clipping, sprite priority/position, 8x16 sprites, and the
+  eight-sprite scanline limit. Keep these targeted cases when changing the
+  renderer.
 - **Regression check the simple mappers**: NROM (SMB1 — heavy sprite-0),
   UxROM, CNROM, AxROM, and MMC1 (Zelda) must still render correctly after the
   timeline moves. Use the headless probe with `PROBE_SHOTS` (see `MAPPER_PLAN.md`

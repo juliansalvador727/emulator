@@ -71,10 +71,11 @@ impl<'a> Bus<'a> {
         self.ppu.poll_nmi_interrupt()
     }
 
-    // The APU's IRQ line (frame counter or DMC). Level-triggered: stays
-    // asserted until the program acknowledges the flag on the APU side.
+    // The IRQ line seen by the CPU. Both sources are level-triggered and stay
+    // asserted until acknowledged: the APU (frame counter or DMC) and the
+    // mapper (MMC3 scanline counter, acked by a write to $E000).
     pub fn poll_irq_status(&self) -> bool {
-        self.apu.irq_pending()
+        self.apu.irq_pending() || self.mapper.borrow().irq_pending()
     }
 }
 

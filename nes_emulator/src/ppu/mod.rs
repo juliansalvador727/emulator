@@ -1,10 +1,9 @@
 use crate::cartridge::Mirroring;
 use crate::mapper::SharedMapper;
 use crate::render::{self, frame::Frame};
-use registers::addr::AddrRegister;
 use registers::control::ControlRegister;
+use registers::loopy::LoopyRegister;
 use registers::mask::MaskRegister;
-use registers::scroll::ScrollRegister;
 use registers::status::StatusRegister;
 
 pub mod registers;
@@ -15,11 +14,10 @@ pub struct NesPPU {
     pub vram: [u8; 2048],
     pub oam_data: [u8; 256],
 
-    addr: AddrRegister,
+    loopy: LoopyRegister,
     pub ctrl: ControlRegister,
     pub mask: MaskRegister,
     pub status: StatusRegister,
-    pub scroll: ScrollRegister,
     pub oam_addr: u8,
     internal_data_buf: u8,
 
@@ -46,11 +44,10 @@ impl NesPPU {
             // sprite (e.g. Pac-Man clears OAM to tile 0 at 0,0 on the title
             // screen) would render as a gray block. $0F keeps those invisible.
             palette_table: [0x0F; 32],
-            addr: AddrRegister::new(),
+            loopy: LoopyRegister::new(),
             ctrl: ControlRegister::new(),
             mask: MaskRegister::new(),
             status: StatusRegister::new(),
-            scroll: ScrollRegister::new(),
             oam_addr: 0,
             internal_data_buf: 0,
             scanline: 0,
@@ -76,10 +73,6 @@ impl NesPPU {
         // single call can carry the PPU past more than one 341-cycle scanline
         // boundary. Loop so every completed line is rendered and none skipped.
         while self.cycles >= 341 {
-            if self.is_sprite_0_hit(self.cycles) {
-                self.status.set_sprite_zero_hit(true);
-            }
-
             self.cycles -= 341;
 
             // We just crossed the end of `self.scanline`. Composite it now
@@ -87,7 +80,35 @@ impl NesPPU {
             // sampled as they stand at this line, capturing mid-frame changes
             // that a single vblank snapshot could never see.
             if self.scanline < 240 {
-                self.composite_scanline(self.scanline as usize);
+                let line = self.scanline as usize;
+                let sprite_zero_hit = self.composite_scanline(line);
+
+                // Sprite-0 hit: set as soon as the line carrying the first
+                // opaque sprite-0-over-opaque-background pixel is crossed, so
+                // the CPU (which busy-polls $2002) can react — e.g. change the
+                // scroll to split the screen — before the next lines composite.
+                if sprite_zero_hit {
+                    self.status.set_sprite_zero_hit(true);
+                }
+
+                // `v` walks vertically through the background while the
+                // horizontal pieces are reloaded from `t` for the next line.
+                // This is the scanline-level equivalent of the C PPU's dot
+                // 256/257 loopy updates.
+                if self.mask.show_background() {
+                    self.loopy.increment_y();
+                }
+                if self.mask.show_background() || self.mask.show_sprites() {
+                    self.loopy.copy_horizontal();
+                }
+
+                // Clock the mapper's scanline counter (MMC3 IRQ). Real hardware
+                // drives this off A12 toggling during a rendered line, so it
+                // only ticks when rendering is enabled; approximate that as
+                // once per visible line while background or sprites are on.
+                if self.mask.show_background() || self.mask.show_sprites() {
+                    self.mapper.borrow_mut().on_scanline();
+                }
             }
 
             self.scanline += 1;
@@ -105,6 +126,13 @@ impl NesPPU {
                 self.nmi_interrupt = None;
                 self.status.set_sprite_zero_hit(false);
                 self.status.reset_vblank_status();
+                // The real PPU copies vertical scroll bits during pre-render.
+                // Our scanline model performs that copy at the frame boundary,
+                // before scanline 0 is next composited.
+                if self.mask.show_background() || self.mask.show_sprites() {
+                    self.loopy.copy_vertical();
+                    self.loopy.copy_horizontal();
+                }
                 frame_complete = true;
             }
         }
@@ -117,20 +145,14 @@ impl NesPPU {
     // OAM, palette, and CHR through the mapper) while writing pixels; it is
     // restored before returning. `take` swaps in `None`, so there is no
     // allocation on this path.
-    fn composite_scanline(&mut self, line: usize) {
+    fn composite_scanline(&mut self, line: usize) -> bool {
         let mut frame = self
             .frame
             .take()
             .expect("frame present at start of scanline render");
-        render::render_scanline(self, &mut frame, line);
+        let sprite_zero_hit = render::render_scanline(self, &mut frame, line);
         self.frame = Some(frame);
-    }
-
-    fn is_sprite_0_hit(&self, cycle: usize) -> bool {
-        let y = self.oam_data[0] as usize;
-        let x = self.oam_data[3] as usize;
-
-        (y == self.scanline as usize) && x <= cycle && self.mask.show_sprites()
+        sprite_zero_hit
     }
 
     pub fn poll_nmi_interrupt(&mut self) -> Option<u8> {
@@ -143,24 +165,24 @@ impl NesPPU {
     }
 
     pub fn write_to_ppu_addr(&mut self, value: u8) {
-        self.addr.update(value);
+        self.loopy.write_addr(value);
     }
 
     pub fn write_to_ctrl(&mut self, value: u8) {
         self.ctrl.update(value);
+        self.loopy.write_ctrl(value);
     }
 
     pub fn write_to_mask(&mut self, value: u8) {
         self.mask.update(value);
     }
 
-    // Reading PPUSTATUS has side effects: it clears the vblank flag and
-    // resets both the address ($2006) and scroll ($2005) write latches.
+    // Reading PPUSTATUS clears vblank and resets the single shared $2005/$2006
+    // write latch.
     pub fn read_status(&mut self) -> u8 {
         let data = self.status.snapshot();
         self.status.reset_vblank_status();
-        self.addr.reset_latch();
-        self.scroll.reset_latch();
+        self.loopy.reset_latch();
         data
     }
 
@@ -178,7 +200,7 @@ impl NesPPU {
     }
 
     pub fn write_to_scroll(&mut self, value: u8) {
-        self.scroll.write(value);
+        self.loopy.write_scroll(value);
     }
 
     // OAM DMA: copy a 256-byte page (supplied by the bus from CPU RAM)
@@ -191,11 +213,11 @@ impl NesPPU {
     }
 
     fn increment_vram_addr(&mut self) {
-        self.addr.increment(self.ctrl.vram_addr_increment());
+        self.loopy.increment(self.ctrl.vram_addr_increment());
     }
 
     pub fn write_to_data(&mut self, value: u8) {
-        let addr = self.addr.get();
+        let addr = self.loopy.current();
         match addr {
             0..=0x1fff => self.mapper.borrow_mut().ppu_write(addr, value),
             0x2000..=0x2fff => {
@@ -217,7 +239,7 @@ impl NesPPU {
     }
 
     pub fn read_data(&mut self) -> u8 {
-        let addr = self.addr.get();
+        let addr = self.loopy.current();
         self.increment_vram_addr();
 
         match addr {
@@ -268,11 +290,60 @@ impl NesPPU {
             _ => vram_index,
         }
     }
+
+    pub(crate) fn render_scroll(&self) -> (u16, u8) {
+        (self.loopy.current(), self.loopy.fine_x())
+    }
+
+    #[cfg(test)]
+    pub fn sync_scroll_for_test(&mut self) {
+        self.loopy.copy_all_for_test();
+    }
 }
 
 #[cfg(test)]
 pub mod test {
     use super::*;
+
+    fn mmc3_ppu() -> (NesPPU, crate::mapper::SharedMapper) {
+        let mapper = crate::mapper::from_rom(crate::cartridge::Rom {
+            // MMC3 fixes its final two 8 KB banks, so give it a conventional
+            // 32 KB PRG image even though this timing test never reads it.
+            prg_rom: vec![0; 0x8000],
+            chr_rom: vec![0; 0x2000],
+            mapper: 4,
+            screen_mirroring: Mirroring::Vertical,
+        });
+        (NesPPU::new(mapper.clone()), mapper)
+    }
+
+    // Phase 2 integration: the PPU, not the CPU or renderer, is responsible
+    // for clocking MMC3's scanline IRQ. A disabled screen must not create A12
+    // edges, while the first visible rendered line must clock the configured
+    // counter and expose the IRQ through the shared mapper.
+    #[test]
+    fn rendered_scanline_clocks_mmc3_irq_but_blank_scanline_does_not() {
+        let (mut ppu, mapper) = mmc3_ppu();
+        {
+            let mut mapper = mapper.borrow_mut();
+            mapper.cpu_write(0xc000, 0); // latch zero: assert on the first clock
+            mapper.cpu_write(0xc001, 0); // request reload
+            mapper.cpu_write(0xe001, 0); // enable IRQ
+        }
+
+        // Cross scanline 0 with rendering disabled. `tick` accepts a u8, so
+        // use two calls to reach its 341 PPU-cycle boundary.
+        ppu.tick(255);
+        ppu.tick(86);
+        assert!(!mapper.borrow().irq_pending());
+
+        // Cross scanline 1 with background rendering enabled: the PPU clocks
+        // MMC3 once and the mapper holds its level-triggered IRQ line high.
+        ppu.write_to_mask(0b0000_1000);
+        ppu.tick(255);
+        ppu.tick(86);
+        assert!(mapper.borrow().irq_pending());
+    }
 
     #[test]
     fn test_ppu_vram_writes() {
@@ -294,7 +365,7 @@ pub mod test {
         ppu.write_to_ppu_addr(0x05);
 
         ppu.read_data(); //load_into_buffer
-        assert_eq!(ppu.addr.get(), 0x2306);
+        assert_eq!(ppu.loopy.current(), 0x2306);
         assert_eq!(ppu.read_data(), 0x66);
     }
 

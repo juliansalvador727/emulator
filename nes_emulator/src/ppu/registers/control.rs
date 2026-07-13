@@ -61,6 +61,10 @@ impl ControlRegister {
         }
     }
 
+    pub fn sprite_size_16(&self) -> bool {
+        self.contains(ControlRegister::SPRITE_SIZE)
+    }
+
     // Base nametable address selected by the low two control bits.
     pub fn nametable_addr(&self) -> u16 {
         match self.bits & 0b11 {

@@ -7,6 +7,7 @@ pub mod axrom;
 pub mod cnrom;
 pub mod gnrom;
 pub mod mmc1;
+pub mod mmc3;
 pub mod nrom;
 pub mod uxrom;
 
@@ -14,6 +15,7 @@ use axrom::Axrom;
 use cnrom::Cnrom;
 use gnrom::Gnrom;
 use mmc1::Mmc1;
+use mmc3::Mmc3;
 use nrom::Nrom;
 use uxrom::Uxrom;
 
@@ -30,6 +32,12 @@ pub trait Mapper {
     fn ppu_write(&mut self, addr: u16, data: u8); // CHR-RAM
     fn mirroring(&self) -> Mirroring; // MMC1 etc. set this at runtime
     fn on_scanline(&mut self) {} // MMC3 IRQ hook (default no-op)
+    // Mapper IRQ line (MMC3). Level-triggered like the APU's: stays asserted
+    // until the program acknowledges it (MMC3: a write to $E000). Default off
+    // for mappers with no IRQ source.
+    fn irq_pending(&self) -> bool {
+        false
+    }
 }
 
 // Shared between Bus and NesPPU so both see the same mapper state. Cloned
@@ -44,6 +52,7 @@ pub fn from_rom(rom: Rom) -> SharedMapper {
         1 => Box::new(Mmc1::from_rom(rom)),
         2 => Box::new(Uxrom::from_rom(rom)),
         3 => Box::new(Cnrom::from_rom(rom)),
+        4 => Box::new(Mmc3::from_rom(rom)),
         7 => Box::new(Axrom::from_rom(rom)),
         66 => Box::new(Gnrom::from_rom(rom)),
         other => panic!("Mapper {} is not supported yet", other),
