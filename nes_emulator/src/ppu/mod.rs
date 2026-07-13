@@ -44,6 +44,10 @@ pub struct NesPPU {
     pub mask: MaskRegister,
     pub status: StatusRegister,
     pub oam_addr: u8,
+    // Value currently visible on the PPU's internal OAM data bus. During
+    // rendering, $2004 observes this bus instead of indexing primary OAM with
+    // OAMADDR.
+    oam_data_bus: u8,
     internal_data_buf: u8,
     io_data_bus: u8,
     io_data_bus_refreshed_at: [u64; 8],
@@ -104,6 +108,7 @@ impl NesPPU {
             mask: MaskRegister::new(),
             status: StatusRegister::new(),
             oam_addr: 0,
+            oam_data_bus: 0,
             internal_data_buf: 0,
             io_data_bus: 0,
             io_data_bus_refreshed_at: [0; 8],
@@ -201,6 +206,10 @@ impl NesPPU {
         self.mask.show_background() || self.mask.show_sprites()
     }
 
+    fn rendering_in_progress(&self) -> bool {
+        (self.scanline < 240 || self.scanline == 261) && self.rendering_enabled()
+    }
+
     // Advance one PPU dot. Rendering, fetches, scrolling and mapper-visible
     // address-bus activity all originate from this timeline.
     fn clock_dot(&mut self) -> bool {
@@ -234,7 +243,15 @@ impl NesPPU {
                 self.clock_sprite_evaluation();
             }
             if (257..=320).contains(&self.dot) {
+                // The sprite fetch sequencer continually forces OAMADDR to
+                // zero. A CPU write during this interval only survives until
+                // the next PPU dot.
+                self.oam_addr = 0;
                 self.clock_sprite_fetch();
+            } else if self.dot == 0 || (321..=340).contains(&self.dot) {
+                // Outside evaluation/fetch, the first byte of secondary OAM
+                // remains selected on the internal OAM bus.
+                self.oam_data_bus = self.secondary_oam[0];
             }
 
             if self.dot == 256 {
@@ -348,6 +365,8 @@ impl NesPPU {
             self.sprite_eval_n = 0;
             self.sprite_eval_m = 0;
         }
+        // The clear circuit overrides OAM reads with $FF on all 64 dots.
+        self.oam_data_bus = 0xff;
         // Secondary OAM is filled with $FF over alternating read/write dots.
         // Model the externally relevant write half of each pair.
         if self.dot & 1 == 0 {
@@ -356,6 +375,12 @@ impl NesPPU {
     }
 
     fn clock_sprite_evaluation(&mut self) {
+        if self.dot == 65 && self.oam_addr >= 8 {
+            // 2C02G/H refresh bug: beginning evaluation with a nonzero OAM
+            // row copies that row over sprite 0 and 1.
+            let source = (self.oam_addr & 0xf8) as usize;
+            self.oam_data.copy_within(source..source + 8, 0);
+        }
         if self.sprite_eval_n >= 64 {
             return;
         }
@@ -364,8 +389,18 @@ impl NesPPU {
         if self.dot & 1 != 0 {
             self.sprite_eval_latch =
                 self.oam_data[self.sprite_eval_n * 4 + self.sprite_eval_m];
+            self.oam_data_bus = self.sprite_eval_latch;
             return;
         }
+
+        // Normally the preceding primary-OAM read remains on the bus. Once
+        // secondary OAM is full, its write-disable path turns even-dot writes
+        // into reads of the first selected sprite's Y coordinate.
+        self.oam_data_bus = if self.secondary_count >= 8 {
+            self.secondary_oam[0]
+        } else {
+            self.sprite_eval_latch
+        };
 
         let line = self.target_sprite_scanline();
         let height = if self.ctrl.sprite_size_16() { 16 } else { 8 };
@@ -435,6 +470,16 @@ impl NesPPU {
         let offset = self.dot - 257;
         let slot = (offset / 8) as usize;
         let phase = offset & 7;
+        self.oam_data_bus = if slot < self.secondary_count {
+            let byte = if phase < 4 { phase as usize } else { 3 };
+            self.secondary_oam[slot * 4 + byte]
+        } else if slot == self.secondary_count && slot < 8 && phase == 0 {
+            // The first unused slot exposes sprite 63's Y coordinate before
+            // the remaining empty-slot reads settle at $FF.
+            self.oam_data[0xfc]
+        } else {
+            0xff
+        };
         if phase == 0 {
             if slot < self.secondary_count {
                 let base = slot * 4;
@@ -682,15 +727,26 @@ impl NesPPU {
     pub fn write_to_oam_data(&mut self, value: u8) {
         self.drive_io_data_bus(value, 0xff);
         self.note_register_write(0x2004);
+        if self.rendering_in_progress() {
+            // Rendering owns OAM. The write is discarded, while the sprite
+            // evaluation address receives the characteristic +4 increment.
+            self.oam_addr = self.oam_addr.wrapping_add(4);
+            return;
+        }
         self.oam_data[self.oam_addr as usize] = value;
         self.oam_addr = self.oam_addr.wrapping_add(1);
     }
 
     pub fn read_oam_data(&mut self) -> u8 {
-        let mut value = self.oam_data[self.oam_addr as usize];
+        let rendering = self.rendering_in_progress();
+        let mut value = if rendering {
+            self.oam_data_bus
+        } else {
+            self.oam_data[self.oam_addr as usize]
+        };
         // Attribute bytes physically implement only bits 7-5 and 1-0. The
         // unimplemented middle bits read as zero rather than open bus.
-        if self.oam_addr & 0x03 == 0x02 {
+        if !rendering && self.oam_addr & 0x03 == 0x02 {
             value &= 0xe3;
         }
         self.drive_io_data_bus(value, 0xff);
@@ -707,6 +763,13 @@ impl NesPPU {
     // into OAM starting at the current oam_addr.
     pub fn write_oam_dma(&mut self, data: &[u8; 256]) {
         self.probe_diagnostics.oam_dma_count += 1;
+        if self.rendering_in_progress() {
+            // OAMDMA is electrically a sequence of $2004 writes. With the
+            // current atomic DMA representation, 256 discarded +4 address
+            // bumps wrap back to the starting OAMADDR.
+            self.drive_io_data_bus(data[255], 0xff);
+            return;
+        }
         for x in data.iter() {
             self.oam_data[self.oam_addr as usize] = *x;
             self.oam_addr = self.oam_addr.wrapping_add(1);
@@ -714,7 +777,15 @@ impl NesPPU {
     }
 
     fn increment_vram_addr(&mut self) {
-        self.loopy.increment(self.ctrl.vram_addr_increment());
+        if self.rendering_in_progress() {
+            // During visible and pre-render scanlines the scrolling carry
+            // chain is active, so a $2007 access clocks both axes regardless
+            // of PPUCTRL's linear increment selection.
+            self.loopy.increment_x();
+            self.loopy.increment_y();
+        } else {
+            self.loopy.increment(self.ctrl.vram_addr_increment());
+        }
     }
 
     pub fn write_to_data(&mut self, value: u8) {
@@ -1012,6 +1083,20 @@ pub mod test {
 
         assert!(!ppu.status.is_in_vblank());
         assert_eq!(ppu.poll_nmi_interrupt(), None);
+    }
+
+    #[test]
+    fn pre_render_dot_one_clears_all_rendering_status_flags() {
+        let mut ppu = NesPPU::new_empty_rom();
+        ppu.status.set_vblank_status(true);
+        ppu.status.set_sprite_zero_hit(true);
+        ppu.status.set_sprite_overflow(true);
+        ppu.scanline = 261;
+        ppu.dot = 0;
+
+        ppu.tick(1);
+
+        assert_eq!(ppu.status.snapshot() & 0xe0, 0);
     }
 
     #[test]
@@ -1472,6 +1557,96 @@ pub mod test {
     }
 
     #[test]
+    fn oamdata_reads_follow_the_internal_bus_during_rendering() {
+        let mut ppu = NesPPU::new_empty_rom();
+        ppu.oam_data[0] = 0x23;
+        ppu.oam_data[1] = 0x45;
+        ppu.write_to_mask(0x08);
+
+        ppu.dot = 1;
+        ppu.tick(1);
+        assert_eq!(ppu.read_oam_data(), 0xff);
+
+        ppu.dot = 65;
+        ppu.tick(1);
+        assert_eq!(ppu.read_oam_data(), 0x23);
+
+        ppu.secondary_count = 1;
+        ppu.secondary_oam[0..4].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+        ppu.dot = 257;
+        ppu.tick(1);
+        assert_eq!(ppu.read_oam_data(), 0x12);
+        ppu.tick(1);
+        assert_eq!(ppu.read_oam_data(), 0x34);
+    }
+
+    #[test]
+    fn oamdata_writes_during_rendering_are_discarded_and_increment_by_four() {
+        let mut ppu = NesPPU::new_empty_rom();
+        ppu.oam_data[0x10] = 0x55;
+        ppu.write_to_oam_addr(0x10);
+        ppu.write_to_mask(0x10);
+
+        ppu.write_to_oam_data(0xaa);
+
+        assert_eq!(ppu.oam_data[0x10], 0x55);
+        assert_eq!(ppu.oam_addr, 0x14);
+    }
+
+    #[test]
+    fn sprite_fetch_resets_oamaddr_and_evaluation_applies_refresh_corruption() {
+        let mut ppu = NesPPU::new_empty_rom();
+        ppu.oam_data[0x20..0x28].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        ppu.write_to_mask(0x08);
+        ppu.write_to_oam_addr(0x23);
+        ppu.dot = 65;
+
+        ppu.tick(1);
+        assert_eq!(&ppu.oam_data[0..8], &[1, 2, 3, 4, 5, 6, 7, 8]);
+
+        ppu.write_to_oam_addr(0x80);
+        ppu.dot = 257;
+        ppu.tick(1);
+        assert_eq!(ppu.oam_addr, 0);
+    }
+
+    #[test]
+    fn ppudata_access_during_rendering_increments_both_scroll_axes() {
+        for read in [false, true] {
+            let mut ppu = NesPPU::new_empty_rom();
+            ppu.write_to_ctrl(0x04); // +32 is ignored while rendering.
+            ppu.write_to_ppu_addr(0x00);
+            ppu.write_to_ppu_addr(0x00);
+            ppu.write_to_mask(0x08);
+            ppu.scanline = 100;
+            ppu.dot = 100;
+
+            if read {
+                ppu.read_data();
+            } else {
+                ppu.write_to_data(0x5a);
+            }
+
+            assert_eq!(ppu.loopy.current(), 0x1001, "read={read}");
+        }
+    }
+
+    #[test]
+    fn ppudata_access_during_vblank_keeps_the_linear_increment() {
+        let mut ppu = NesPPU::new_empty_rom();
+        ppu.write_to_ctrl(0x04);
+        ppu.write_to_ppu_addr(0x20);
+        ppu.write_to_ppu_addr(0x00);
+        ppu.write_to_mask(0x08);
+        ppu.scanline = 241;
+        ppu.dot = 20;
+
+        ppu.read_data();
+
+        assert_eq!(ppu.loopy.current(), 0x2020);
+    }
+
+    #[test]
     fn test_ppu_vram_reads() {
         let mut ppu = NesPPU::new_empty_rom();
         ppu.write_to_ctrl(0);
@@ -1654,5 +1829,19 @@ pub mod test {
 
         ppu.write_to_oam_addr(0x11);
         assert_eq!(ppu.read_oam_data(), 0x66);
+    }
+
+    #[test]
+    fn oam_dma_during_rendering_does_not_modify_oam() {
+        let mut ppu = NesPPU::new_empty_rom();
+        ppu.oam_data.fill(0x55);
+        ppu.write_to_oam_addr(0x10);
+        ppu.write_to_mask(0x10);
+
+        ppu.write_oam_dma(&[0xaa; 256]);
+
+        assert!(ppu.oam_data.iter().all(|&value| value == 0x55));
+        assert_eq!(ppu.oam_addr, 0x10);
+        assert_eq!(ppu.read_io_data_bus(), 0xaa);
     }
 }

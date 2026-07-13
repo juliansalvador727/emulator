@@ -8,7 +8,7 @@ lower-priority backlog at the end of this file.
 
 Current verified baseline (2026-07-13):
 
-- 179 passing Rust tests.
+- 188 passing Rust tests.
 - All official 6502 opcodes; `nestest` matches 5,003 official-opcode entries.
 - NROM, MMC1, UxROM, CNROM, MMC3, AxROM, and GxROM/GNROM.
 - Dot-driven background and sprite rendering with mapper-visible PPU fetches.
@@ -91,8 +91,11 @@ status-bar splits no longer exhibit one-line jitter.
   - buffered-read interaction and open-bus high bits;
   - PPUMASK grayscale and color-emphasis output.
 - [x] Model PPU open bus and decay closely enough for the relevant test ROMs.
-- [ ] Complete `$2002/$2004/$2007` behavior during rendering, including OAM
+- [x] Complete `$2002/$2004/$2007` behavior during rendering, including OAM
   access restrictions/corruption and rendering-time `$2007` address changes.
+  Verified with `oam_read.nes` (SHA-256
+  `f298973dabeb61ca35007445f7a615f77e87703c958c870986af83b1aabde926`),
+  which reports status 0 through the blargg `$6000` protocol.
 - [ ] Model delayed PPUMASK rendering enable/disable effects and exact left-edge
   clipping transitions.
 - [ ] Tighten pre-render/vblank ordering, `$2002` race windows, NMI suppression,
