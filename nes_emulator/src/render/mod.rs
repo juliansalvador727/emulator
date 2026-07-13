@@ -19,7 +19,8 @@ pub fn render(ppu: &NesPPU, frame: &mut Frame) {
     // neighbour; with horizontal mirroring they're stacked, so vertical scroll
     // does. In both cases VRAM only holds two 1KB tables, and the second is a
     // mirror of the other pair.
-    let (main_nametable, second_nametable) = match (&ppu.mirroring, ppu.ctrl.nametable_addr()) {
+    let mirroring = ppu.mirroring();
+    let (main_nametable, second_nametable) = match (mirroring, ppu.ctrl.nametable_addr()) {
         (Mirroring::Vertical, 0x2000)
         | (Mirroring::Vertical, 0x2800)
         | (Mirroring::Horizontal, 0x2000)
@@ -29,7 +30,7 @@ pub fn render(ppu: &NesPPU, frame: &mut Frame) {
         | (Mirroring::Horizontal, 0x2800)
         | (Mirroring::Horizontal, 0x2C00) => (&ppu.vram[0x400..0x800], &ppu.vram[0..0x400]),
         (_, _) => {
-            panic!("Not supported mirroring {:?}", ppu.mirroring);
+            panic!("Not supported mirroring {:?}", mirroring);
         }
     };
 
@@ -80,8 +81,7 @@ pub fn render(ppu: &NesPPU, frame: &mut Frame) {
         let sprite_palette = sprite_palette(ppu, palette_idx);
 
         let bank: u16 = ppu.ctrl.sprt_pattern_addr();
-        let tile =
-            &ppu.chr_rom[(bank + tile_idx * 16) as usize..=(bank + tile_idx * 16 + 15) as usize];
+        let tile = read_tile(ppu, bank + tile_idx * 16);
 
         for y in 0..=7 {
             let mut upper = tile[y];
@@ -106,6 +106,18 @@ pub fn render(ppu: &NesPPU, frame: &mut Frame) {
             }
         }
     }
+}
+
+// Fetch a single 8x8 tile's 16 CHR bytes (two bitplanes) through the mapper.
+// The renderer only has a `&NesPPU`, so it reaches CHR via the shared mapper's
+// interior mutability rather than a direct `chr_rom` slice.
+fn read_tile(ppu: &NesPPU, base: u16) -> [u8; 16] {
+    let mut tile = [0u8; 16];
+    let mut mapper = ppu.mapper.borrow_mut();
+    for (i, byte) in tile.iter_mut().enumerate() {
+        *byte = mapper.ppu_read(base + i as u16);
+    }
+    tile
 }
 
 // Sprite palettes live at $3F11.. in palette_table (index 0 is transparent).
@@ -209,8 +221,7 @@ fn render_name_table(
         let tile_column = i % 32;
         let tile_row = i / 32;
         let tile_idx = name_table[i] as u16;
-        let tile =
-            &ppu.chr_rom[(bank + tile_idx * 16) as usize..=(bank + tile_idx * 16 + 15) as usize];
+        let tile = read_tile(ppu, bank + tile_idx * 16);
         let palette = bg_palette(ppu, attribute_table, tile_column, tile_row);
 
         for y in 0..=7 {
@@ -256,7 +267,7 @@ mod test {
     #[test]
     fn render_draws_background_without_panicking() {
         // 2 CHR banks of a non-zero pattern; point a nametable entry at a tile.
-        let mut ppu = NesPPU::new(vec![0x55; 0x2000], Mirroring::Horizontal);
+        let mut ppu = NesPPU::new(crate::mapper::test_nrom(vec![0x55; 0x2000], Mirroring::Horizontal));
         ppu.vram[0] = 1;
         ppu.vram[959] = 2;
 
@@ -274,7 +285,7 @@ mod test {
         for b in 16..32 {
             chr[b] = 0xFF;
         }
-        let mut ppu = NesPPU::new(chr, Mirroring::Horizontal);
+        let mut ppu = NesPPU::new(crate::mapper::test_nrom(chr, Mirroring::Horizontal));
 
         // Sprite palette 0, color 3 -> palette_table[0x13].
         ppu.palette_table[0x13] = 0x30;
@@ -298,7 +309,7 @@ mod test {
 
     #[test]
     fn bg_palette_selects_quadrant_from_attribute_byte() {
-        let mut ppu = NesPPU::new(vec![0; 0x2000], Mirroring::Horizontal);
+        let mut ppu = NesPPU::new(crate::mapper::test_nrom(vec![0; 0x2000], Mirroring::Horizontal));
         // Distinct palette bytes so each palette is identifiable.
         for k in 0..32 {
             ppu.palette_table[k] = k as u8;

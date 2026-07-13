@@ -2,7 +2,7 @@ const NES_TAG: [u8; 4] = [0x4E, 0x45, 0x53, 0x1A];
 const PRG_ROM_PAGE_SIZE: usize = 16384;
 const CHR_ROM_PAGE_SIZE: usize = 8192;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum Mirroring {
     Vertical,
     Horizontal,
@@ -85,9 +85,12 @@ pub mod test {
         let mut pgp_rom_contents = program;
         pgp_rom_contents.resize(2 * PRG_ROM_PAGE_SIZE, 0);
 
+        // Byte 6 low nibble 0 => mapper 0 (NROM), the only mapper the bus/ppu
+        // tests need. Bit 0 set keeps vertical mirroring. (The standalone
+        // cartridge-parsing tests below use their own mapper-3 headers.)
         let test_rom = create_rom(TestRom {
             header: vec![
-                0x4E, 0x45, 0x53, 0x1A, 0x02, 0x01, 0x31, 00, 00, 00, 00, 00, 00, 00, 00, 00,
+                0x4E, 0x45, 0x53, 0x1A, 0x02, 0x01, 0x01, 00, 00, 00, 00, 00, 00, 00, 00, 00,
             ],
             trainer: None,
             pgp_rom: pgp_rom_contents,

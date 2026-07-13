@@ -39,9 +39,8 @@ pub struct NesAPU {
     // depend on APU-cycle (CPU/2) parity.
     cycles: usize,
 
-    // Downsampling: emit one mixed sample every cycles_per_sample CPU
-    // cycles, tracking the fractional remainder so the long-run rate is
-    // exact.
+    // Downsampling: emit one mixed sample every cycles_per_sample CPU cycles,
+    // tracking the fractional remainder so the long-run rate is exact.
     cycles_per_sample: f64,
     sample_timer: f64,
     samples: Vec<f32>,

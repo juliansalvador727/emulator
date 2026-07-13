@@ -1,7 +1,10 @@
+use std::rc::Rc;
+
 use crate::apu::NesAPU;
 use crate::cartridge::Rom;
 use crate::cpu::Mem;
 use crate::joypad::Joypad;
+use crate::mapper::{self, SharedMapper};
 use crate::ppu::NesPPU;
 
 const RAM: u16 = 0x0000;
@@ -11,7 +14,7 @@ const PPU_REGISTERS_MIRRORS_END: u16 = 0x3FFF;
 
 pub struct Bus<'call> {
     cpu_vram: [u8; 2048],
-    prg_rom: Vec<u8>,
+    mapper: SharedMapper,
     ppu: NesPPU,
     pub apu: NesAPU,
 
@@ -25,10 +28,11 @@ impl<'a> Bus<'a> {
     where
         F: FnMut(&NesPPU, &mut NesAPU, &mut Joypad) + 'call,
     {
-        let ppu = NesPPU::new(rom.chr_rom, rom.screen_mirroring);
+        let mapper = mapper::from_rom(rom);
+        let ppu = NesPPU::new(Rc::clone(&mapper));
         Bus {
             cpu_vram: [0; 2048],
-            prg_rom: rom.prg_rom,
+            mapper: mapper,
             ppu: ppu,
             apu: NesAPU::new(),
             cycles: 0,
@@ -72,16 +76,6 @@ impl<'a> Bus<'a> {
     pub fn poll_irq_status(&self) -> bool {
         self.apu.irq_pending()
     }
-
-    fn read_prg_rom(&self, mut addr: u16) -> u8 {
-        addr -= 0x8000;
-
-        if self.prg_rom.len() == 0x4000 && addr >= 0x4000 {
-            //mirror if needed
-            addr = addr % 0x4000;
-        }
-        self.prg_rom[addr as usize]
-    }
 }
 
 impl Mem for Bus<'_> {
@@ -104,7 +98,13 @@ impl Mem for Bus<'_> {
             }
             0x4015 => self.apu.read_status(),
             0x4016 => self.joypad1.read(),
-            0x8000..=0xFFFF => self.read_prg_rom(addr),
+            // $4017 reads controller 2 on real hardware. This emulator only
+            // exposes joypad 1, so return an idle value instead of spamming
+            // stdout for games that poll both controller ports.
+            0x4017 => 0,
+            // $6000-$7FFF is PRG-RAM; $8000-$FFFF is PRG-ROM. Both go through
+            // the mapper.
+            0x6000..=0xFFFF => self.mapper.borrow_mut().cpu_read(addr),
 
             _ => {
                 println!("Ignoring mem access at {}", addr);
@@ -172,7 +172,9 @@ impl Mem for Bus<'_> {
                 self.joypad1.write(data);
             }
 
-            0x8000..=0xFFFF => panic!("Attempt to write to Cartridge ROM space: {:x}", addr),
+            // Writes to $6000-$7FFF hit PRG-RAM; writes to $8000-$FFFF are the
+            // mapper's bank-switch control registers, not errors.
+            0x6000..=0xFFFF => self.mapper.borrow_mut().cpu_write(addr, data),
 
             _ => {
                 println!("Ignoring mem write-access at {}", addr);
@@ -196,6 +198,12 @@ mod test {
         bus.mem_write(0x4015, 0x01); // enable pulse 1
         bus.mem_write(0x4003, 0x08); // load its length counter
         assert_eq!(bus.mem_read(0x4015) & 0x01, 0x01);
+    }
+
+    #[test]
+    fn joypad2_reads_do_not_fall_through_to_unmapped_io() {
+        let mut bus = test_bus();
+        assert_eq!(bus.mem_read(0x4017), 0);
     }
 
     #[test]

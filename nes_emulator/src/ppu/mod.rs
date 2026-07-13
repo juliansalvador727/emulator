@@ -1,4 +1,5 @@
 use crate::cartridge::Mirroring;
+use crate::mapper::SharedMapper;
 use registers::addr::AddrRegister;
 use registers::control::ControlRegister;
 use registers::mask::MaskRegister;
@@ -8,11 +9,10 @@ use registers::status::StatusRegister;
 pub mod registers;
 
 pub struct NesPPU {
-    pub chr_rom: Vec<u8>,
+    pub mapper: SharedMapper,
     pub palette_table: [u8; 32],
     pub vram: [u8; 2048],
     pub oam_data: [u8; 256],
-    pub mirroring: Mirroring,
 
     addr: AddrRegister,
     pub ctrl: ControlRegister,
@@ -28,10 +28,9 @@ pub struct NesPPU {
 }
 
 impl NesPPU {
-    pub fn new(chr_rom: Vec<u8>, mirroring: Mirroring) -> Self {
+    pub fn new(mapper: SharedMapper) -> Self {
         NesPPU {
-            chr_rom: chr_rom,
-            mirroring: mirroring,
+            mapper: mapper,
             vram: [0; 2048],
             oam_data: [0; 64 * 4],
             // Power-on palette RAM as NES black ($0F) rather than $00 (a visible
@@ -93,8 +92,9 @@ impl NesPPU {
         self.nmi_interrupt.take()
     }
 
+    #[cfg(test)]
     pub fn new_empty_rom() -> Self {
-        NesPPU::new(vec![0; 2048], Mirroring::Horizontal)
+        NesPPU::new(crate::mapper::test_nrom(vec![0; 0x2000], Mirroring::Horizontal))
     }
 
     pub fn write_to_ppu_addr(&mut self, value: u8) {
@@ -152,7 +152,7 @@ impl NesPPU {
     pub fn write_to_data(&mut self, value: u8) {
         let addr = self.addr.get();
         match addr {
-            0..=0x1fff => println!("attempt to write to chr rom space {}", addr),
+            0..=0x1fff => self.mapper.borrow_mut().ppu_write(addr, value),
             0x2000..=0x2fff => {
                 self.vram[self.mirror_vram_addr(addr) as usize] = value;
             }
@@ -178,7 +178,7 @@ impl NesPPU {
         match addr {
             0..=0x1fff => {
                 let result = self.internal_data_buf;
-                self.internal_data_buf = self.chr_rom[addr as usize];
+                self.internal_data_buf = self.mapper.borrow_mut().ppu_read(addr);
                 result
             }
             0x2000..=0x2fff => {
@@ -202,11 +202,17 @@ impl NesPPU {
     // Vertical:
     //   [ A ] [ B ]
     //   [ a ] [ b ]
+    // Nametable mirroring lives on the mapper (MMC1 and friends change it at
+    // runtime), so read it through the shared handle rather than a fixed field.
+    pub fn mirroring(&self) -> Mirroring {
+        self.mapper.borrow().mirroring()
+    }
+
     pub fn mirror_vram_addr(&self, addr: u16) -> u16 {
         let mirrored_vram = addr & 0b10111111111111; // mirror down 0x3000-0x3eff to 0x2000 - 0x2eff
         let vram_index = mirrored_vram - 0x2000; // to vram vector
         let name_table = vram_index / 0x400; // to the name table index
-        match (&self.mirroring, name_table) {
+        match (self.mirroring(), name_table) {
             (Mirroring::Vertical, 2) | (Mirroring::Vertical, 3) => vram_index - 0x800,
             (Mirroring::Horizontal, 2) => vram_index - 0x400,
             (Mirroring::Horizontal, 1) => vram_index - 0x400,
@@ -310,7 +316,7 @@ pub mod test {
     //   [0x2800 a ] [0x2C00 b ]
     #[test]
     fn test_vram_vertical_mirror() {
-        let mut ppu = NesPPU::new(vec![0; 2048], Mirroring::Vertical);
+        let mut ppu = NesPPU::new(crate::mapper::test_nrom(vec![0; 0x2000], Mirroring::Vertical));
 
         ppu.write_to_ppu_addr(0x20);
         ppu.write_to_ppu_addr(0x05);
