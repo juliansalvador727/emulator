@@ -81,6 +81,17 @@ impl LoopyRegister {
         self.v = (self.v & !0x03e0) | (next << 5);
     }
 
+    // The fetch pipeline advances coarse X after every tile. Wrapping column
+    // 31 also selects the horizontally adjacent logical nametable.
+    pub fn increment_x(&mut self) {
+        if self.v & 0x001f == 31 {
+            self.v &= !0x001f;
+            self.v ^= 0x0400;
+        } else {
+            self.v += 1;
+        }
+    }
+
     // Horizontal bits are reloaded from `t` at the end of every rendered line.
     pub fn copy_horizontal(&mut self) {
         self.v = (self.v & !0x041f) | (self.t & 0x041f);
@@ -127,5 +138,17 @@ mod test {
         loopy.increment_y();
         assert_eq!((loopy.current() >> 5) & 0x1f, 0);
         assert_eq!((loopy.current() >> 11) & 1, 0);
+    }
+
+
+    #[test]
+    fn increment_x_wraps_and_switches_horizontal_nametable() {
+        let mut loopy = LoopyRegister::new();
+        loopy.write_scroll(31 * 8);
+        loopy.write_scroll(0);
+        loopy.copy_all_for_test();
+        loopy.increment_x();
+        assert_eq!(loopy.current() & 0x001f, 0);
+        assert_eq!((loopy.current() >> 10) & 1, 1);
     }
 }

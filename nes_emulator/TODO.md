@@ -8,10 +8,10 @@ lower-priority backlog at the end of this file.
 
 Current verified baseline (2026-07-13):
 
-- 142 passing Rust tests.
+- 147 passing Rust tests.
 - All official 6502 opcodes; `nestest` matches 5,003 official-opcode entries.
 - NROM, MMC1, UxROM, CNROM, MMC3, AxROM, and GxROM/GNROM.
-- Dot-timed PPU state transitions around a scanline compositor.
+- Dot-driven background and sprite rendering with mapper-visible PPU fetches.
 - Five-channel APU including DMC DMA, filtering, and SDL2 playback.
 - Deterministic visual regressions for SMB1, Zelda, and SMB2.
 - Two-minute release probes exceed real-time performance with stable sample
@@ -19,38 +19,36 @@ Current verified baseline (2026-07-13):
 
 ## P0 — Replace the scanline compositor with a real dot-driven PPU
 
-The highest-value next step is a hardware-timed PPU pipeline. The current PPU
-tracks dots, but `composite_scanline` still renders an entire visible line at
-dot 0 and MMC3 receives one synthetic `on_scanline` clock at dot 260. Avoid
-adding more timing exceptions around that model.
+The hardware-timed pipeline is now the production renderer. Remaining work in
+this section is focused on edge-case fidelity and test-ROM validation.
 
-- [ ] Model background fetches on their real dots:
+- [x] Model background fetches on their real dots:
   - nametable, attribute, pattern-low, and pattern-high bus accesses;
   - fetch latches and background shift registers;
   - shifter reloads, fine-X selection, and per-dot background pixels;
   - prefetches on dots 321-336 and dummy fetches on dots 337-340.
-- [ ] Move loopy scrolling entirely onto the hardware fetch timeline:
+- [x] Move loopy scrolling entirely onto the hardware fetch timeline:
   - coarse-X increments every tile;
   - Y increment at dot 256;
   - horizontal copy at dot 257;
   - vertical copy on pre-render dots 280-304;
   - correct behavior when rendering is disabled or toggled mid-frame.
-- [ ] Implement the sprite pipeline:
+- [x] Implement the sprite pipeline:
   - primary/secondary OAM and clear/evaluation timing;
   - the eight-sprite limit and hardware sprite-overflow behavior;
   - sprite pattern fetches on dots 257-320;
   - 8x8/8x16 addressing, flipping, priority, and sprite shift registers;
   - per-dot sprite-zero hit, including left-edge and x=255 behavior.
-- [ ] Produce each visible pixel from the background and sprite pipelines, then
+- [x] Produce each visible pixel from the background and sprite pipelines, then
   remove `render::render_scanline`, `NesPPU::composite_scanline`, and the
   pending scanline-derived sprite-zero-hit mechanism from production timing.
-- [ ] Put every real PPU memory access on one modeled PPU address-bus path so
+- [x] Put every real PPU memory access on one modeled PPU address-bus path so
   mappers observe the same CHR fetches that generate pixels.
-- [ ] Keep NTSC odd-frame dot skipping and frame completion exact after the
+- [x] Keep NTSC odd-frame dot skipping and frame completion exact after the
   renderer migration.
 - [ ] Add focused tests for each fetch phase and run established PPU test ROMs
   for scrolling, sprite-zero, overflow, vblank/NMI, and odd-frame behavior.
-- [ ] Re-run release probes and reviewed visual regressions after each vertical
+- [x] Re-run release probes and reviewed visual regressions after each vertical
   slice; investigate deliberate baseline changes rather than blindly replacing
   images.
 
@@ -63,16 +61,16 @@ remain visually and audibly stable at 60.0985 FPS.
 Do this as part of the dot-driven fetch work, not as a second synthetic
 scanline schedule.
 
-- [ ] Replace `Mapper::on_scanline()` with a mapper hook that observes PPU bus
+- [x] Replace `Mapper::on_scanline()` with a mapper hook that observes PPU bus
   addresses/accesses without making non-MMC3 mappers timing-aware.
-- [ ] Track PPU A12 state and clock the MMC3 counter only on qualified low-to-
+- [x] Track PPU A12 state and clock the MMC3 counter only on qualified low-to-
   high transitions, including the required low-time filter.
 - [ ] Verify background/sprite pattern-table combinations, blanked rendering,
   pre-render fetches, short low pulses, and extra fetches caused by PPU access.
 - [ ] Preserve and test `$C000/$C001/$E000/$E001` latch, reload, enable,
   acknowledge, and level-triggered IRQ behavior; account for MMC3 revision
   differences when cartridge/submapper metadata can identify them.
-- [ ] Remove the dot-260 approximation and its tests once edge-driven tests are
+- [x] Remove the dot-260 approximation and its tests once edge-driven tests are
   in place.
 - [ ] Validate with MMC3 IRQ test ROMs and SMB2/SMB3-style status-bar splits;
   compare against the captured SMB2 transition documented in

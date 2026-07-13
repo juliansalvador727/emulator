@@ -10,7 +10,7 @@ use crate::cartridge::{Mirroring, Rom};
 //      picks which of eight bank registers R0-R7 the *next* write to $8001
 //      (odd) will load, along with the PRG mode and CHR-inversion bits.
 //   2. A scanline IRQ. A counter reloads from a latch and decrements once per
-//      rendered scanline (clocked here from the PPU via `on_scanline`); when it
+//      qualified PPU A12 rising edge; when it
 //      hits zero with IRQs enabled it asserts the CPU IRQ line. Games use it to
 //      split the screen — a fixed status bar over a scrolling playfield — which
 //      is exactly the effect the whole-frame renderer could never produce.
@@ -42,9 +42,11 @@ pub struct Mmc3 {
 
     irq_latch: u8,
     irq_counter: u8,
-    irq_reload: bool,  // force reload from latch on the next scanline clock
+    irq_reload: bool,  // force reload from latch on the next qualified A12 edge
     irq_enabled: bool,
     irq_line: bool, // asserted; held until acknowledged by a write to $E000
+    a12_high: bool,
+    a12_low_since: Option<u64>,
 
     num_prg_banks: usize, // in 8 KB units
     num_chr_banks: usize, // in 1 KB units
@@ -73,6 +75,8 @@ impl Mmc3 {
             irq_reload: false,
             irq_enabled: false,
             irq_line: false,
+            a12_high: false,
+            a12_low_since: None,
             num_prg_banks,
             num_chr_banks,
         }
@@ -182,10 +186,35 @@ impl Mapper for Mmc3 {
         self.mirroring
     }
 
-    // Clocked once per rendered scanline. The counter reloads from the latch on
-    // a forced reload or when it has run down to zero, otherwise it decrements;
-    // reaching zero with IRQs enabled asserts the line.
-    fn on_scanline(&mut self) {
+    fn on_ppu_bus_access(&mut self, addr: u16, ppu_cycle: u64) {
+        let high = addr & 0x1000 != 0;
+        if !high {
+            if self.a12_high || self.a12_low_since.is_none() {
+                self.a12_low_since = Some(ppu_cycle);
+            }
+            self.a12_high = false;
+            return;
+        }
+
+        if !self.a12_high
+            && self
+                .a12_low_since
+                .is_some_and(|start| ppu_cycle.saturating_sub(start) >= 8)
+        {
+            self.clock_irq_counter();
+        }
+        self.a12_high = true;
+    }
+
+    fn irq_pending(&self) -> bool {
+        self.irq_line
+    }
+}
+
+impl Mmc3 {
+    // Clocked on a qualified PPU A12 edge. The counter reloads from the latch
+    // on a forced reload or when it has run down to zero, otherwise decrements.
+    fn clock_irq_counter(&mut self) {
         if self.irq_reload || self.irq_counter == 0 {
             self.irq_counter = self.irq_latch;
             self.irq_reload = false;
@@ -198,9 +227,6 @@ impl Mapper for Mmc3 {
         }
     }
 
-    fn irq_pending(&self) -> bool {
-        self.irq_line
-    }
 }
 
 #[cfg(test)]
@@ -300,11 +326,11 @@ mod test {
         m.cpu_write(0xc001, 0); // force reload
         m.cpu_write(0xe001, 0); // enable IRQ
         // First clock reloads to 2 (counter 0 or reload set); then decrements.
-        m.on_scanline(); // reload -> 2
+        m.clock_irq_counter(); // reload -> 2
         assert!(!m.irq_pending());
-        m.on_scanline(); // 2 -> 1
+        m.clock_irq_counter(); // 2 -> 1
         assert!(!m.irq_pending());
-        m.on_scanline(); // 1 -> 0 -> assert
+        m.clock_irq_counter(); // 1 -> 0 -> assert
         assert!(m.irq_pending());
     }
 
@@ -314,7 +340,7 @@ mod test {
         m.cpu_write(0xc000, 0); // latch 0: fires as soon as it reloads
         m.cpu_write(0xc001, 0);
         m.cpu_write(0xe001, 0);
-        m.on_scanline(); // reload to 0 -> counter 0 & enabled -> assert
+        m.clock_irq_counter(); // reload to 0 -> counter 0 & enabled -> assert
         assert!(m.irq_pending());
         m.cpu_write(0xe000, 0); // disable + acknowledge
         assert!(!m.irq_pending());
@@ -327,9 +353,24 @@ mod test {
         m.cpu_write(0xc001, 0);
         // IRQ never enabled.
         for _ in 0..4 {
-            m.on_scanline();
+            m.clock_irq_counter();
         }
         assert!(!m.irq_pending());
+    }
+
+    #[test]
+    fn a12_rise_requires_eight_ppu_cycles_low() {
+        let mut m = Mmc3::from_rom(rom(8, 8));
+        m.cpu_write(0xc000, 0);
+        m.cpu_write(0xc001, 0);
+        m.cpu_write(0xe001, 0);
+
+        m.on_ppu_bus_access(0x0000, 10);
+        m.on_ppu_bus_access(0x1000, 17);
+        assert!(!m.irq_pending());
+        m.on_ppu_bus_access(0x0000, 20);
+        m.on_ppu_bus_access(0x1000, 28);
+        assert!(m.irq_pending());
     }
 
     #[test]

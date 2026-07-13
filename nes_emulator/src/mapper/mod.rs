@@ -22,7 +22,7 @@ use uxrom::Uxrom;
 // A cartridge mapper. It owns PRG ROM, CHR ROM/RAM, PRG RAM, any bank
 // registers, and the mirroring state, and is visible from both sides of the
 // machine at once: the CPU bus drives PRG space ($6000-$FFFF) and the PPU +
-// renderer drive CHR space ($0000-$1FFF) plus nametable mirroring. Writes to
+// dot pipeline drives CHR space ($0000-$1FFF) plus nametable mirroring. Writes to
 // PRG ROM space are how bank switches arrive, so they land in `cpu_write`
 // rather than being errors.
 pub trait Mapper {
@@ -31,7 +31,10 @@ pub trait Mapper {
     fn ppu_read(&mut self, addr: u16) -> u8; // $0000-$1FFF CHR
     fn ppu_write(&mut self, addr: u16, data: u8); // CHR-RAM
     fn mirroring(&self) -> Mirroring; // MMC1 etc. set this at runtime
-    fn on_scanline(&mut self) {} // MMC3 IRQ hook (default no-op)
+    // Observe the address driven by a real PPU memory access. `ppu_cycle` is a
+    // monotonically increasing PPU-dot timestamp, allowing edge-sensitive
+    // mappers to distinguish a qualified A12 low period from a short pulse.
+    fn on_ppu_bus_access(&mut self, _addr: u16, _ppu_cycle: u64) {}
     // Mapper IRQ line (MMC3). Level-triggered like the APU's: stays asserted
     // until the program acknowledges it (MMC3: a write to $E000). Default off
     // for mappers with no IRQ source.
@@ -42,7 +45,7 @@ pub trait Mapper {
 
 // Shared between Bus and NesPPU so both see the same mapper state. Cloned
 // (the Rc) into each; the RefCell gives interior mutability since the PPU
-// borrows it through a `&NesPPU` during rendering.
+// accesses it throughout CPU and PPU bus activity.
 pub type SharedMapper = Rc<RefCell<Box<dyn Mapper>>>;
 
 // Builds the mapper named by the iNES header. Consumes the parsed Rom.
