@@ -24,7 +24,6 @@ use cpu::CPU;
 use joypad::Joypad;
 use joypad::JoypadButton;
 use ppu::NesPPU;
-use render::frame::Frame;
 use render::show_tile;
 use trace::trace;
 
@@ -36,9 +35,10 @@ use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 use sdl2::pixels::PixelFormatEnum;
 
-// Runs a game ROM, rendering the PPU background to an SDL2 window.
-// The bus fires the callback once per frame (at vblank); we render the
-// nametable into a Frame and blit it.
+// Runs a game ROM, presenting the PPU's frame to an SDL2 window.
+// The PPU composites each scanline into its own frame as it crosses the line;
+// the bus fires the callback once per frame (at vblank), where we just blit
+// the finished frame and pace the loop.
 fn run_game(rom_path: &str) {
     // Keep PulseAudio's server-side buffer bounded. Very small values make
     // WSLg's sink stop calling SDL's callback after a short run; 80 ms is
@@ -79,8 +79,6 @@ fn run_game(rom_path: &str) {
         .unwrap_or_else(|err| panic!("failed to read ROM {}: {}", rom_path.display(), err));
     let rom = Rom::new(&bytes).unwrap();
 
-    let mut frame = Frame::new();
-
     // Keyboard -> NES controller button mapping.
     let mut key_map = HashMap::new();
     key_map.insert(Keycode::Down, JoypadButton::DOWN);
@@ -111,14 +109,13 @@ fn run_game(rom_path: &str) {
     let mut frames: u64 = 0;
     let mut samples_produced: u64 = 0;
 
-    // Called by the bus at each vblank: draw the background, present it,
+    // Called by the bus at each vblank: present the PPU's finished frame,
     // queue the frame's audio, pace the loop, and drain the SDL event queue
     // (updating the joypad) so the window stays responsive.
     let bus = Bus::new(
         rom,
         move |ppu: &NesPPU, apu: &mut NesAPU, joypad: &mut Joypad| {
-            render::render(ppu, &mut frame);
-            texture.update(None, &frame.data, 256 * 3).unwrap();
+            texture.update(None, &ppu.frame().data, 256 * 3).unwrap();
             canvas.copy(&texture, None, None).unwrap();
             canvas.present();
 

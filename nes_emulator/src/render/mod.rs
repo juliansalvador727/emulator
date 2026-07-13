@@ -5,11 +5,15 @@ use crate::cartridge::Mirroring;
 use crate::ppu::NesPPU;
 use frame::Frame;
 
-// Renders the first nametable's background (32x30 tiles) into `frame`.
-// Reads tile indices straight from VRAM ($2000 nametable) and decodes each
-// 8x8 tile's two bitplanes. Palette is a fixed placeholder for now; the
-// attribute-table lookup (bg_palette) is the next step.
-pub fn render(ppu: &NesPPU, frame: &mut Frame) {
+// Composite a single visible scanline (`line`, 0..240) into `frame`: the
+// background from up to two nametables, then the sprites that cover this line
+// drawn on top. Every pixel it writes lands on row `line`.
+//
+// This is the production render entry: `NesPPU::tick` calls it once per visible
+// line as the PPU crosses it, so each line samples PPU state (scroll, ctrl, CHR
+// banks, OAM) at that instant. The test-only `render` (below) loops it over all
+// 240 lines to reproduce a whole frame for the golden comparison.
+pub fn render_scanline(ppu: &NesPPU, frame: &mut Frame, line: usize) {
     let scroll_x = (ppu.scroll.scroll_x) as usize;
     let scroll_y = (ppu.scroll.scroll_y) as usize;
 
@@ -39,44 +43,58 @@ pub fn render(ppu: &NesPPU, frame: &mut Frame) {
 
     // Main nametable, shifted up/left by the scroll so the pixel at (scroll_x,
     // scroll_y) lands at the top-left of the screen.
-    render_name_table(
+    render_name_table_line(
         ppu,
         frame,
         main_nametable,
         Rect::new(scroll_x, scroll_y, 256, 240),
         -(scroll_x as isize),
         -(scroll_y as isize),
+        line,
     );
 
     // The second nametable fills whatever the scroll exposed: a vertical strip
     // on the right for horizontal scroll, or a horizontal strip on the bottom
     // for vertical scroll.
     if scroll_x > 0 {
-        render_name_table(
+        render_name_table_line(
             ppu,
             frame,
             second_nametable,
             Rect::new(0, 0, scroll_x, 240),
             (256 - scroll_x) as isize,
             0,
+            line,
         );
     } else if scroll_y > 0 {
-        render_name_table(
+        render_name_table_line(
             ppu,
             frame,
             second_nametable,
             Rect::new(0, 0, 256, scroll_y),
             0,
             (240 - scroll_y) as isize,
+            line,
         );
     }
 
-    // Draw sprites from OAM (64 entries of 4 bytes: y, tile, attr, x).
-    // Iterate in reverse so lower-index sprites draw on top.
+    render_sprites_line(ppu, frame, line);
+}
+
+// Draw the sprites covering scanline `line`, over the background already
+// composited there. Sprites come from OAM (64 entries of 4 bytes: y, tile,
+// attr, x); iterating in reverse means lower-index sprites draw on top.
+fn render_sprites_line(ppu: &NesPPU, frame: &mut Frame, line: usize) {
     for i in (0..ppu.oam_data.len()).step_by(4).rev() {
         let tile_idx = ppu.oam_data[i + 1] as u16;
         let tile_x = ppu.oam_data[i + 3] as usize;
         let tile_y = ppu.oam_data[i] as usize;
+
+        // Skip sprites that don't touch this line (an 8x8 sprite covers the
+        // rows [tile_y, tile_y + 7]).
+        if line < tile_y || line > tile_y + 7 {
+            continue;
+        }
 
         let flip_vertical = ppu.oam_data[i + 2] >> 7 & 1 == 1;
         let flip_horizontal = ppu.oam_data[i + 2] >> 6 & 1 == 1;
@@ -86,26 +104,32 @@ pub fn render(ppu: &NesPPU, frame: &mut Frame) {
         let bank: u16 = ppu.ctrl.sprt_pattern_addr();
         let tile = read_tile(ppu, bank + tile_idx * 16);
 
-        for y in 0..=7 {
-            let mut upper = tile[y];
-            let mut lower = tile[y + 8];
-            'next: for x in (0..=7).rev() {
-                let value = (1 & lower) << 1 | (1 & upper);
-                upper = upper >> 1;
-                lower = lower >> 1;
-                let rgb = match value {
-                    0 => continue 'next, // color 0 is transparent for sprites
-                    1 => palette::SYSTEM_PALLETE[sprite_palette[1] as usize],
-                    2 => palette::SYSTEM_PALLETE[sprite_palette[2] as usize],
-                    3 => palette::SYSTEM_PALLETE[sprite_palette[3] as usize],
-                    _ => panic!("impossible"),
-                };
-                match (flip_horizontal, flip_vertical) {
-                    (false, false) => frame.set_pixel(tile_x + x, tile_y + y, rgb),
-                    (true, false) => frame.set_pixel(tile_x + 7 - x, tile_y + y, rgb),
-                    (false, true) => frame.set_pixel(tile_x + x, tile_y + 7 - y, rgb),
-                    (true, true) => frame.set_pixel(tile_x + 7 - x, tile_y + 7 - y, rgb),
-                }
+        // The one tile row that lands on `line`. Vertical flip mirrors which
+        // source row is read, but the destination row is `line` either way.
+        let y = if flip_vertical {
+            tile_y + 7 - line
+        } else {
+            line - tile_y
+        };
+
+        let mut upper = tile[y];
+        let mut lower = tile[y + 8];
+        'next: for x in (0..=7).rev() {
+            let value = (1 & lower) << 1 | (1 & upper);
+            upper = upper >> 1;
+            lower = lower >> 1;
+            let rgb = match value {
+                0 => continue 'next, // color 0 is transparent for sprites
+                1 => palette::SYSTEM_PALLETE[sprite_palette[1] as usize],
+                2 => palette::SYSTEM_PALLETE[sprite_palette[2] as usize],
+                3 => palette::SYSTEM_PALLETE[sprite_palette[3] as usize],
+                _ => panic!("impossible"),
+            };
+            match (flip_horizontal, flip_vertical) {
+                (false, false) => frame.set_pixel(tile_x + x, tile_y + y, rgb),
+                (true, false) => frame.set_pixel(tile_x + 7 - x, tile_y + y, rgb),
+                (false, true) => frame.set_pixel(tile_x + x, tile_y + 7 - y, rgb),
+                (true, true) => frame.set_pixel(tile_x + 7 - x, tile_y + 7 - y, rgb),
             }
         }
     }
@@ -208,55 +232,61 @@ impl Rect {
     }
 }
 
-fn render_name_table(
+// Composite the one row of `name_table` that lands on destination row `line`
+// (after `shift_y`), clipped to `view_port` (expressed in this nametable's own
+// pixel coordinates). Only the single source row that maps to `line` is
+// touched, so calling this for every line reproduces the old full-nametable
+// pass exactly.
+fn render_name_table_line(
     ppu: &NesPPU,
     frame: &mut Frame,
     name_table: &[u8],
     view_port: Rect,
     shift_x: isize,
     shift_y: isize,
+    line: usize,
 ) {
-    let bank = ppu.ctrl.bknd_pattern_addr();
+    // Which source pixel row of this nametable ends up on `line`?
+    let src_py = line as isize - shift_y;
+    if src_py < 0 || src_py >= 240 {
+        return;
+    }
+    let src_py = src_py as usize;
+    if src_py < view_port.y1 || src_py >= view_port.y2 {
+        return;
+    }
 
+    let bank = ppu.ctrl.bknd_pattern_addr();
     let attribute_table = &name_table[0x3c0..0x400];
 
-    for i in 0..0x3c0 {
-        let tile_column = i % 32;
-        let tile_row = i / 32;
+    let tile_row = src_py / 8;
+    let y = src_py % 8;
+
+    for tile_column in 0..32 {
+        let i = tile_row * 32 + tile_column;
         let tile_idx = name_table[i] as u16;
         let tile = read_tile(ppu, bank + tile_idx * 16);
         let palette = bg_palette(ppu, attribute_table, tile_column, tile_row);
 
-        for y in 0..=7 {
-            let mut upper = tile[y];
-            let mut lower = tile[y + 8];
+        let mut upper = tile[y];
+        let mut lower = tile[y + 8];
 
-            for x in (0..=7).rev() {
-                let value = (1 & lower) << 1 | (1 & upper);
-                upper = upper >> 1;
-                lower = lower >> 1;
+        for x in (0..=7).rev() {
+            let value = (1 & lower) << 1 | (1 & upper);
+            upper = upper >> 1;
+            lower = lower >> 1;
 
-                let rgb = match value {
-                    0 => palette::SYSTEM_PALLETE[ppu.palette_table[0] as usize],
-                    1 => palette::SYSTEM_PALLETE[palette[1] as usize],
-                    2 => palette::SYSTEM_PALLETE[palette[2] as usize],
-                    3 => palette::SYSTEM_PALLETE[palette[3] as usize],
-                    _ => panic!("impossible"),
-                };
-                let pixel_x = tile_column * 8 + x;
-                let pixel_y = tile_row * 8 + y;
+            let rgb = match value {
+                0 => palette::SYSTEM_PALLETE[ppu.palette_table[0] as usize],
+                1 => palette::SYSTEM_PALLETE[palette[1] as usize],
+                2 => palette::SYSTEM_PALLETE[palette[2] as usize],
+                3 => palette::SYSTEM_PALLETE[palette[3] as usize],
+                _ => panic!("impossible"),
+            };
+            let pixel_x = tile_column * 8 + x;
 
-                if pixel_x >= view_port.x1
-                    && pixel_x < view_port.x2
-                    && pixel_y >= view_port.y1
-                    && pixel_y < view_port.y2
-                {
-                    frame.set_pixel(
-                        (shift_x + pixel_x as isize) as usize,
-                        (shift_y + pixel_y as isize) as usize,
-                        rgb,
-                    );
-                }
+            if pixel_x >= view_port.x1 && pixel_x < view_port.x2 {
+                frame.set_pixel((shift_x + pixel_x as isize) as usize, line, rgb);
             }
         }
     }
@@ -266,6 +296,239 @@ fn render_name_table(
 mod test {
     use super::*;
     use crate::cartridge::Mirroring;
+
+    // Render a whole frame by looping the production per-line compositor over
+    // all 240 visible lines. In production the PPU calls `render_scanline`
+    // itself, one line at a time from `tick`; this helper reconstructs a full
+    // frame from a single static PPU state so the golden test can compare it,
+    // byte for byte, against `reference_render`.
+    fn render(ppu: &NesPPU, frame: &mut Frame) {
+        for line in 0..240 {
+            render_scanline(ppu, frame, line);
+        }
+    }
+
+    // The original single-pass renderer, kept verbatim as the golden reference:
+    // `render` (the scanline loop) must stay byte-identical to it. This guards
+    // the Phase 0 refactor and every later phase that touches the compositor.
+    fn reference_render(ppu: &NesPPU, frame: &mut Frame) {
+        let scroll_x = (ppu.scroll.scroll_x) as usize;
+        let scroll_y = (ppu.scroll.scroll_y) as usize;
+
+        let mirroring = ppu.mirroring();
+        let (main_nametable, second_nametable) = match (mirroring, ppu.ctrl.nametable_addr()) {
+            (Mirroring::Vertical, 0x2000)
+            | (Mirroring::Vertical, 0x2800)
+            | (Mirroring::Horizontal, 0x2000)
+            | (Mirroring::Horizontal, 0x2400) => (&ppu.vram[0..0x400], &ppu.vram[0x400..0x800]),
+            (Mirroring::Vertical, 0x2400)
+            | (Mirroring::Vertical, 0x2C00)
+            | (Mirroring::Horizontal, 0x2800)
+            | (Mirroring::Horizontal, 0x2C00) => (&ppu.vram[0x400..0x800], &ppu.vram[0..0x400]),
+            (Mirroring::SingleScreenLower, _) => (&ppu.vram[0..0x400], &ppu.vram[0..0x400]),
+            (Mirroring::SingleScreenUpper, _) => (&ppu.vram[0x400..0x800], &ppu.vram[0x400..0x800]),
+            (_, _) => panic!("Not supported mirroring {:?}", mirroring),
+        };
+
+        reference_name_table(
+            ppu,
+            frame,
+            main_nametable,
+            Rect::new(scroll_x, scroll_y, 256, 240),
+            -(scroll_x as isize),
+            -(scroll_y as isize),
+        );
+
+        if scroll_x > 0 {
+            reference_name_table(
+                ppu,
+                frame,
+                second_nametable,
+                Rect::new(0, 0, scroll_x, 240),
+                (256 - scroll_x) as isize,
+                0,
+            );
+        } else if scroll_y > 0 {
+            reference_name_table(
+                ppu,
+                frame,
+                second_nametable,
+                Rect::new(0, 0, 256, scroll_y),
+                0,
+                (240 - scroll_y) as isize,
+            );
+        }
+
+        for i in (0..ppu.oam_data.len()).step_by(4).rev() {
+            let tile_idx = ppu.oam_data[i + 1] as u16;
+            let tile_x = ppu.oam_data[i + 3] as usize;
+            let tile_y = ppu.oam_data[i] as usize;
+
+            let flip_vertical = ppu.oam_data[i + 2] >> 7 & 1 == 1;
+            let flip_horizontal = ppu.oam_data[i + 2] >> 6 & 1 == 1;
+            let palette_idx = ppu.oam_data[i + 2] & 0b11;
+            let sprite_palette = sprite_palette(ppu, palette_idx);
+
+            let bank: u16 = ppu.ctrl.sprt_pattern_addr();
+            let tile = read_tile(ppu, bank + tile_idx * 16);
+
+            for y in 0..=7 {
+                let mut upper = tile[y];
+                let mut lower = tile[y + 8];
+                'next: for x in (0..=7).rev() {
+                    let value = (1 & lower) << 1 | (1 & upper);
+                    upper = upper >> 1;
+                    lower = lower >> 1;
+                    let rgb = match value {
+                        0 => continue 'next,
+                        1 => palette::SYSTEM_PALLETE[sprite_palette[1] as usize],
+                        2 => palette::SYSTEM_PALLETE[sprite_palette[2] as usize],
+                        3 => palette::SYSTEM_PALLETE[sprite_palette[3] as usize],
+                        _ => panic!("impossible"),
+                    };
+                    match (flip_horizontal, flip_vertical) {
+                        (false, false) => frame.set_pixel(tile_x + x, tile_y + y, rgb),
+                        (true, false) => frame.set_pixel(tile_x + 7 - x, tile_y + y, rgb),
+                        (false, true) => frame.set_pixel(tile_x + x, tile_y + 7 - y, rgb),
+                        (true, true) => frame.set_pixel(tile_x + 7 - x, tile_y + 7 - y, rgb),
+                    }
+                }
+            }
+        }
+    }
+
+    fn reference_name_table(
+        ppu: &NesPPU,
+        frame: &mut Frame,
+        name_table: &[u8],
+        view_port: Rect,
+        shift_x: isize,
+        shift_y: isize,
+    ) {
+        let bank = ppu.ctrl.bknd_pattern_addr();
+        let attribute_table = &name_table[0x3c0..0x400];
+
+        for i in 0..0x3c0 {
+            let tile_column = i % 32;
+            let tile_row = i / 32;
+            let tile_idx = name_table[i] as u16;
+            let tile = read_tile(ppu, bank + tile_idx * 16);
+            let palette = bg_palette(ppu, attribute_table, tile_column, tile_row);
+
+            for y in 0..=7 {
+                let mut upper = tile[y];
+                let mut lower = tile[y + 8];
+
+                for x in (0..=7).rev() {
+                    let value = (1 & lower) << 1 | (1 & upper);
+                    upper = upper >> 1;
+                    lower = lower >> 1;
+
+                    let rgb = match value {
+                        0 => palette::SYSTEM_PALLETE[ppu.palette_table[0] as usize],
+                        1 => palette::SYSTEM_PALLETE[palette[1] as usize],
+                        2 => palette::SYSTEM_PALLETE[palette[2] as usize],
+                        3 => palette::SYSTEM_PALLETE[palette[3] as usize],
+                        _ => panic!("impossible"),
+                    };
+                    let pixel_x = tile_column * 8 + x;
+                    let pixel_y = tile_row * 8 + y;
+
+                    if pixel_x >= view_port.x1
+                        && pixel_x < view_port.x2
+                        && pixel_y >= view_port.y1
+                        && pixel_y < view_port.y2
+                    {
+                        frame.set_pixel(
+                            (shift_x + pixel_x as isize) as usize,
+                            (shift_y + pixel_y as isize) as usize,
+                            rgb,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Build a busy NROM scene: distinct CHR tiles, both nametables filled with
+    // varied tile/attribute data, a scroll offset, and a spread of sprites
+    // (each flip combination, an overlap, and one running off the bottom edge).
+    fn golden_scene(scroll_x: u8, scroll_y: u8, mirroring: Mirroring) -> NesPPU {
+        // 16 CHR tiles with different bitplane patterns so tile index matters.
+        let mut chr = vec![0u8; 0x2000];
+        for t in 0..16usize {
+            for b in 0..16usize {
+                chr[t * 16 + b] = ((t as u8).wrapping_mul(37)).wrapping_add(b as u8 * 11) ^ 0x5a;
+            }
+        }
+        let mut ppu = NesPPU::new(crate::mapper::test_nrom(chr, mirroring));
+
+        // Fill both 1KB nametables (tiles + attribute tables) with varied data.
+        for i in 0..0x800usize {
+            ppu.vram[i] = ((i * 7 + 3) % 251) as u8;
+        }
+        // A full, distinct palette so every color index resolves uniquely.
+        for k in 0..32usize {
+            ppu.palette_table[k] = ((k * 5 + 1) % 64) as u8;
+        }
+
+        ppu.scroll.scroll_x = scroll_x;
+        ppu.scroll.scroll_y = scroll_y;
+
+        // Sprites: all four flip combinations, an overlapping pair, edges, and
+        // one straddling the bottom of the screen.
+        let sprites: [[u8; 4]; 8] = [
+            [50, 1, 0b0000_0000, 60],  // no flip, palette 0
+            [50, 2, 0b0100_0001, 64],  // h-flip, palette 1, overlaps prev
+            [80, 3, 0b1000_0010, 100], // v-flip, palette 2
+            [80, 4, 0b1100_0011, 100], // hv-flip, palette 3, same spot
+            [0, 5, 0b0000_0001, 0],    // top-left corner
+            [200, 6, 0b0100_0010, 248], // right edge
+            [236, 7, 0b0000_0011, 120], // straddles the bottom edge (clipped)
+            [120, 8, 0b1000_0000, 200],
+        ];
+        for (s, bytes) in sprites.iter().enumerate() {
+            ppu.oam_data[s * 4..s * 4 + 4].copy_from_slice(bytes);
+        }
+        ppu
+    }
+
+    fn assert_scanline_matches_reference(scroll_x: u8, scroll_y: u8, mirroring: Mirroring) {
+        let ppu = golden_scene(scroll_x, scroll_y, mirroring);
+
+        let mut expected = Frame::new();
+        reference_render(&ppu, &mut expected);
+
+        let mut got = Frame::new();
+        render(&ppu, &mut got);
+
+        assert!(
+            expected.data == got.data,
+            "scanline render differs from single-pass reference \
+             (scroll=({}, {}), {:?})",
+            scroll_x,
+            scroll_y,
+            mirroring
+        );
+    }
+
+    #[test]
+    fn golden_frame_no_scroll() {
+        assert_scanline_matches_reference(0, 0, Mirroring::Horizontal);
+        assert_scanline_matches_reference(0, 0, Mirroring::Vertical);
+    }
+
+    #[test]
+    fn golden_frame_horizontal_scroll() {
+        assert_scanline_matches_reference(37, 0, Mirroring::Vertical);
+        assert_scanline_matches_reference(128, 0, Mirroring::Vertical);
+    }
+
+    #[test]
+    fn golden_frame_vertical_scroll() {
+        assert_scanline_matches_reference(0, 45, Mirroring::Horizontal);
+        assert_scanline_matches_reference(0, 130, Mirroring::Horizontal);
+    }
 
     #[test]
     fn render_draws_background_without_panicking() {

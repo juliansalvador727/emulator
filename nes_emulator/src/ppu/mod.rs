@@ -1,5 +1,6 @@
 use crate::cartridge::Mirroring;
 use crate::mapper::SharedMapper;
+use crate::render::{self, frame::Frame};
 use registers::addr::AddrRegister;
 use registers::control::ControlRegister;
 use registers::mask::MaskRegister;
@@ -25,6 +26,12 @@ pub struct NesPPU {
     scanline: u16,
     cycles: usize,
     pub nmi_interrupt: Option<u8>,
+
+    // The PPU renders directly into this frame, one scanline at a time, as it
+    // crosses each line (see `tick`). Held in an Option only so a single line
+    // can be composited: `composite_scanline` detaches it to hand `&self` to
+    // the compositor, then puts it back. It is always `Some` between calls.
+    frame: Option<Frame>,
 }
 
 impl NesPPU {
@@ -49,17 +56,40 @@ impl NesPPU {
             scanline: 0,
             cycles: 0,
             nmi_interrupt: None,
+            frame: Some(Frame::new()),
         }
+    }
+
+    // The finished frame, ready to present. Valid to read at vblank, once every
+    // visible line has been composited during this frame's ticks.
+    pub fn frame(&self) -> &Frame {
+        self.frame
+            .as_ref()
+            .expect("frame is detached only transiently during a scanline render")
     }
 
     pub fn tick(&mut self, cycles: u8) -> bool {
         self.cycles += cycles as usize;
-        if self.cycles >= 341 {
+        let mut frame_complete = false;
+
+        // The bus advances the PPU in chunks (`ppu.tick(cycles * 3)`), so a
+        // single call can carry the PPU past more than one 341-cycle scanline
+        // boundary. Loop so every completed line is rendered and none skipped.
+        while self.cycles >= 341 {
             if self.is_sprite_0_hit(self.cycles) {
                 self.status.set_sprite_zero_hit(true);
             }
 
-            self.cycles = self.cycles - 341;
+            self.cycles -= 341;
+
+            // We just crossed the end of `self.scanline`. Composite it now
+            // (visible lines are 0..=239) so scroll / ctrl / CHR banks / OAM are
+            // sampled as they stand at this line, capturing mid-frame changes
+            // that a single vblank snapshot could never see.
+            if self.scanline < 240 {
+                self.composite_scanline(self.scanline as usize);
+            }
+
             self.scanline += 1;
 
             if self.scanline == 241 {
@@ -75,10 +105,25 @@ impl NesPPU {
                 self.nmi_interrupt = None;
                 self.status.set_sprite_zero_hit(false);
                 self.status.reset_vblank_status();
-                return true;
+                frame_complete = true;
             }
         }
-        return false;
+
+        frame_complete
+    }
+
+    // Render one visible scanline into the owned frame. The frame is detached
+    // for the duration so the compositor can borrow `&self` (it reads VRAM,
+    // OAM, palette, and CHR through the mapper) while writing pixels; it is
+    // restored before returning. `take` swaps in `None`, so there is no
+    // allocation on this path.
+    fn composite_scanline(&mut self, line: usize) {
+        let mut frame = self
+            .frame
+            .take()
+            .expect("frame present at start of scanline render");
+        render::render_scanline(self, &mut frame, line);
+        self.frame = Some(frame);
     }
 
     fn is_sprite_0_hit(&self, cycle: usize) -> bool {

@@ -136,9 +136,11 @@ The PPU renders the **whole frame at once at vblank** (the callback fired in
 2. **Mid-frame CHR bank switches** (also MMC3) can't be reproduced at all — the
    renderer only ever sees the bank state present at vblank.
 
-Full MMC3 correctness ultimately wants a dot-accurate PPU rewrite. You can get
-"good enough" without it, but not perfect. The simple mappers and most of MMC1
-are unaffected by this limitation.
+Full MMC3 correctness ultimately wants a scanline-accurate PPU (dot-accurate is
+overkill). You can get "good enough" without it, but not perfect. The simple
+mappers and most of MMC1 are unaffected by this limitation. **See `PPU_PLAN.md`
+for the phased plan to make the PPU scanline-accurate — MMC3's IRQ lands in its
+Phase 2.**
 
 ## Recommended order of work
 

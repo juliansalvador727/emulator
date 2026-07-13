@@ -15,7 +15,6 @@ use crate::bus::Bus;
 use crate::cartridge::Rom;
 use crate::cpu::CPU;
 use crate::joypad::JoypadButton;
-use crate::render;
 use crate::render::frame::Frame;
 
 // Minimal 24-bit BMP writer so screenshots need no external crates.
@@ -93,15 +92,13 @@ pub fn run_probe(rom_path: &str, script: &str, max_frames: u32) {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(50);
-    let mut shot_frame = Frame::new();
 
     let mut frame_no: u32 = 0;
     let bus = Bus::new(rom, move |ppu, apu, joypad| {
         frame_no += 1;
         if let Some(dir) = &shot_dir {
             if frame_no % shot_every == 0 {
-                render::render(ppu, &mut shot_frame);
-                write_bmp(&format!("{}/f{:05}.bmp", dir, frame_no), &shot_frame);
+                write_bmp(&format!("{}/f{:05}.bmp", dir, frame_no), ppu.frame());
             }
         }
         for p in &presses {
