@@ -8,10 +8,12 @@ lower-priority backlog at the end of this file.
 
 Current verified baseline (2026-07-13):
 
-- 188 passing Rust tests.
+- 196 passing Rust tests.
 - All official 6502 opcodes; `nestest` matches 5,003 official-opcode entries.
 - NROM, MMC1, UxROM, CNROM, MMC3, AxROM, and GxROM/GNROM.
 - Dot-driven background and sprite rendering with mapper-visible PPU fetches.
+- P1 PPU register and memory behavior complete; DMA/bus timing is the next
+  active P1 foundation.
 - Five-channel APU including DMC DMA, filtering, and SDL2 playback.
 - Deterministic visual regressions for SMB1, Zelda, and SMB2.
 - Two-minute release probes exceed real-time performance with stable sample
@@ -83,6 +85,9 @@ status-bar splits no longer exhibit one-line jitter.
 
 ## P1 — Finish PPU register and memory behavior
 
+Status: complete. The dot-driven renderer now uses delayed PPUMASK ownership,
+per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
+
 - [x] Mirror `$3000-$3EFF` to `$2000-$2EFF` for reads and writes instead of
   panicking.
 - [x] Correct palette behavior:
@@ -96,11 +101,20 @@ status-bar splits no longer exhibit one-line jitter.
   Verified with `oam_read.nes` (SHA-256
   `f298973dabeb61ca35007445f7a615f77e87703c958c870986af83b1aabde926`),
   which reports status 0 through the blargg `$6000` protocol.
-- [ ] Model delayed PPUMASK rendering enable/disable effects and exact left-edge
+- [x] Model delayed PPUMASK rendering enable/disable effects and exact left-edge
   clipping transitions.
-- [ ] Tighten pre-render/vblank ordering, `$2002` race windows, NMI suppression,
+- [x] Tighten pre-render/vblank ordering, `$2002` race windows, NMI suppression,
   and immediate NMI behavior on `$2000` changes.
-- [ ] Add targeted register tests plus relevant nesdev/blargg ROM results.
+- [x] Add targeted register tests plus relevant nesdev/blargg ROM results.
+  `ppu_vbl_nmi.nes` (SHA-256
+  `8dbab1be785585c399cf055ef02147b788ab75fd80e81cf9568a2feafc03fb7d`)
+  reports all 10 tests passed, and `ppu_open_bus.nes` (SHA-256
+  `d4208a3ff6340532dd0fced7f9d408d5b6585853a0ddc9c1f64ee1722ef08e67`)
+  reports passed through the blargg `$6000` protocol.
+  The older standalone `vbl_nmi_timing` ROMs that depend on the CPU cycle of
+  each register access remain acceptance coverage for the bus-cycle timing
+  work below; do not compensate for instruction-granularity CPU accesses with
+  an incorrect global PPU offset.
 
 ## P1 — Implement real DMA and CPU/PPU/APU bus timing
 
@@ -121,7 +135,8 @@ status-bar splits no longer exhibit one-line jitter.
 - [ ] Complete the `nestest` trace beyond the first unofficial opcode and add
   dedicated illegal-opcode test ROM results.
 - [ ] Audit instruction, interrupt, reset, and DMA timing at bus-cycle
-  granularity as needed by timing ROMs and mapper write quirks.
+  granularity as needed by timing ROMs and mapper write quirks; make the older
+  standalone `vbl_nmi_timing` suite pass without a compensating PPU offset.
 - [ ] Implement accurate reset and power-cycle state separately; do not treat
   application startup, reset, and save-state restore as the same operation.
 

@@ -14,6 +14,12 @@ pub mod registers;
 // drives the latch; this is equivalent to clocking it on every PPU dot.
 const PPU_IO_BUS_DECAY_DOTS: u64 = 53_693;
 
+// PPUMASK's rendering-enable signal crosses a short internal pipeline before
+// it hands VRAM/OAM ownership to the renderer. A write made between PPU dots
+// leaves the next four dots in the old state; pixel-component and color bits
+// themselves remain directly observable from PPUMASK.
+const PPUMASK_RENDER_DELAY_DOTS: u64 = 4;
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProbeDiagnostics {
     pub oam_dma_count: u64,
@@ -44,6 +50,9 @@ pub struct NesPPU {
     pub mask: MaskRegister,
     pub status: StatusRegister,
     pub oam_addr: u8,
+    rendering_enabled: bool,
+    pending_rendering_enabled: bool,
+    rendering_change_at: Option<u64>,
     // Value currently visible on the PPU's internal OAM data bus. During
     // rendering, $2004 observes this bus instead of indexing primary OAM with
     // OAMADDR.
@@ -108,6 +117,9 @@ impl NesPPU {
             mask: MaskRegister::new(),
             status: StatusRegister::new(),
             oam_addr: 0,
+            rendering_enabled: false,
+            pending_rendering_enabled: false,
+            rendering_change_at: None,
             oam_data_bus: 0,
             internal_data_buf: 0,
             io_data_bus: 0,
@@ -203,7 +215,21 @@ impl NesPPU {
     }
 
     fn rendering_enabled(&self) -> bool {
+        self.rendering_enabled
+    }
+
+    fn rendering_requested(&self) -> bool {
         self.mask.show_background() || self.mask.show_sprites()
+    }
+
+    fn apply_pending_rendering_state(&mut self) {
+        if self
+            .rendering_change_at
+            .is_some_and(|change_at| self.total_dots >= change_at)
+        {
+            self.rendering_enabled = self.pending_rendering_enabled;
+            self.rendering_change_at = None;
+        }
     }
 
     fn rendering_in_progress(&self) -> bool {
@@ -213,6 +239,7 @@ impl NesPPU {
     // Advance one PPU dot. Rendering, fetches, scrolling and mapper-visible
     // address-bus activity all originate from this timeline.
     fn clock_dot(&mut self) -> bool {
+        self.apply_pending_rendering_state();
         let render_line = self.scanline < 240 || self.scanline == 261;
         if self.scanline == 261 && self.dot == 0 {
             self.odd_skip_armed = false;
@@ -220,7 +247,10 @@ impl NesPPU {
             // PPUMASK is sampled before the skipped-clock point. A rendering
             // enable that lands after this dot is too late to shorten the
             // current odd frame.
-            self.odd_skip_armed = self.odd_frame && self.rendering_enabled();
+            // This model decides the later dot-339 skip here at dot 337. Use
+            // the directly written PPUMASK request: by the actual skip point,
+            // its internal rendering signal has crossed the transition delay.
+            self.odd_skip_armed = self.odd_frame && self.rendering_requested();
         }
         if render_line && self.rendering_enabled() {
             if (1..=256).contains(&self.dot) || (321..=336).contains(&self.dot) {
@@ -231,10 +261,6 @@ impl NesPPU {
                     let addr = 0x2000 | (self.loopy.current() & 0x0fff);
                     let _ = self.ppu_bus_read(addr);
                 }
-            }
-
-            if self.scanline < 240 && (1..=256).contains(&self.dot) {
-                self.render_pixel();
             }
 
             if (1..=64).contains(&self.dot) {
@@ -263,6 +289,14 @@ impl NesPPU {
             if self.scanline == 261 && (280..=304).contains(&self.dot) {
                 self.loopy.copy_vertical();
             }
+        }
+
+        // The video output continues to produce backdrop pixels while the
+        // fetch/evaluation pipeline is disabled. Keeping this outside the
+        // rendering block also makes mid-scanline PPUMASK transitions land on
+        // the exact first affected pixel instead of leaving stale frame data.
+        if self.scanline < 240 && (1..=256).contains(&self.dot) {
+            self.render_pixel();
         }
 
         if self.scanline == 241 && self.dot == 0 {
@@ -513,7 +547,8 @@ impl NesPPU {
 
     fn render_pixel(&mut self) {
         let x = (self.dot - 1) as usize;
-        let show_bg = self.mask.show_background()
+        let show_bg = self.rendering_enabled()
+            && self.mask.show_background()
             && (x >= 8 || self.mask.leftmost_8pxl_background());
         let selector = 0x8000u16 >> self.loopy.fine_x();
         let bg_pixel = if show_bg {
@@ -525,7 +560,8 @@ impl NesPPU {
         let bg_palette = ((self.bg_attr_hi & selector != 0) as u8) << 1
             | (self.bg_attr_lo & selector != 0) as u8;
 
-        let show_sprites = self.mask.show_sprites()
+        let show_sprites = self.rendering_enabled()
+            && self.mask.show_sprites()
             && (x >= 8 || self.mask.leftmost_8pxl_sprite());
         let mut sprite_pixel = 0;
         let mut sprite_palette = 0;
@@ -551,7 +587,7 @@ impl NesPPU {
             self.status.set_sprite_zero_hit(true);
         }
         let palette_index = match (bg_pixel, sprite_pixel) {
-            (0, 0) => 0,
+            (0, 0) => self.backdrop_palette_index(),
             (0, sp) => 0x10 + sprite_palette as usize * 4 + sp as usize,
             (bg, 0) => bg_palette as usize * 4 + bg as usize,
             (bg, _) if sprite_behind => bg_palette as usize * 4 + bg as usize,
@@ -560,16 +596,30 @@ impl NesPPU {
         let color = self.output_color(self.palette_table[palette_index]);
         self.frame.set_pixel(x, self.scanline as usize, color);
 
-        for sprite in &mut self.current_sprites {
-            if !sprite.valid {
-                continue;
+        if self.rendering_enabled() {
+            for sprite in &mut self.current_sprites {
+                if !sprite.valid {
+                    continue;
+                }
+                if sprite.x_counter > 0 {
+                    sprite.x_counter -= 1;
+                } else {
+                    sprite.pattern_lo <<= 1;
+                    sprite.pattern_hi <<= 1;
+                }
             }
-            if sprite.x_counter > 0 {
-                sprite.x_counter -= 1;
-            } else {
-                sprite.pattern_lo <<= 1;
-                sprite.pattern_hi <<= 1;
-            }
+        }
+    }
+
+    fn backdrop_palette_index(&self) -> usize {
+        // With rendering disabled, a palette address left in v is presented
+        // directly as the backdrop color. Otherwise the universal background
+        // entry is used, including during the short PPUMASK disable delay.
+        let addr = self.loopy.current() & 0x3fff;
+        if !self.rendering_enabled() && addr >= 0x3f00 {
+            Self::palette_index(addr)
+        } else {
+            0
         }
     }
 
@@ -690,6 +740,16 @@ impl NesPPU {
         self.drive_io_data_bus(value, 0xff);
         self.note_register_write(0x2001);
         self.mask.update(value);
+        let requested = self.rendering_requested();
+        self.pending_rendering_enabled = requested;
+        if requested == self.rendering_enabled {
+            // A second write can retract a transition before it reaches the
+            // renderer (a pattern used by timing tests and a few games).
+            self.rendering_change_at = None;
+        } else if self.rendering_change_at.is_none() {
+            self.rendering_change_at =
+                Some(self.total_dots.wrapping_add(PPUMASK_RENDER_DELAY_DOTS));
+        }
     }
 
     // Reading PPUSTATUS clears vblank and resets the single shared $2005/$2006
@@ -702,7 +762,7 @@ impl NesPPU {
         let data = self.io_data_bus;
         // A read immediately before vblank suppresses that frame's vblank flag
         // and NMI. A read on dot 1 clears the just-set flag/NMI below.
-        if self.scanline == 241 && self.dot <= 1 {
+        if self.scanline == 241 && self.dot == 0 {
             self.suppress_vblank = true;
         }
         self.status.reset_vblank_status();
@@ -923,6 +983,18 @@ pub mod test {
         (NesPPU::new(mapper), accesses)
     }
 
+    // Most dot-phase tests start the raster at an arbitrary position and are
+    // concerned with the pipeline once it is already active. Keep those tests
+    // independent of PPUMASK's transition delay; dedicated tests below cover
+    // the delay itself.
+    fn force_mask(ppu: &mut NesPPU, value: u8) {
+        ppu.write_to_mask(value);
+        let rendering = ppu.mask.show_background() || ppu.mask.show_sprites();
+        ppu.rendering_enabled = rendering;
+        ppu.pending_rendering_enabled = rendering;
+        ppu.rendering_change_at = None;
+    }
+
     fn mmc3_ppu() -> (NesPPU, crate::mapper::SharedMapper) {
         let mapper = crate::mapper::from_rom(crate::cartridge::Rom {
             // MMC3 fixes its final two 8 KB banks, so give it a conventional
@@ -1112,6 +1184,183 @@ pub mod test {
     }
 
     #[test]
+    fn ppumask_rendering_ownership_changes_after_four_complete_dots() {
+        let mut ppu = NesPPU::new_empty_rom();
+
+        ppu.write_to_mask(0x08);
+        assert!(!ppu.rendering_enabled());
+        ppu.tick(1);
+        assert!(!ppu.rendering_enabled());
+        ppu.tick(1);
+        assert!(!ppu.rendering_enabled());
+        ppu.tick(1);
+        assert!(!ppu.rendering_enabled());
+        ppu.tick(1);
+        assert!(!ppu.rendering_enabled());
+        ppu.tick(1);
+        assert!(ppu.rendering_enabled());
+
+        ppu.write_to_mask(0x00);
+        ppu.tick(1);
+        assert!(ppu.rendering_enabled());
+        ppu.tick(1);
+        assert!(ppu.rendering_enabled());
+        ppu.tick(1);
+        assert!(ppu.rendering_enabled());
+        ppu.tick(1);
+        assert!(ppu.rendering_enabled());
+        ppu.tick(1);
+        assert!(!ppu.rendering_enabled());
+    }
+
+    #[test]
+    fn ppumask_transition_can_be_retracted_before_it_reaches_the_renderer() {
+        let mut ppu = NesPPU::new_empty_rom();
+        ppu.write_to_mask(0x08);
+        ppu.tick(1);
+        ppu.write_to_mask(0x00);
+
+        ppu.tick(3);
+
+        assert!(!ppu.rendering_enabled());
+        assert_eq!(ppu.rendering_change_at, None);
+    }
+
+    #[test]
+    fn left_background_clip_changes_on_the_first_pixel_after_the_write() {
+        let mut ppu = NesPPU::new_empty_rom();
+        force_mask(&mut ppu, 0x08); // background on, left column clipped
+        ppu.palette_table[0] = 0x0f;
+        ppu.palette_table[1] = 0x30;
+
+        ppu.bg_pattern_lo = 0x4000;
+        ppu.dot = 1;
+        ppu.tick(1);
+
+        ppu.write_to_mask(0x0a); // expose background in the left column
+        ppu.bg_pattern_lo = 0x4000;
+        ppu.tick(1);
+
+        ppu.write_to_mask(0x08); // clip it again on the following pixel
+        ppu.bg_pattern_lo = 0x4000;
+        ppu.tick(1);
+
+        let backdrop = SYSTEM_PALLETE[0x0f];
+        let foreground = SYSTEM_PALLETE[0x30];
+        assert_eq!(
+            &ppu.frame().data[0..3],
+            &[backdrop.0, backdrop.1, backdrop.2]
+        );
+        assert_eq!(
+            &ppu.frame().data[3..6],
+            &[foreground.0, foreground.1, foreground.2]
+        );
+        assert_eq!(
+            &ppu.frame().data[6..9],
+            &[backdrop.0, backdrop.1, backdrop.2]
+        );
+    }
+
+    #[test]
+    fn blanked_output_uses_palette_address_left_in_v() {
+        let mut ppu = NesPPU::new_empty_rom();
+        ppu.palette_table[5] = 0x30;
+        ppu.write_to_ppu_addr(0x3f);
+        ppu.write_to_ppu_addr(0x05);
+        ppu.dot = 1;
+
+        ppu.tick(1);
+
+        let expected = SYSTEM_PALLETE[0x30];
+        assert_eq!(
+            &ppu.frame().data[0..3],
+            &[expected.0, expected.1, expected.2]
+        );
+    }
+
+    #[test]
+    fn status_read_on_vblank_set_dot_does_not_poison_the_next_frame() {
+        let mut ppu = NesPPU::new_empty_rom();
+        ppu.write_to_ctrl(0x80);
+        ppu.scanline = 241;
+        ppu.dot = 0;
+        ppu.tick(1);
+
+        assert_eq!(ppu.read_status() & 0x80, 0x80);
+        assert!(!ppu.suppress_vblank);
+        assert_eq!(ppu.poll_nmi_interrupt(), None);
+
+        // Jump to the next frame's set point. The post-set read above must not
+        // be mistaken for a pre-set read and suppress this event as well.
+        ppu.scanline = 241;
+        ppu.dot = 0;
+        ppu.tick(1);
+        assert!(ppu.status.is_in_vblank());
+    }
+
+    #[test]
+    fn status_read_suppression_window_ends_two_dots_after_vblank_set() {
+        let mut suppressed = NesPPU::new_empty_rom();
+        suppressed.write_to_ctrl(0x80);
+        suppressed.scanline = 241;
+        suppressed.dot = 0;
+        suppressed.tick(1); // vblank set
+        suppressed.tick(1); // one dot after set
+        assert_eq!(suppressed.read_status() & 0x80, 0x80);
+        suppressed.tick(2);
+        assert_eq!(suppressed.poll_nmi_interrupt(), None);
+
+        let mut recognized = NesPPU::new_empty_rom();
+        recognized.write_to_ctrl(0x80);
+        recognized.scanline = 241;
+        recognized.dot = 0;
+        recognized.tick(1); // vblank set
+        recognized.tick(2); // two dots after set: CPU has recognized the edge
+        assert_eq!(recognized.read_status() & 0x80, 0x80);
+        assert_eq!(recognized.poll_nmi_interrupt(), Some(1));
+    }
+
+    #[test]
+    fn disabling_nmi_only_cancels_an_edge_before_cpu_recognition() {
+        let mut cancelled = NesPPU::new_empty_rom();
+        cancelled.write_to_ctrl(0x80);
+        cancelled.scanline = 241;
+        cancelled.dot = 0;
+        cancelled.tick(1);
+        cancelled.tick(1); // one dot after vblank set
+        cancelled.write_to_ctrl(0x00);
+        cancelled.tick(2);
+        assert_eq!(cancelled.poll_nmi_interrupt(), None);
+
+        let mut recognized = NesPPU::new_empty_rom();
+        recognized.write_to_ctrl(0x80);
+        recognized.scanline = 241;
+        recognized.dot = 0;
+        recognized.tick(1);
+        recognized.tick(2); // recognition point
+        recognized.write_to_ctrl(0x00);
+        assert_eq!(recognized.poll_nmi_interrupt(), Some(1));
+    }
+
+    #[test]
+    fn toggling_ppuctrl_can_generate_multiple_immediate_nmis_in_one_vblank() {
+        let mut ppu = NesPPU::new_empty_rom();
+        ppu.status.set_vblank_status(true);
+
+        ppu.write_to_ctrl(0x80);
+        let first_edge_at = ppu.nmi_interrupt_at;
+        ppu.write_to_ctrl(0x80);
+        assert_eq!(ppu.nmi_interrupt_at, first_edge_at);
+        ppu.tick(6);
+        assert_eq!(ppu.poll_nmi_interrupt(), Some(1));
+
+        ppu.write_to_ctrl(0x00);
+        ppu.write_to_ctrl(0x80);
+        ppu.tick(6);
+        assert_eq!(ppu.poll_nmi_interrupt(), Some(1));
+    }
+
+    #[test]
     fn sprite_zero_hit_is_asserted_at_the_overlap_dot() {
         let mut ppu = NesPPU::new_empty_rom();
         ppu.write_to_mask(0b0001_1110);
@@ -1147,7 +1396,7 @@ pub mod test {
             valid: true,
         };
 
-        ppu.write_to_mask(0x18); // rendering on, left eight pixels clipped
+        force_mask(&mut ppu, 0x18); // rendering on, left eight pixels clipped
         // The background pipeline shifts immediately before composing a dot.
         ppu.bg_pattern_lo = 0x4000;
         ppu.current_sprites[0] = sprite;
@@ -1173,7 +1422,7 @@ pub mod test {
     #[test]
     fn background_fetches_follow_the_eight_dot_bus_sequence() {
         let mut ppu = NesPPU::new_empty_rom();
-        ppu.write_to_mask(0x08);
+        force_mask(&mut ppu, 0x08);
         ppu.vram[0] = 2;
         ppu.vram[0x03c0] = 0b11;
         ppu.mapper.borrow_mut().ppu_write(32, 0xaa);
@@ -1195,7 +1444,7 @@ pub mod test {
     #[test]
     fn background_fetch_phases_drive_the_expected_addresses_and_dots() {
         let (mut ppu, accesses) = recording_ppu();
-        ppu.write_to_mask(0x08);
+        force_mask(&mut ppu, 0x08);
         ppu.vram[0] = 2;
         ppu.dot = 1;
 
@@ -1211,7 +1460,7 @@ pub mod test {
     #[test]
     fn prefetch_and_dummy_fetches_drive_the_ppu_bus_on_dots_321_through_339() {
         let (mut ppu, accesses) = recording_ppu();
-        ppu.write_to_mask(0x08);
+        force_mask(&mut ppu, 0x08);
         ppu.dot = 321;
 
         ppu.tick(20);
@@ -1237,7 +1486,7 @@ pub mod test {
     fn sprite_fetch_slot_drives_two_garbage_and_two_pattern_accesses() {
         let (mut ppu, accesses) = recording_ppu();
         ppu.write_to_ctrl(0x08); // 8x8 sprite patterns at $1000
-        ppu.write_to_mask(0x10);
+        force_mask(&mut ppu, 0x10);
         ppu.secondary_count = 1;
         ppu.secondary_indices[0] = 0;
         ppu.secondary_oam[0..4].copy_from_slice(&[0, 2, 0, 0]);
@@ -1256,7 +1505,7 @@ pub mod test {
     fn empty_sprite_slots_still_fetch_from_the_selected_pattern_table() {
         let (mut ppu, accesses) = recording_ppu();
         ppu.write_to_ctrl(0x08);
-        ppu.write_to_mask(0x10);
+        force_mask(&mut ppu, 0x10);
         ppu.dot = 257;
 
         ppu.tick(8);
@@ -1311,7 +1560,7 @@ pub mod test {
     #[test]
     fn loopy_scroll_copies_happen_on_their_hardware_dots() {
         let mut ppu = NesPPU::new_empty_rom();
-        ppu.write_to_mask(0x08);
+        force_mask(&mut ppu, 0x08);
 
         // Establish v=0, then change only temporary horizontal scroll.
         ppu.write_to_scroll(0);
@@ -1342,7 +1591,7 @@ pub mod test {
     #[test]
     fn odd_rendered_frame_skips_pre_render_dot_340() {
         let mut ppu = NesPPU::new_empty_rom();
-        ppu.write_to_mask(0x08);
+        force_mask(&mut ppu, 0x08);
         ppu.scanline = 261;
         ppu.dot = 0;
 
@@ -1561,7 +1810,7 @@ pub mod test {
         let mut ppu = NesPPU::new_empty_rom();
         ppu.oam_data[0] = 0x23;
         ppu.oam_data[1] = 0x45;
-        ppu.write_to_mask(0x08);
+        force_mask(&mut ppu, 0x08);
 
         ppu.dot = 1;
         ppu.tick(1);
@@ -1585,7 +1834,7 @@ pub mod test {
         let mut ppu = NesPPU::new_empty_rom();
         ppu.oam_data[0x10] = 0x55;
         ppu.write_to_oam_addr(0x10);
-        ppu.write_to_mask(0x10);
+        force_mask(&mut ppu, 0x10);
 
         ppu.write_to_oam_data(0xaa);
 
@@ -1597,7 +1846,7 @@ pub mod test {
     fn sprite_fetch_resets_oamaddr_and_evaluation_applies_refresh_corruption() {
         let mut ppu = NesPPU::new_empty_rom();
         ppu.oam_data[0x20..0x28].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
-        ppu.write_to_mask(0x08);
+        force_mask(&mut ppu, 0x08);
         ppu.write_to_oam_addr(0x23);
         ppu.dot = 65;
 
@@ -1617,7 +1866,7 @@ pub mod test {
             ppu.write_to_ctrl(0x04); // +32 is ignored while rendering.
             ppu.write_to_ppu_addr(0x00);
             ppu.write_to_ppu_addr(0x00);
-            ppu.write_to_mask(0x08);
+            force_mask(&mut ppu, 0x08);
             ppu.scanline = 100;
             ppu.dot = 100;
 
@@ -1836,7 +2085,7 @@ pub mod test {
         let mut ppu = NesPPU::new_empty_rom();
         ppu.oam_data.fill(0x55);
         ppu.write_to_oam_addr(0x10);
-        ppu.write_to_mask(0x10);
+        force_mask(&mut ppu, 0x10);
 
         ppu.write_oam_dma(&[0xaa; 256]);
 

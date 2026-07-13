@@ -1,4 +1,4 @@
-# P0 baseline results
+# P0/P1 PPU baseline results
 
 Recorded on 2026-07-13 in a Linux release build. These figures are evidence
 for the current baseline, not universal performance promises; rerun the probe
@@ -6,14 +6,16 @@ on the target host before changing PPU timing.
 
 ## Deterministic timing validation
 
-The Rust suite now has 179 passing tests. P0 coverage records exact
+The Rust suite now has 196 passing tests. P0/P1 coverage records exact
 mapper-visible background, prefetch, dummy, and sprite fetch addresses/dots;
 blanked rendering; sprite-zero left-edge and x=255 behavior; vblank/NMI races;
 odd-frame skipping; all background/sprite pattern-table combinations; PPUDATA
 A12 activity; the eight-dot MMC3 low filter; and IRQ latch/reload/enable/
 acknowledge/level behavior. PPU register coverage also includes palette
 mirroring, greyscale/emphasis output, the CPU-facing I/O latch, partial-bit
-refresh, deterministic decay, and OAM attribute read masking.
+refresh, deterministic decay, OAM attribute read masking, delayed PPUMASK
+rendering ownership, per-pixel left-edge clipping changes, disabled-rendering
+backdrop output, and the `$2002`/`$2000` NMI suppression/control windows.
 
 `test-roms/run_p0_validation.sh` provides hash-checked execution and revisioned
 TSV results for external blargg/nesdev ROMs. The binaries remain outside this
@@ -42,6 +44,15 @@ and exact odd/even frame timing.
 This result was reproduced on revision `6ec8976c8df0b1a708b5d6afe59defa2a5dc5ce6`
 with `NES_TEST_ROMS_ROOT=../nes-test-roms`; the full suite again passed 22/22.
 
+The P1 register pass reran `ppu_vbl_nmi.nes` and `ppu_open_bus.nes` from the
+same upstream revision: the combined vblank/NMI ROM again reported all 10
+tests passed, and the open-bus ROM reported passed. The older standalone
+`vbl_nmi_timing` set was also explored: frame basics and even/odd timing pass,
+while its five CPU-alignment-sensitive ROMs still fail. Those CPU-visible
+accesses currently occur at instruction granularity, so their single-cycle bus
+placement belongs to the separately tracked CPU/PPU bus-timing work rather
+than being hidden by a compensating PPU offset.
+
 The dedicated `scrolltest/scroll.nes` ROM (SHA-256
 `04ebe8b768ffc31fc1fa18a21f2e1884d0d3df2588f5efee53e881a339874db7`)
 was also run headlessly for 180 frames. The reviewed output showed its complete
@@ -63,6 +74,8 @@ The nine reviewed BMPs in `baselines/` cover frames 180, 360, and 600 for
 each case and are checked byte-for-byte by `run_visual_regressions.sh`.
 The suite was rerun while closing P0; all nine current images matched, including
 the three MMC3/SMB2 frames, with zero baseline failures.
+It was rerun again after the P1 PPU-register timing pass; all nine still
+matched with zero baseline failures.
 
 ## Artifact capture
 
