@@ -55,5 +55,29 @@ cargo run --release -- probe games/mario.nes "start@120-135" 904
 
 The output contains frames 897 through 903. Inspect the matching CSV rows for
 `oam_dmas`, `visible_ppu_writes`, and the last register/scanline/dot. Sprite
-overflow is not yet exact in the scanline renderer. Its implementation and the
-corresponding capture-report extension are tracked centrally in `../TODO.md`.
+overflow state is not yet included in capture reports; that diagnostics work
+is tracked centrally in `../TODO.md`.
+
+## PPU/MMC3 test ROMs
+
+The `test-rom` command runs ROMs that use the standard blargg status protocol
+at `$6000-$6004`, plus older PPU/MMC3 suites that return a code at `$00F8`,
+without opening SDL video or audio:
+
+```sh
+cargo run --release -- test-rom test-roms/local/example.nes 50000000
+```
+
+For a repeatable P0 suite, copy legally obtained test ROMs under
+`test-roms/local/`, add their paths and SHA-256 hashes to
+`test-roms/p0-cases.txt` (the checked-in manifest is pinned to the named
+upstream revision), then run:
+
+```sh
+./test-roms/run_p0_validation.sh
+```
+
+The runner rejects hash mismatches and writes a tab-separated report containing
+the emulator Git revision, NTSC configuration, case, ROM hash, result, and
+diagnostic. Set `P0_RESULTS` to retain that report at a specific path. Missing,
+mismatched, or failing cases make the command fail.

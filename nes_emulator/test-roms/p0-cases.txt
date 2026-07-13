@@ -1,0 +1,26 @@
+# id|rom|sha256|max_instructions
+# Upstream: christopherpow/nes-test-roms at commit
+# 95d8f621ae55cee0d09b91519a8989ae0e64753b. Binaries are not committed;
+# copy these directories beneath test-roms/local/ before running the suite.
+ppu-vbl-nmi|test-roms/local/ppu_vbl_nmi/ppu_vbl_nmi.nes|8dbab1be785585c399cf055ef02147b788ab75fd80e81cf9568a2feafc03fb7d|50000000
+sprite-hit-01|test-roms/local/sprite_hit_tests_2005.10.05/01.basics.nes|51819e8e502bd88fe3b7244198a074dbeef2e848f66c587be04b04f1f0d4bb52|50000000
+sprite-hit-02|test-roms/local/sprite_hit_tests_2005.10.05/02.alignment.nes|125bbb3ce1e67370f1f4559c2ad3221e52a3e98880b9789400292b5f3a8b39e6|50000000
+sprite-hit-03|test-roms/local/sprite_hit_tests_2005.10.05/03.corners.nes|9dd57776bc6267fe6183c5521d67cbe3fccc6662ae545eb2c419949bf39644d3|50000000
+sprite-hit-04|test-roms/local/sprite_hit_tests_2005.10.05/04.flip.nes|5f7142bddb51b7577f93fa22f9f668efebbeea00346d7255089e1863acb9d46a|50000000
+sprite-hit-05|test-roms/local/sprite_hit_tests_2005.10.05/05.left_clip.nes|69b329658c17b953f149c2f0de77eb272089df22c815bd2fd3d6f43206791c13|50000000
+sprite-hit-06|test-roms/local/sprite_hit_tests_2005.10.05/06.right_edge.nes|8e6653fcb869e06873e29e5e4423122ea72ba0bf38f3ba9e39f471420db759a4|50000000
+sprite-hit-07|test-roms/local/sprite_hit_tests_2005.10.05/07.screen_bottom.nes|05849956f80267838c5b6556310266b794078a4300841cbb36339fd141905a0b|50000000
+sprite-hit-08|test-roms/local/sprite_hit_tests_2005.10.05/08.double_height.nes|127fd966b6b32d6d88a53c5f59d7e938827783c9ad056091f119be1c4ab21c71|50000000
+sprite-hit-09|test-roms/local/sprite_hit_tests_2005.10.05/09.timing_basics.nes|311698c717e50150edd0b5fd0016c41de686463205c20efb5630d6adb90859fd|50000000
+sprite-hit-10|test-roms/local/sprite_hit_tests_2005.10.05/10.timing_order.nes|0f36bc07bfe51c416e3cc1a5231053572aa6b15aa60e6d2fd0568be49b6dc2e9|50000000
+sprite-hit-11|test-roms/local/sprite_hit_tests_2005.10.05/11.edge_timing.nes|5a7c121f6e76617be88a0a7035c0e402293be5c685c95b97190a8d70835736ab|50000000
+sprite-overflow-1|test-roms/local/sprite_overflow_tests/1.Basics.nes|1a6782f63ccb3a3dd1aa6a24272036c9c3aa232c2d1ff0b21e872741a3ee4fe2|50000000
+sprite-overflow-2|test-roms/local/sprite_overflow_tests/2.Details.nes|6405a7ff1042fe7a50d9bfe521e43460a3251799425bd3e1863b29b67e7cd587|50000000
+sprite-overflow-3|test-roms/local/sprite_overflow_tests/3.Timing.nes|2252ec8fc35932b408f409ef9b6863edf084aa871fc10ad180b0ac4c2468ef8c|50000000
+sprite-overflow-4|test-roms/local/sprite_overflow_tests/4.Obscure.nes|aebf2199344321465ae0d8dcd81f6c528c7f661f31f1814711365b4e573a8263|50000000
+sprite-overflow-5|test-roms/local/sprite_overflow_tests/5.Emulator.nes|cf994454219696de82794f0b84f2bd63458444d12a1171c85bba8697ab94acb4|50000000
+mmc3-1-clocking|test-roms/local/mmc3_irq_tests/1.Clocking.nes|699d0644bd2b6ff4c9ba598c9609f4a3da536594b6363585b2caf82cf337ac88|50000000
+mmc3-2-details|test-roms/local/mmc3_irq_tests/2.Details.nes|0af95238b69806c072c28aed0fa8ad812157dfee928a6c9cea8d5420268baade|50000000
+mmc3-3-a12|test-roms/local/mmc3_irq_tests/3.A12_clocking.nes|3b936e1079f12bdc5e55aa82def017ddc76fd79e3879ff0478d41ca718302e7c|50000000
+mmc3-4-scanline|test-roms/local/mmc3_irq_tests/4.Scanline_timing.nes|3369e8f73a96ec97918c6c9440804a369a19256c57df91e62881555f21528894|50000000
+mmc3-6-rev-b|test-roms/local/mmc3_irq_tests/6.MMC3_rev_B.nes|d8a2af42cdafe8046b36109e6f6ff71ca0d7f5d62c7d5953e0aa1d1828a86088|50000000

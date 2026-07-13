@@ -351,7 +351,14 @@ impl NesPPU {
 
     fn sprite_pattern_addr(&self, slot: usize) -> u16 {
         if slot >= self.secondary_count {
-            return 0;
+            // Empty secondary-OAM slots contain $FF. The PPU still performs
+            // their pattern fetches, and the resulting address matters to
+            // A12-sensitive mappers even though no sprite pixel is produced.
+            return if self.ctrl.sprite_size_16() {
+                0x1ff0
+            } else {
+                self.ctrl.sprt_pattern_addr() + 0x0ff0
+            };
         }
         let base = slot * 4;
         let y = self.secondary_oam[base] as usize;
@@ -510,7 +517,9 @@ impl NesPPU {
 
     pub fn write_to_ppu_addr(&mut self, value: u8) {
         self.note_register_write(0x2006);
-        self.loopy.write_addr(value);
+        if self.loopy.write_addr(value) {
+            self.notify_ppu_address_bus();
+        }
     }
 
     pub fn write_to_ctrl(&mut self, value: u8) {
@@ -585,13 +594,14 @@ impl NesPPU {
         let addr = self.loopy.current();
         self.ppu_bus_write(addr, value);
         self.increment_vram_addr();
+        self.notify_ppu_address_bus();
     }
 
     pub fn read_data(&mut self) -> u8 {
         let addr = self.loopy.current();
         self.increment_vram_addr();
 
-        if addr < 0x3f00 {
+        let result = if addr < 0x3f00 {
             let result = self.internal_data_buf;
             self.internal_data_buf = self.ppu_bus_read(addr);
             result
@@ -601,7 +611,15 @@ impl NesPPU {
             // from the mirrored nametable address beneath palette space.
             self.internal_data_buf = self.ppu_bus_read(addr - 0x1000);
             result
-        }
+        };
+        self.notify_ppu_address_bus();
+        result
+    }
+
+    fn notify_ppu_address_bus(&mut self) {
+        self.mapper
+            .borrow_mut()
+            .on_ppu_bus_access(self.loopy.current() & 0x3fff, self.total_dots);
     }
 
     // Horizontal:
@@ -647,6 +665,49 @@ impl NesPPU {
 #[cfg(test)]
 pub mod test {
     use super::*;
+    use crate::mapper::Mapper;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[derive(Default)]
+    struct RecordingMapper {
+        chr: Vec<u8>,
+        accesses: Rc<RefCell<Vec<(u16, u64)>>>,
+    }
+
+    impl Mapper for RecordingMapper {
+        fn cpu_read(&mut self, _addr: u16) -> u8 {
+            0
+        }
+
+        fn cpu_write(&mut self, _addr: u16, _data: u8) {}
+
+        fn ppu_read(&mut self, addr: u16) -> u8 {
+            self.chr[addr as usize]
+        }
+
+        fn ppu_write(&mut self, addr: u16, data: u8) {
+            self.chr[addr as usize] = data;
+        }
+
+        fn mirroring(&self) -> Mirroring {
+            Mirroring::Vertical
+        }
+
+        fn on_ppu_bus_access(&mut self, addr: u16, ppu_cycle: u64) {
+            self.accesses.borrow_mut().push((addr, ppu_cycle));
+        }
+    }
+
+    fn recording_ppu() -> (NesPPU, Rc<RefCell<Vec<(u16, u64)>>>) {
+        let accesses = Rc::new(RefCell::new(Vec::new()));
+        let mapper = RecordingMapper {
+            chr: vec![0; 0x2000],
+            accesses: Rc::clone(&accesses),
+        };
+        let mapper = Rc::new(RefCell::new(Box::new(mapper) as Box<dyn Mapper>));
+        (NesPPU::new(mapper), accesses)
+    }
 
     fn mmc3_ppu() -> (NesPPU, crate::mapper::SharedMapper) {
         let mapper = crate::mapper::from_rom(crate::cartridge::Rom {
@@ -687,6 +748,98 @@ pub mod test {
         ppu.tick(255);
         ppu.tick(86);
         assert!(mapper.borrow().irq_pending());
+    }
+
+    #[test]
+    fn mmc3_a12_edges_follow_background_and_sprite_pattern_table_selection() {
+        for (ctrl, expected_irq) in [(0x00, false), (0x08, true), (0x10, true), (0x18, true)] {
+            let (mut ppu, mapper) = mmc3_ppu();
+            {
+                let mut mapper = mapper.borrow_mut();
+                mapper.cpu_write(0xc000, 0);
+                mapper.cpu_write(0xc001, 0);
+                mapper.cpu_write(0xe001, 0);
+            }
+            ppu.write_to_ctrl(ctrl);
+            ppu.write_to_mask(0x18);
+
+            // Two lines cover both intra-line table transitions and the
+            // qualified edge after the dummy-fetch low period at line end.
+            for _ in 0..2 {
+                ppu.tick(255);
+                ppu.tick(86);
+            }
+
+            assert_eq!(
+                mapper.borrow().irq_pending(),
+                expected_irq,
+                "PPUCTRL pattern-table selection {ctrl:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn ppudata_accesses_are_visible_to_the_mmc3_a12_filter() {
+        let (mut ppu, mapper) = mmc3_ppu();
+        {
+            let mut mapper = mapper.borrow_mut();
+            mapper.cpu_write(0xc000, 0);
+            mapper.cpu_write(0xc001, 0);
+            mapper.cpu_write(0xe001, 0);
+        }
+
+        ppu.write_to_ppu_addr(0x00);
+        ppu.write_to_ppu_addr(0x00);
+        ppu.write_to_data(0);
+        ppu.tick(8);
+        ppu.write_to_ppu_addr(0x10);
+        ppu.write_to_ppu_addr(0x00);
+        ppu.write_to_data(0);
+
+        assert!(mapper.borrow().irq_pending());
+    }
+
+    #[test]
+    fn ppuaddr_write_can_clock_mmc3_from_a12_low_to_high() {
+        let (mut ppu, mapper) = mmc3_ppu();
+        {
+            let mut mapper = mapper.borrow_mut();
+            mapper.cpu_write(0xc000, 0);
+            mapper.cpu_write(0xc001, 0);
+            mapper.cpu_write(0xe001, 0);
+        }
+
+        ppu.write_to_ppu_addr(0x00);
+        ppu.write_to_ppu_addr(0x00);
+        ppu.tick(8);
+        ppu.write_to_ppu_addr(0x10);
+        ppu.write_to_ppu_addr(0x00);
+
+        assert!(mapper.borrow().irq_pending());
+    }
+
+    #[test]
+    fn ppudata_increment_across_0fff_clocks_mmc3_a12() {
+        for read in [false, true] {
+            let (mut ppu, mapper) = mmc3_ppu();
+            {
+                let mut mapper = mapper.borrow_mut();
+                mapper.cpu_write(0xc000, 0);
+                mapper.cpu_write(0xc001, 0);
+                mapper.cpu_write(0xe001, 0);
+            }
+            ppu.write_to_ppu_addr(0x0f);
+            ppu.write_to_ppu_addr(0xff);
+            ppu.tick(8);
+
+            if read {
+                ppu.read_data();
+            } else {
+                ppu.write_to_data(0);
+            }
+
+            assert!(mapper.borrow().irq_pending(), "PPUDATA read={read}");
+        }
     }
 
     #[test]
@@ -754,6 +907,41 @@ pub mod test {
     }
 
     #[test]
+    fn sprite_zero_hit_obeys_left_clipping_and_never_fires_at_x255() {
+        let mut ppu = NesPPU::new_empty_rom();
+        let sprite = SpriteUnit {
+            pattern_lo: 0x80,
+            pattern_hi: 0,
+            attributes: 0,
+            x_counter: 0,
+            oam_index: 0,
+            valid: true,
+        };
+
+        ppu.write_to_mask(0x18); // rendering on, left eight pixels clipped
+        // The background pipeline shifts immediately before composing a dot.
+        ppu.bg_pattern_lo = 0x4000;
+        ppu.current_sprites[0] = sprite;
+        ppu.dot = 1;
+        ppu.tick(1);
+        assert_eq!(ppu.status.snapshot() & 0x40, 0);
+
+        ppu.write_to_mask(0x1e); // show background and sprites in left edge
+        ppu.bg_pattern_lo = 0x4000;
+        ppu.current_sprites[0] = sprite;
+        ppu.dot = 1;
+        ppu.tick(1);
+        assert_eq!(ppu.status.snapshot() & 0x40, 0x40);
+
+        ppu.status.set_sprite_zero_hit(false);
+        ppu.bg_pattern_lo = 0x4000;
+        ppu.current_sprites[0] = sprite;
+        ppu.dot = 256;
+        ppu.tick(1);
+        assert_eq!(ppu.status.snapshot() & 0x40, 0);
+    }
+
+    #[test]
     fn background_fetches_follow_the_eight_dot_bus_sequence() {
         let mut ppu = NesPPU::new_empty_rom();
         ppu.write_to_mask(0x08);
@@ -773,6 +961,91 @@ pub mod test {
         assert_eq!(ppu.next_tile_hi, 0x55);
         ppu.tick(1);
         assert_eq!(ppu.loopy.current() & 0x1f, 1);
+    }
+
+    #[test]
+    fn background_fetch_phases_drive_the_expected_addresses_and_dots() {
+        let (mut ppu, accesses) = recording_ppu();
+        ppu.write_to_mask(0x08);
+        ppu.vram[0] = 2;
+        ppu.dot = 1;
+
+        ppu.tick(8);
+
+        assert_eq!(
+            *accesses.borrow(),
+            vec![(0x2000, 0), (0x23c0, 2), (0x0020, 4), (0x0028, 6)]
+        );
+        assert_eq!(ppu.loopy.current() & 0x001f, 1);
+    }
+
+    #[test]
+    fn prefetch_and_dummy_fetches_drive_the_ppu_bus_on_dots_321_through_339() {
+        let (mut ppu, accesses) = recording_ppu();
+        ppu.write_to_mask(0x08);
+        ppu.dot = 321;
+
+        ppu.tick(20);
+
+        assert_eq!(
+            *accesses.borrow(),
+            vec![
+                (0x2000, 0),
+                (0x23c0, 2),
+                (0x0000, 4),
+                (0x0008, 6),
+                (0x2001, 8),
+                (0x23c0, 10),
+                (0x0000, 12),
+                (0x0008, 14),
+                (0x2002, 16),
+                (0x2002, 18),
+            ]
+        );
+    }
+
+    #[test]
+    fn sprite_fetch_slot_drives_two_garbage_and_two_pattern_accesses() {
+        let (mut ppu, accesses) = recording_ppu();
+        ppu.write_to_ctrl(0x08); // 8x8 sprite patterns at $1000
+        ppu.write_to_mask(0x10);
+        ppu.secondary_count = 1;
+        ppu.secondary_indices[0] = 0;
+        ppu.secondary_oam[0..4].copy_from_slice(&[0, 2, 0, 0]);
+        ppu.dot = 257;
+
+        ppu.tick(8);
+
+        assert_eq!(
+            *accesses.borrow(),
+            vec![(0x2000, 0), (0x2000, 2), (0x1020, 4), (0x1028, 6)]
+        );
+        assert!(ppu.next_sprites[0].valid);
+    }
+
+    #[test]
+    fn empty_sprite_slots_still_fetch_from_the_selected_pattern_table() {
+        let (mut ppu, accesses) = recording_ppu();
+        ppu.write_to_ctrl(0x08);
+        ppu.write_to_mask(0x10);
+        ppu.dot = 257;
+
+        ppu.tick(8);
+
+        assert_eq!(
+            *accesses.borrow(),
+            vec![(0x2000, 0), (0x2000, 2), (0x1ff0, 4), (0x1ff8, 6)]
+        );
+    }
+
+    #[test]
+    fn rendering_disabled_suppresses_all_pipeline_bus_accesses() {
+        let (mut ppu, accesses) = recording_ppu();
+
+        ppu.tick(255);
+        ppu.tick(86);
+
+        assert!(accesses.borrow().is_empty());
     }
 
     #[test]
@@ -859,6 +1132,22 @@ pub mod test {
         }
         odd_dots += 1;
         assert_eq!(odd_dots, 340);
+    }
+
+    #[test]
+    fn odd_blank_frame_keeps_pre_render_dot_340() {
+        let mut ppu = NesPPU::new_empty_rom();
+        ppu.scanline = 261;
+        ppu.dot = 0;
+        ppu.odd_frame = true;
+
+        let mut dots = 0;
+        while !ppu.tick(1) {
+            dots += 1;
+        }
+        dots += 1;
+
+        assert_eq!(dots, 341);
     }
 
     #[test]

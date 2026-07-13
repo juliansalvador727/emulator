@@ -8,7 +8,7 @@ lower-priority backlog at the end of this file.
 
 Current verified baseline (2026-07-13):
 
-- 147 passing Rust tests.
+- 163 passing Rust tests.
 - All official 6502 opcodes; `nestest` matches 5,003 official-opcode entries.
 - NROM, MMC1, UxROM, CNROM, MMC3, AxROM, and GxROM/GNROM.
 - Dot-driven background and sprite rendering with mapper-visible PPU fetches.
@@ -46,8 +46,10 @@ this section is focused on edge-case fidelity and test-ROM validation.
   mappers observe the same CHR fetches that generate pixels.
 - [x] Keep NTSC odd-frame dot skipping and frame completion exact after the
   renderer migration.
-- [ ] Add focused tests for each fetch phase and run established PPU test ROMs
-  for scrolling, sprite-zero, overflow, vblank/NMI, and odd-frame behavior.
+- [x] Add focused tests for each fetch phase, scrolling, sprite-zero, overflow,
+  vblank/NMI, rendering blanking, mapper-visible accesses, and odd frames.
+- [ ] Run established PPU test ROMs for scrolling, sprite-zero, overflow,
+  vblank/NMI, and odd-frame behavior through `test-roms/run_p0_validation.sh`.
 - [x] Re-run release probes and reviewed visual regressions after each vertical
   slice; investigate deliberate baseline changes rather than blindly replacing
   images.
@@ -65,11 +67,11 @@ scanline schedule.
   addresses/accesses without making non-MMC3 mappers timing-aware.
 - [x] Track PPU A12 state and clock the MMC3 counter only on qualified low-to-
   high transitions, including the required low-time filter.
-- [ ] Verify background/sprite pattern-table combinations, blanked rendering,
+- [x] Verify background/sprite pattern-table combinations, blanked rendering,
   pre-render fetches, short low pulses, and extra fetches caused by PPU access.
-- [ ] Preserve and test `$C000/$C001/$E000/$E001` latch, reload, enable,
-  acknowledge, and level-triggered IRQ behavior; account for MMC3 revision
-  differences when cartridge/submapper metadata can identify them.
+- [x] Preserve and test `$C000/$C001/$E000/$E001` latch, reload, enable,
+  acknowledge, and level-triggered IRQ behavior. MMC3 revision differences
+  remain deferred until cartridge/submapper metadata can identify them.
 - [x] Remove the dot-260 approximation and its tests once edge-driven tests are
   in place.
 - [ ] Validate with MMC3 IRQ test ROMs and SMB2/SMB3-style status-bar splits;
@@ -189,7 +191,7 @@ status-bar splits no longer exhibit one-line jitter.
 
 ## P2 — Validation, diagnostics, and maintenance
 
-- [ ] Create a repeatable test-ROM runner that records ROM hash, pass/fail
+- [x] Create a repeatable test-ROM runner that records ROM hash, pass/fail
   result, emulator revision, and relevant region/configuration.
 - [ ] Expand ROM-level visual baselines when a new mapper or timing-sensitive
   behavior is added; keep copyrighted ROMs out of git when licensing requires.

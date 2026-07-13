@@ -10,6 +10,7 @@ pub mod ppu;
 pub mod probe;
 pub mod render;
 pub mod trace;
+pub mod test_rom;
 
 #[macro_use]
 extern crate lazy_static;
@@ -280,6 +281,17 @@ fn main() {
                 args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1800),
             ) {
                 eprintln!("probe failed: {err}");
+                std::process::exit(1);
+            }
+        }
+        Some("test-rom") => {
+            if let Err(err) = test_rom::run(
+                args.get(2).expect("test-rom needs a ROM path"),
+                args.get(3)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(50_000_000),
+            ) {
+                eprintln!("test ROM failed: {err}");
                 std::process::exit(1);
             }
         }

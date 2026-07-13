@@ -374,6 +374,74 @@ mod test {
     }
 
     #[test]
+    fn repeated_low_accesses_do_not_restart_the_a12_filter() {
+        let mut m = Mmc3::from_rom(rom(8, 8));
+        m.cpu_write(0xc000, 0);
+        m.cpu_write(0xc001, 0);
+        m.cpu_write(0xe001, 0);
+
+        m.on_ppu_bus_access(0x0000, 10);
+        m.on_ppu_bus_access(0x2000, 15);
+        m.on_ppu_bus_access(0x1000, 18);
+
+        assert!(m.irq_pending());
+    }
+
+    #[test]
+    fn high_a12_accesses_clock_only_one_rising_edge() {
+        let mut m = Mmc3::from_rom(rom(8, 8));
+        m.cpu_write(0xc000, 1);
+        m.cpu_write(0xc001, 0);
+        m.cpu_write(0xe001, 0);
+
+        m.on_ppu_bus_access(0x0000, 0);
+        m.on_ppu_bus_access(0x1000, 8); // reload counter to one
+        m.on_ppu_bus_access(0x1008, 20); // still high; must not decrement
+        assert!(!m.irq_pending());
+
+        m.on_ppu_bus_access(0x0000, 21);
+        m.on_ppu_bus_access(0x1000, 29); // next qualified rise decrements to zero
+        assert!(m.irq_pending());
+    }
+
+    #[test]
+    fn c001_forces_latch_reload_on_the_next_qualified_edge() {
+        let mut m = Mmc3::from_rom(rom(8, 8));
+        m.cpu_write(0xc000, 3);
+        m.clock_irq_counter();
+        m.clock_irq_counter();
+        assert_eq!(m.irq_counter, 2);
+
+        m.cpu_write(0xc000, 5);
+        m.cpu_write(0xc001, 0);
+        m.clock_irq_counter();
+
+        assert_eq!(m.irq_counter, 5);
+        assert!(!m.irq_reload);
+    }
+
+    #[test]
+    fn irq_is_level_triggered_until_acknowledged_and_can_be_reenabled() {
+        let mut m = Mmc3::from_rom(rom(8, 8));
+        m.cpu_write(0xc000, 0);
+        m.cpu_write(0xc001, 0);
+        m.cpu_write(0xe001, 0);
+        m.clock_irq_counter();
+        assert!(m.irq_pending());
+
+        m.clock_irq_counter();
+        assert!(m.irq_pending());
+        m.cpu_write(0xe000, 0);
+        assert!(!m.irq_pending());
+
+        m.clock_irq_counter();
+        assert!(!m.irq_pending());
+        m.cpu_write(0xe001, 0);
+        m.clock_irq_counter();
+        assert!(m.irq_pending());
+    }
+
+    #[test]
     fn prg_ram_read_write() {
         let mut m = Mmc3::from_rom(rom(8, 8));
         m.cpu_write(0x6001, 0xab);

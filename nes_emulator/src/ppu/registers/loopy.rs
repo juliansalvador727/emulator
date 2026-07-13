@@ -42,7 +42,10 @@ impl LoopyRegister {
         self.write_latch = !self.write_latch;
     }
 
-    pub fn write_addr(&mut self, value: u8) {
+    /// Apply one $2006 write. Returns true when the low-byte write completed
+    /// the address and copied `t` to the PPU's current address bus value `v`.
+    pub fn write_addr(&mut self, value: u8) -> bool {
+        let completed = self.write_latch;
         if !self.write_latch {
             self.t = (self.t & 0x00ff) | (((value as u16) & 0x3f) << 8);
         } else {
@@ -50,6 +53,7 @@ impl LoopyRegister {
             self.v = self.t;
         }
         self.write_latch = !self.write_latch;
+        completed
     }
 
     pub fn increment(&mut self, amount: u8) {

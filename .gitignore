@@ -23,4 +23,7 @@ target
 
 # my gitignores (separate from the rust template)
 /nes_emulator/games/*
+/nes_emulator/test-roms/local/
 /NES
+
+/nes-test-roms
