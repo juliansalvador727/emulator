@@ -3,9 +3,17 @@ use std::rc::Rc;
 
 use crate::cartridge::{Mirroring, Rom};
 
+pub mod axrom;
+pub mod cnrom;
+pub mod gnrom;
 pub mod nrom;
+pub mod uxrom;
 
+use axrom::Axrom;
+use cnrom::Cnrom;
+use gnrom::Gnrom;
 use nrom::Nrom;
+use uxrom::Uxrom;
 
 // A cartridge mapper. It owns PRG ROM, CHR ROM/RAM, PRG RAM, any bank
 // registers, and the mirroring state, and is visible from both sides of the
@@ -31,6 +39,10 @@ pub type SharedMapper = Rc<RefCell<Box<dyn Mapper>>>;
 pub fn from_rom(rom: Rom) -> SharedMapper {
     let mapper: Box<dyn Mapper> = match rom.mapper {
         0 => Box::new(Nrom::from_rom(rom)),
+        2 => Box::new(Uxrom::from_rom(rom)),
+        3 => Box::new(Cnrom::from_rom(rom)),
+        7 => Box::new(Axrom::from_rom(rom)),
+        66 => Box::new(Gnrom::from_rom(rom)),
         other => panic!("Mapper {} is not supported yet", other),
     };
     Rc::new(RefCell::new(mapper))

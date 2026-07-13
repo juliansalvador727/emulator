@@ -1,31 +1,57 @@
 # Adding Mapper Support to the Rust NES Emulator — Handoff
 
-Context handoff for a future session. This describes exactly what it takes to
-add cartridge mapper support to `nes_emulator/` (the Rust emulator following
+Context handoff for a future session. This describes what it takes to add
+cartridge mapper support to `nes_emulator/` (the Rust emulator following
 bugzmanov/nes_ebook). Everything below is grounded in the current code with
 file:line references. Read this top to bottom before touching anything.
 
-## Current state (what exists today)
+## Current state (steps 1 and 2 are DONE)
 
-The Rust emulator is **NROM-only**. It parses the mapper number from the iNES
-header but nothing uses it:
+**Update (step 2):** UxROM (#2), CNROM (#3), AxROM (#7), and GNROM/GxROM (#66)
+are implemented and merged. Each is a self-contained file in `src/mapper/`
+(`uxrom.rs`, `cnrom.rs`, `axrom.rs`, `gnrom.rs`) with its own unit tests, plus a
+`match` arm in `from_rom` (`mapper/mod.rs`). AxROM's single-screen mirroring
+added two `Mirroring` variants — `SingleScreenLower`/`SingleScreenUpper`
+(`cartridge.rs`) — wired through `ppu::mirror_vram_addr` and the renderer's
+nametable selection. **105 tests pass** (was 96). No mapper 2/3/7/66 ROMs are in
+`games/` yet, so these were verified by unit tests only, not a live render — drop
+real carts in `games/` to eyeball them. Next up: **MMC1** (step 3).
 
-- `cartridge.rs:25` computes `mapper` and stores it on `Rom`, but no code
-  branches on it.
-- `bus.rs:14` owns `prg_rom: Vec<u8>`; `read_prg_rom` (`bus.rs:76`) maps it with
-  a hardcoded fixed scheme (subtract `0x8000`, mirror a 16 KB image). Writes to
-  `$8000-$FFFF` **panic** (`bus.rs:179`).
-- `ppu/mod.rs:11` separately owns `chr_rom: Vec<u8>` and indexes it flat in
-  `read_data` (`ppu/mod.rs:181`). CHR writes just print a warning
-  (`ppu/mod.rs:155`). Mirroring is a fixed `self.mirroring` field used in
-  `mirror_vram_addr` (`ppu/mod.rs:205`).
-- `render/mod.rs` reaches **directly** into `ppu.chr_rom[...]` during background
-  and sprite drawing (background tile fetch, sprite fetch, and `show_tile`).
+## Current state (step 1 is DONE)
 
-There are 95 passing tests (`cargo test`). Keeping them green through the
-refactor is part of the definition of done.
+**The plumbing refactor and NROM (mapper 0) are implemented and merged into the
+working tree.** The mapper trait now sits behind both the bus and the PPU, and
+NROM games (SMB, Pac-Man, Donkey Kong) render correctly through it. What exists:
 
-## The core problem
+- `src/mapper/mod.rs` — the `Mapper` trait (see below), the
+  `SharedMapper = Rc<RefCell<Box<dyn Mapper>>>` alias (`mapper/mod.rs:28`),
+  `from_rom()` dispatch (`mapper/mod.rs:31`, panics with "Mapper N is not
+  supported yet" for anything but 0), and a `#[cfg(test)] test_nrom()` helper
+  (`mapper/mod.rs:42`) used by the ppu/render tests.
+- `src/mapper/nrom.rs` — mapper 0. Owns PRG ROM (16 KB mirrored or 32 KB), CHR
+  (ROM, or 8 KB CHR-RAM when the header ships no CHR), and 8 KB PRG-RAM at
+  `$6000-$7FFF`. Writes to ROM space are inert.
+- `bus.rs` holds a `SharedMapper` (`bus.rs:17`), builds it via `from_rom` and
+  clones the `Rc` into the PPU (`bus.rs:31`). `$6000-$FFFF` reads/writes route
+  through `cpu_read`/`cpu_write` (`bus.rs:107`, `bus.rs:177`) — **ROM-space
+  writes are now the bank-switch entry point, not a panic.**
+- `ppu/mod.rs` holds a `SharedMapper` (`ppu/mod.rs:12`); `NesPPU::new` takes it
+  (`ppu/mod.rs:31`). CHR reads/writes go through `ppu_read`/`ppu_write`
+  (`ppu/mod.rs:181`, `:155`). Mirroring is read from the mapper via a new
+  `mirroring()` helper (`ppu/mod.rs:207`).
+- `render/mod.rs` fetches CHR tiles through `read_tile()` (`render/mod.rs:114`),
+  which reads via the mapper's interior mutability; mirroring comes from
+  `ppu.mirroring()` (`render/mod.rs:22`).
+- `cartridge.rs` still parses `mapper` (`cartridge.rs:25`) and keeps `Rom`'s
+  `prg_rom`/`chr_rom` fields (so `show_tile` and the `tiles` viewer are
+  untouched); `from_rom` consumes the `Rom` to build the mapper. `Mirroring`
+  now derives `Clone, Copy`. The shared `test::test_rom` helper
+  (`cartridge.rs:84`) declares mapper 0.
+
+105 tests pass (`cargo test`). `on_scanline` exists as a default no-op with no
+consumer yet — it's the MMC3 hook for later.
+
+## The core problem (already solved for step 1, but the shape matters for MMC1+)
 
 A mapper must be visible from **both** sides of the machine at once:
 
@@ -33,17 +59,12 @@ A mapper must be visible from **both** sides of the machine at once:
 - the **PPU + renderer** need it for CHR reads/writes (`$0000-$1FFF`) **and** for
   mirroring (mappers like MMC1 change mirroring at runtime).
 
-Today PRG lives in the bus and CHR lives in the PPU as two separate owners.
-Rust won't let two structs own one value, so the real work is a small ownership
-refactor, not the mappers themselves. The renderer reaching straight into
-`ppu.chr_rom` is the fiddliest part to unpick.
+This is why the mapper is a shared `Rc<RefCell<Box<dyn Mapper>>>` cloned into
+both `Bus` and `NesPPU` rather than owned by one of them. The renderer takes
+`&NesPPU`, so it reaches CHR through the PPU's `Rc` via interior mutability
+(`render/mod.rs` `read_tile`).
 
-## Design
-
-### 1. A `Mapper` trait
-
-New module `src/mapper/mod.rs` plus one file per mapper (`nrom.rs`, `uxrom.rs`,
-`cnrom.rs`, `mmc1.rs`, `mmc3.rs`, ...).
+## The `Mapper` trait (as implemented)
 
 ```rust
 pub trait Mapper {
@@ -57,56 +78,32 @@ pub trait Mapper {
 ```
 
 The mapper owns PRG ROM, CHR ROM/RAM, PRG RAM, its bank registers, and mirroring
-state.
+state. `mapper/nrom.rs` is the reference implementation to copy.
 
-### 2. Shared ownership
+## How to add a new mapper (the step-2+ recipe)
 
-Use `Rc<RefCell<Box<dyn Mapper>>>`, constructed in `cartridge.rs` and **cloned**
-into both `Bus` and `NesPPU`. This is the smallest diff and matches the existing
-layout.
+The plumbing is done, so each new mapper is now self-contained:
 
-- Alternative: an `enum Mapper { Nrom(..), Uxrom(..), ... }` with static dispatch
-  (faster, no `RefCell`), but it's a larger churn. Prefer `Rc<RefCell>` unless
-  profiling later says otherwise.
-- Note the renderer takes `&NesPPU`, so it borrows the mapper through the PPU's
-  `Rc` — CHR fetches in `render/mod.rs` become `mapper.borrow_mut().ppu_read(addr)`.
+1. Add `src/mapper/<name>.rs` with a struct implementing `Mapper`. Crib banking
+   math from the C emulator (see the reference section) and model NROM's file.
+2. Add `pub mod <name>;` and a `<n> => Box::new(<Name>::from_rom(rom))` arm to
+   the `match` in `from_rom` (`mapper/mod.rs:31`).
+3. Bank registers arrive as `cpu_write` calls for `$8000-$FFFF` — decode the
+   address/data there and recompute your PRG/CHR bank offsets.
+4. `cpu_read`/`ppu_read` apply the current bank offsets. `mirroring()` returns
+   the current state (fixed for UxROM/CNROM; runtime for MMC1+).
+5. Drop a real ROM in `games/` (gitignored) and eyeball it with the probe
+   (see Testing). No bus/ppu/render changes should be needed.
 
-### 3. Rewire the three consumers
-
-- **`bus.rs`**
-  - `read_prg_rom` (`bus.rs:76`) → `self.mapper.borrow_mut().cpu_read(addr)`.
-  - Add a `$6000..=$7FFF` arm in `mem_read`/`mem_write` for PRG-RAM.
-  - The panicking `$8000..=$FFFF` write arm (`bus.rs:179`) → `cpu_write`. **This
-    is how bank switches arrive** — writes to ROM space are the mapper's control
-    registers, not errors.
-  - Drop the `prg_rom` field; hold the shared mapper instead.
-- **`ppu/mod.rs`**
-  - Remove the `chr_rom` field (`ppu/mod.rs:11`); hold the shared mapper.
-  - `read_data` / `write_to_data` `0..=0x1fff` arms (`:179`, `:155`) go through
-    `ppu_read` / `ppu_write`.
-  - `mirror_vram_addr` (`:205`) reads `self.mapper.borrow().mirroring()` instead
-    of the fixed `self.mirroring` field.
-  - `NesPPU::new` / `new_empty_rom` signatures change to take the mapper.
-- **`render/mod.rs`**
-  - Every `ppu.chr_rom[idx]` → `mapper.borrow_mut().ppu_read(addr)` (background
-    tile fetch, sprite fetch, `show_tile`).
-- **`cartridge.rs`**
-  - Build the correct mapper from the `mapper` byte already parsed at
-    `cartridge.rs:25`.
-  - Add PRG-RAM.
-  - Add CHR-RAM: when CHR size is 0 (`raw[5] == 0`), allocate 8 KB of writable
-    CHR instead of a ROM slice.
-  - The existing `test::test_rom` helper (`cartridge.rs:84`) and bus/ppu tests
-    must be updated to construct through the mapper path.
-
-## Per-mapper effort (after plumbing exists)
+## Per-mapper effort (plumbing exists; NROM done)
 
 | Mapper | Difficulty | Notes |
 |---|---|---|
-| #0 NROM | trivial | Current fixed mapping, moved behind the trait |
-| #3 CNROM | easy | 8 KB CHR bank select on any `$8000+` write |
-| #2 UxROM | easy | 16 KB PRG bank at `$8000`, fixed last bank |
-| #7 AxROM / #66 GNROM | easy | Single bank register; AxROM adds single-screen mirroring |
+| #0 NROM | **DONE** | `mapper/nrom.rs` — the reference implementation |
+| #3 CNROM | **DONE** | `mapper/cnrom.rs` — 8 KB CHR bank select on any `$8000+` write |
+| #2 UxROM | **DONE** | `mapper/uxrom.rs` — 16 KB PRG bank at `$8000`, fixed last bank |
+| #7 AxROM | **DONE** | `mapper/axrom.rs` — 32 KB PRG bank + single-screen mirroring |
+| #66 GNROM | **DONE** | `mapper/gnrom.rs` — one register: 32 KB PRG (bits 4-5) + 8 KB CHR (bits 0-1) |
 | #1 MMC1 | medium | 5-bit serial shift register, 4 control regs, runtime mirroring + PRG/CHR bank modes |
 | #4 MMC3 | hard | Banking is fine; the scanline IRQ is the problem (see caveats) |
 
@@ -115,12 +112,12 @@ Simple mappers are a few dozen lines each. MMC1 ~half a day. MMC3 is the hard on
 ## Caveats — read before attempting MMC3
 
 The PPU renders the **whole frame at once at vblank** (the callback fired in
-`bus.rs:62`), not dot-by-dot. Two consequences:
+`bus.rs:66`), not dot-by-dot. Two consequences:
 
 1. **MMC3 scanline IRQ** counts PPU A12 rising edges from pattern-table fetches.
    This PPU doesn't model per-dot fetches, so the IRQ has to be *approximated* —
    e.g. tick the MMC3 counter once per visible scanline inside `ppu.tick()`
-   (`ppu/mod.rs:56`) via `on_scanline()`. Mid-screen status-bar splits (SMB3,
+   (`ppu/mod.rs:55`) via `on_scanline()`. Mid-screen status-bar splits (SMB3,
    Kirby) will mostly work but jitter at the split line.
 2. **Mid-frame CHR bank switches** (also MMC3) can't be reproduced at all — the
    renderer only ever sees the bank state present at vblank.
@@ -131,30 +128,33 @@ are unaffected by this limitation.
 
 ## Recommended order of work
 
-1. **Plumbing refactor** + NROM behind the trait. Definition of done: behavior
-   identical to today, all 95 tests green. ~1 day. This is the bulk of the risk.
-2. **UxROM + CNROM + AxROM + GNROM.** ~half a day total. Biggest payoff per line
-   — jumps from a few NROM games to a large fraction of the library (Mega Man,
-   Castlevania, Contra, Metal Gear, ...).
-3. **MMC1.** ~half a day (Zelda, Metroid, Mega Man 2, Final Fantasy).
+1. ~~**Plumbing refactor** + NROM behind the trait.~~ **DONE** — see "Current
+   state" above.
+2. ~~**UxROM + CNROM + AxROM + GNROM.**~~ **DONE** — see the step-2 update at the
+   top. Each is a new file in `src/mapper/` plus one `match` arm.
+3. **MMC1.** ← *start here next.* ~half a day (Zelda, Metroid, Mega Man 2,
+   Final Fantasy). `games/zelda.nes` is a mapper-1 cart already present. First one
+   with runtime `mirroring()` changes and a serial shift register.
 4. **MMC3.** ~1–2 days for banking + approximate IRQ; imperfect until the PPU is
-   dot-accurate.
-
-Suggested first slice for a single session: **step 1 + step 2** (plumbing,
-NROM, UxROM, CNROM). Leave MMC1/MMC3 for follow-ups.
+   dot-accurate. This is where `on_scanline()` finally gets wired up.
 
 ## Testing
 
-- `cargo test` must stay green (95 tests) at every step.
-- Update `cartridge.rs::test::test_rom`, and the `bus.rs` / `ppu/mod.rs` tests
-  that construct a PPU/bus directly, to go through the mapper.
+- `cargo test` must stay green (105 tests) at every step.
+- The mapper-aware test scaffolding already exists: `cartridge.rs::test::test_rom`
+  builds a mapper-0 ROM, and the `ppu/mod.rs` / `render/mod.rs` tests construct a
+  PPU via `mapper::test_nrom(chr, mirroring)` (`mapper/mod.rs:42`). New mappers
+  can add their own unit tests directly against the struct in their file.
 - Manual verification: run real ROMs per mapper. `cargo run -- <path.nes>`.
   The headless probe (`cargo run --release -- probe <rom> "<script>" <frames>`)
   and `PROBE_SHOTS=<dir>` screenshot dumps are useful for eyeballing output
-  without a display.
+  without a display. **Note:** `PROBE_SHOTS` writes to `<dir>/fNNNNN.bmp` and the
+  dir must already exist (`std::fs::write` won't `mkdir -p`). Convert with
+  `convert f00100.bmp out.png` to view.
 - Good test ROMs to drop in `nes_emulator/games/` (gitignored): a UxROM game
-  (e.g. Mega Man), a CNROM game, an MMC1 game (Zelda), an MMC3 game (SMB3) to
-  exercise the IRQ approximation.
+  (e.g. Mega Man), a CNROM game, an MMC1 game (Zelda — currently panics with
+  "Mapper 1 is not supported yet"), an MMC3 game (SMB3) to exercise the IRQ
+  approximation. Existing NROM ROMs already present: pacman, donkeykong, mario.
 
 ## Reference: the C emulator next door
 

@@ -217,6 +217,9 @@ impl NesPPU {
             (Mirroring::Horizontal, 2) => vram_index - 0x400,
             (Mirroring::Horizontal, 1) => vram_index - 0x400,
             (Mirroring::Horizontal, 3) => vram_index - 0x800,
+            // Every nametable collapses onto one physical page.
+            (Mirroring::SingleScreenLower, _) => vram_index % 0x400,
+            (Mirroring::SingleScreenUpper, _) => (vram_index % 0x400) + 0x400,
             _ => vram_index,
         }
     }

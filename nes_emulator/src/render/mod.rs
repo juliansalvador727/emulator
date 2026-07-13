@@ -29,6 +29,9 @@ pub fn render(ppu: &NesPPU, frame: &mut Frame) {
         | (Mirroring::Vertical, 0x2C00)
         | (Mirroring::Horizontal, 0x2800)
         | (Mirroring::Horizontal, 0x2C00) => (&ppu.vram[0x400..0x800], &ppu.vram[0..0x400]),
+        // Single-screen: both logical nametables resolve to the same page.
+        (Mirroring::SingleScreenLower, _) => (&ppu.vram[0..0x400], &ppu.vram[0..0x400]),
+        (Mirroring::SingleScreenUpper, _) => (&ppu.vram[0x400..0x800], &ppu.vram[0x400..0x800]),
         (_, _) => {
             panic!("Not supported mirroring {:?}", mirroring);
         }

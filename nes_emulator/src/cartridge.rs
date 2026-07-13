@@ -6,6 +6,10 @@ const CHR_ROM_PAGE_SIZE: usize = 8192;
 pub enum Mirroring {
     Vertical,
     Horizontal,
+    // Single-screen mirroring (AxROM and friends): all four nametables show the
+    // same physical 1 KB page — the lower (first) or upper (second) VRAM bank.
+    SingleScreenLower,
+    SingleScreenUpper,
     FourScreen,
 }
 
