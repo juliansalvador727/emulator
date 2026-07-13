@@ -137,7 +137,7 @@ status-bar splits no longer exhibit one-line jitter.
 ## P1 — Harden existing mappers and cartridge memory
 
 - [ ] MMC3:
-  - implement `$A001` PRG-RAM enable and write protection;
+  - [x] implement `$A001` PRG-RAM enable and write protection;
   - finish four-screen nametable storage/behavior;
   - support relevant board/revision differences after NES 2.0 submappers exist.
 - [ ] MMC1:

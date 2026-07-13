@@ -60,14 +60,14 @@ With no argument, the emulator tries `games/pacman.nes`.
 
 ### Controls
 
-| NES control | Keyboard |
-|---|---|
-| D-pad | Arrow keys |
-| A | A |
-| B | S |
-| Select | Space |
-| Start | Enter |
-| Quit | Escape |
+| NES control | Keyboard   |
+| ----------- | ---------- |
+| D-pad       | Arrow keys |
+| A           | A          |
+| B           | S          |
+| Select      | Space      |
+| Start       | Enter      |
+| Quit        | Escape     |
 
 ## Validation and diagnostics
 

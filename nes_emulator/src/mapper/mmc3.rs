@@ -19,7 +19,7 @@ use crate::cartridge::{Mirroring, Rom};
 //   $8000 even  bank select   (low 3 bits R0-R7; bit6 PRG mode; bit7 CHR inv)
 //   $8001 odd   bank data      (value loaded into the selected register)
 //   $A000 even  mirroring      (bit0: 0=vertical, 1=horizontal)
-//   $A001 odd   PRG-RAM protect (not modelled)
+//   $A001 odd   PRG-RAM protect (bit7 enable; bit6 write protect)
 //   $C000 even  IRQ latch       (reload value for the counter)
 //   $C001 odd   IRQ reload      (force a reload on the next clock)
 //   $E000 even  IRQ disable + acknowledge (clears the pending line)
@@ -29,6 +29,8 @@ pub struct Mmc3 {
     chr: Vec<u8>,
     chr_is_ram: bool,
     prg_ram: [u8; 0x2000],
+    prg_ram_enabled: bool,
+    prg_ram_write_protected: bool,
 
     // R0-R7. R0/R1 are 2 KB CHR banks (their low bit is ignored); R2-R5 are
     // 1 KB CHR banks; R6/R7 are 8 KB PRG banks.
@@ -64,6 +66,10 @@ impl Mmc3 {
             chr,
             chr_is_ram,
             prg_ram: [0; 0x2000],
+            // Keep RAM accessible until software writes $A001, matching the
+            // mapper's historical behavior in this emulator.
+            prg_ram_enabled: true,
+            prg_ram_write_protected: false,
             regs: [0; 8],
             bank_select: 0,
             prg_mode: false,
@@ -126,7 +132,13 @@ impl Mmc3 {
 impl Mapper for Mmc3 {
     fn cpu_read(&mut self, addr: u16) -> u8 {
         match addr {
-            0x6000..=0x7fff => self.prg_ram[(addr - 0x6000) as usize],
+            0x6000..=0x7fff => {
+                if self.prg_ram_enabled {
+                    self.prg_ram[(addr - 0x6000) as usize]
+                } else {
+                    0
+                }
+            }
             0x8000..=0xffff => self.prg_rom[self.prg_offset(addr)],
             _ => 0,
         }
@@ -134,7 +146,11 @@ impl Mapper for Mmc3 {
 
     fn cpu_write(&mut self, addr: u16, data: u8) {
         match addr {
-            0x6000..=0x7fff => self.prg_ram[(addr - 0x6000) as usize] = data,
+            0x6000..=0x7fff => {
+                if self.prg_ram_enabled && !self.prg_ram_write_protected {
+                    self.prg_ram[(addr - 0x6000) as usize] = data;
+                }
+            }
             0x8000..=0xffff => match addr & 0xe001 {
                 0x8000 => {
                     self.bank_select = (data & 0x07) as usize;
@@ -151,7 +167,10 @@ impl Mapper for Mmc3 {
                         };
                     }
                 }
-                0xa001 => {} // PRG-RAM protect: not modelled
+                0xa001 => {
+                    self.prg_ram_enabled = data & 0x80 != 0;
+                    self.prg_ram_write_protected = data & 0x40 != 0;
+                }
                 0xc000 => self.irq_latch = data,
                 0xc001 => {
                     self.irq_counter = 0;
@@ -446,6 +465,34 @@ mod test {
         let mut m = Mmc3::from_rom(rom(8, 8));
         m.cpu_write(0x6001, 0xab);
         assert_eq!(m.cpu_read(0x6001), 0xab);
+    }
+
+    #[test]
+    fn a001_disables_prg_ram_reads_and_writes() {
+        let mut m = Mmc3::from_rom(rom(8, 8));
+        m.cpu_write(0x6001, 0xab);
+
+        m.cpu_write(0xa001, 0x00);
+        assert_eq!(m.cpu_read(0x6001), 0);
+        m.cpu_write(0x6001, 0xcd);
+
+        m.cpu_write(0xa001, 0x80);
+        assert_eq!(m.cpu_read(0x6001), 0xab);
+    }
+
+    #[test]
+    fn a001_write_protects_enabled_prg_ram() {
+        let mut m = Mmc3::from_rom(rom(8, 8));
+        m.cpu_write(0x6001, 0xab);
+
+        m.cpu_write(0xa001, 0xc0);
+        assert_eq!(m.cpu_read(0x6001), 0xab);
+        m.cpu_write(0x6001, 0xcd);
+        assert_eq!(m.cpu_read(0x6001), 0xab);
+
+        m.cpu_write(0xa001, 0x80);
+        m.cpu_write(0x6001, 0xef);
+        assert_eq!(m.cpu_read(0x6001), 0xef);
     }
 
     #[test]
