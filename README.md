@@ -29,7 +29,7 @@ documentation and test ROMs are the sources of truth for hardware behaviour.
 - Headless performance probes and deterministic visual regression tests
 
 The test suite currently contains 224 passing tests. The prioritized remaining
-work is tracked in [`nes_emulator/TODO.md`](nes_emulator/TODO.md).
+work is tracked in [`TODO.md`](TODO.md).
 
 ## Requirements
 
@@ -51,7 +51,7 @@ you are legally permitted to use.
 
 ## Default build target
 
-`nes_emulator/.cargo/config.toml` sets the default cargo target to
+`.cargo/config.toml` sets the default cargo target to
 `x86_64-pc-windows-gnu`, so a bare `cargo run` / `cargo build` / `cargo test`
 cross-compiles to a native Windows binary — and `cargo run` launches it through
 WSL interop. This is deliberate: under WSL2 the WSLg audio bridge adds latency
@@ -65,7 +65,6 @@ explicit `--target x86_64-unknown-linux-gnu` on any cargo command is
 equivalent):
 
 ```bash
-cd nes_emulator
 cargo lin-build                  # build on native Linux
 cargo lin-test                   # run the unit tests on native Linux
 cargo lin -- games/pacman.nes    # run a game on native Linux
@@ -74,7 +73,6 @@ cargo lin -- games/pacman.nes    # run a game on native Linux
 ## Build and test
 
 ```bash
-cd nes_emulator
 cargo build --release            # Windows binary (default target)
 cargo lin-test                   # unit tests, native Linux
 ```
@@ -170,14 +168,14 @@ sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
 rustup target add x86_64-pc-windows-gnu
 ```
 
-A bare `cargo run -- ../games/mario.nes` now builds and launches the Windows
+A bare `cargo run -- games/mario.nes` now builds and launches the Windows
 binary straight from the WSL shell (it runs as a real Windows process via WSL
 interop). `.cargo/config.toml` also defines convenience aliases:
 
 ```bash
-cargo win -- ../games/mario.nes --fullscreen   # same as cargo run, but --release
-cargo win-build                                 # release Windows build, no launch
-cargo lin -- ../games/mario.nes                 # run on native Linux instead
+cargo win -- games/mario.nes --fullscreen   # same as cargo run, but --release
+cargo win-build                              # release Windows build, no launch
+cargo lin -- games/mario.nes                 # run on native Linux instead
 ```
 
 The first build is slow because SDL3 compiles from source. The `.exe` at
@@ -209,7 +207,6 @@ trace output line-ending-clean for the diff and skips the interop launch.
 Run the bundled `nestest` trace mode:
 
 ```bash
-cd nes_emulator
 cargo lin -- nestest > mynes.log 2>/dev/null
 diff <(sed 's/ PPU:.*//' nestest.log | head -n "$(wc -l < mynes.log)") mynes.log
 ```
@@ -226,7 +223,7 @@ cargo lin --release -- probe games/mario.nes "start@120-135,right@350-" 2100
 The probe reports frame timing, audio production and drift, frame hashes, DMA
 activity, and visible-time PPU writes. It can also create deterministic BMPs
 and compare them against reviewed baselines. See
-[`nes_emulator/probes/README.md`](nes_emulator/probes/README.md) for all probe
+[`probes/README.md`](probes/README.md) for all probe
 options and the visual-regression runner.
 
 Inspect a CHR tile in an SDL window:

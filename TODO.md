@@ -2,7 +2,7 @@
 
 This is the single source of truth for unfinished work in this repository, and
 the consolidation point for important operational knowledge (host audio failure
-model, native Windows build). The Rust emulator under `nes_emulator/` is the
+model, native Windows build). The Rust emulator at the repository root is the
 active project; the older C emulator under `NES/` is retained as a reference
 and has a separate, lower-priority backlog at the end of this file.
 

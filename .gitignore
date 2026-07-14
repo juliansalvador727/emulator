@@ -22,14 +22,14 @@ target
 
 
 # my gitignores (separate from the rust template)
-/nes_emulator/games/*
-/nes_emulator/test-roms/local/
+/games/*
+/test-roms/local/
 /NES
 
 # generated diagnostic output (keep nestest.log, the golden reference)
-/nes_emulator/mynes.log
-/nes_emulator/nestest_no_cycle.log
-/nes_emulator/snake.txt
+/mynes.log
+/nestest_no_cycle.log
+/snake.txt
 
 /nes-test-roms
 
