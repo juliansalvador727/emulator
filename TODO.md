@@ -179,11 +179,32 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
   granularity. Instruction timing (`instr_timing`), dummy reads (`instr_misc`),
   page-cross penalties, and one-instruction CLI/SEI/PLP interrupt latency (IRQ
   is polled at the instruction boundary using the pre-instruction I flag) are
-  done and tested. The remaining sub-cycle cases — NMI/BRK hijacking, exact RTI
-  and branch interrupt-delay timing (`cpu_interrupts_v2`), and making
-  `vbl_nmi_timing` pass without a compensating PPU offset — require a fully
-  cycle-stepped CPU that ticks the PPU/APU on each memory access, which is the
-  next slice of this item.
+  done and tested. The cycle-stepped foundation now exists (slice 1, done): the
+  CPU ticks the PPU/APU on each memory access (`CPU::bus_cycle`, gated by an
+  `executing` flag so trace/test pokes don't advance time) and reconciles the
+  remaining internal cycles in `finish_instruction`, so per-instruction cycle
+  totals are unchanged (nestest still matches 8,991 lines; `instr_timing`,
+  `instr_misc`, `instr_test-v5`, and the SMB1/Zelda/SMB2 visual baselines all
+  stay green) while interrupt entry is now the correct 7 cycles.
+  Slice 2 (done) built the cycle-accurate interrupt model on that foundation:
+  per-cycle interrupt sampling with penultimate-cycle recognition (`CPU::cycle`
+  latches `_delayed` line states), a unified 7-cycle `service_interrupt` for
+  BRK/IRQ/NMI with a late (PCL-push) vector decision so a pending NMI hijacks a
+  BRK/IRQ vector, RTI's immediate I-flag effect, and the branch-specific poll
+  point (end of cycle 2). `cpu_interrupts_v2`: `1-cli_latency` and
+  `2-nmi_and_brk` now PASS (were failing); no regressions (nestest, instr_*,
+  ppu_vbl_nmi, visual baselines all green). The three still failing are gated on
+  work outside the interrupt core: `3-nmi_and_irq` needs sub-PPU-dot NMI sync
+  resolution (the PPU advances 3 dots per CPU-cycle tick, so NMI edge timing is
+  quantized); `5-branch_delays_irq` uses `sync_apu`/`CUSTOM_IRQ` and needs exact
+  APU frame-counter IRQ timing (the separate "APU correctness" item below);
+  `4-irq_and_dma` needs per-cycle IRQ sampling during DMA (slice 4).
+  Slice 3 (done, no code needed): all 7 `vbl_nmi_timing` sub-tests
+  (`1.frame_basics`..`7.nmi_timing`) now pass with NO compensating PPU offset --
+  the per-cycle CPU timing places each register access on its true cycle, and
+  the only PPU/CPU sync constants are the legitimate 3/6-dot NMI clock-domain
+  delays (`nmi_interrupt_at`). `ppu_vbl_nmi` (10/10) and `oam_read` stay green.
+  Still to do: the DMA sub-cycle cases (slice 4). See the plan file.
 - [ ] Implement accurate reset and power-cycle state separately; do not treat
   application startup, reset, and save-state restore as the same operation.
   (Still one `reset()`; power-on vs. reset RAM/APU/PPU differences are unmodeled.)

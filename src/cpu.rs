@@ -73,6 +73,23 @@ pub struct CPU<'a> {
     // accesses from the trace formatter, test setup, and assertions leave it
     // clear so they do not advance time.
     executing: bool,
+    // Interrupt lines sampled at the end of every CPU cycle. NMI is edge
+    // detected and latched sticky in `nmi_pending` until serviced; IRQ is a
+    // level read into `irq_line`. The `_delayed` copies hold the value as of the
+    // *previous* cycle, so an instruction boundary recognizes an interrupt only
+    // if it was pending at the end of the penultimate cycle -- reproducing the
+    // 6502's poll point and the taken-branch "ignores IRQ on its last cycle"
+    // quirk.
+    nmi_pending: bool,
+    nmi_pending_delayed: bool,
+    irq_line: bool,
+    irq_line_delayed: bool,
+    // Branch instructions poll interrupts at a fixed point -- the end of their
+    // second cycle (the offset fetch) -- rather than at the generic penultimate
+    // cycle. When a branch executes it latches its (nmi, irq) poll here so the
+    // instruction-boundary recognition uses that point instead of `_delayed`.
+    // This is the taken-branch IRQ-delay quirk `branch_delays_irq` checks.
+    branch_poll: Option<(bool, bool)>,
     // When true, executing BRK ($00) returns from the run loop instead of
     // taking the interrupt. This core uses BRK as the halt sentinel for
     // nestest automation and the small `load_and_run` unit-test programs; test
@@ -88,6 +105,10 @@ pub struct CpuSnapshot {
     program_counter: u16,
     stack_pointer: u8,
     additional_cycles: u8,
+    nmi_pending: bool,
+    nmi_pending_delayed: bool,
+    irq_line: bool,
+    irq_line_delayed: bool,
     bus: BusSnapshot,
 }
 
@@ -140,8 +161,29 @@ impl<'a> CPU<'a> {
             additional_cycles: 0,
             instr_accesses: 0,
             executing: false,
+            nmi_pending: false,
+            nmi_pending_delayed: false,
+            irq_line: false,
+            irq_line_delayed: false,
+            branch_poll: None,
             halt_on_brk: true,
         }
+    }
+
+    // Advance the machine exactly one CPU cycle and, at the end of it, sample
+    // the interrupt lines. The `_delayed` copies are shifted first so they hold
+    // the state as of the previous cycle; a subsequent instruction boundary that
+    // reads them therefore sees the penultimate-cycle poll point. NMI is edge
+    // detected (the PPU hands out each vblank edge once) and latched sticky.
+    #[inline]
+    fn cycle(&mut self) {
+        self.bus.tick(1);
+        self.nmi_pending_delayed = self.nmi_pending;
+        if self.bus.poll_nmi_status().is_some() {
+            self.nmi_pending = true;
+        }
+        self.irq_line_delayed = self.irq_line;
+        self.irq_line = self.bus.poll_irq_status();
     }
 
     // Advance the machine one CPU cycle for a bus access performed while an
@@ -152,7 +194,7 @@ impl<'a> CPU<'a> {
     fn bus_cycle(&mut self) {
         if self.executing {
             self.instr_accesses = self.instr_accesses.saturating_add(1);
-            self.bus.tick(1);
+            self.cycle();
         }
     }
 
@@ -171,8 +213,8 @@ impl<'a> CPU<'a> {
             self.instr_accesses,
             expected
         );
-        if remaining > 0 {
-            self.bus.tick(remaining as u8);
+        for _ in 0..remaining.max(0) {
+            self.cycle();
         }
     }
 
@@ -192,6 +234,10 @@ impl<'a> CPU<'a> {
             program_counter: self.program_counter,
             stack_pointer: self.stack_pointer,
             additional_cycles: self.additional_cycles,
+            nmi_pending: self.nmi_pending,
+            nmi_pending_delayed: self.nmi_pending_delayed,
+            irq_line: self.irq_line,
+            irq_line_delayed: self.irq_line_delayed,
             bus: self.bus.snapshot(),
         }
     }
@@ -204,6 +250,10 @@ impl<'a> CPU<'a> {
         self.program_counter = snapshot.program_counter;
         self.stack_pointer = snapshot.stack_pointer;
         self.additional_cycles = snapshot.additional_cycles;
+        self.nmi_pending = snapshot.nmi_pending;
+        self.nmi_pending_delayed = snapshot.nmi_pending_delayed;
+        self.irq_line = snapshot.irq_line;
+        self.irq_line_delayed = snapshot.irq_line_delayed;
         self.bus.restore(snapshot.bus);
     }
 
@@ -884,11 +934,17 @@ impl<'a> CPU<'a> {
     }
 
     fn branch(&mut self, condition: bool) {
-        if condition {
-            let old_pc = self.program_counter.wrapping_add(1);
-            let jump: i8 = self.mem_read(self.program_counter) as i8;
-            let jump_addr = old_pc.wrapping_add(jump as u16);
+        // The offset is fetched on cycle 2 whether or not the branch is taken;
+        // interrupts are polled at the end of that cycle for every branch. That
+        // makes a not-taken branch poll on its last cycle and a taken
+        // page-crossing branch poll two cycles before its end -- neither of
+        // which is the generic penultimate-cycle poll.
+        let old_pc = self.program_counter.wrapping_add(1);
+        let jump: i8 = self.mem_read(self.program_counter) as i8;
+        self.branch_poll = Some((self.nmi_pending, self.irq_line));
 
+        if condition {
+            let jump_addr = old_pc.wrapping_add(jump as u16);
             self.program_counter = jump_addr;
             self.additional_cycles += 1;
             if (old_pc & 0xff00) != (jump_addr & 0xff00) {
@@ -897,48 +953,46 @@ impl<'a> CPU<'a> {
         }
     }
 
-    // Software interrupt. The pushed return address is the byte after BRK's
-    // signature byte (PC already points one past the opcode, so +1), the
-    // pushed status has B set, and execution vectors through $FFFE.
-    fn brk(&mut self) {
-        let return_addr = self.program_counter.wrapping_add(1);
-        self.stack_push_u16(return_addr);
+    // The seven-cycle interrupt sequence shared by BRK, IRQ, and NMI. Every
+    // access ticks a real cycle, so the PPU/APU advance through the pushes and
+    // vector fetch. The vector is chosen *after* the status push (the hardware's
+    // cycle-5 poll point): a pending NMI at that moment steals the vector even
+    // when the sequence began as a BRK or an IRQ, which is the NMI-hijacking the
+    // `cpu_interrupts_v2` tests check. `brk` selects the B flag on the pushed
+    // status and the two-byte return address past the signature byte.
+    fn service_interrupt(&mut self, brk: bool) {
+        if brk {
+            // Dummy fetch of the signature byte; the return address skips it.
+            let _ = self.mem_read(self.program_counter);
+            self.program_counter = self.program_counter.wrapping_add(1);
+        } else {
+            // Two dummy reads of the preempted instruction's opcode.
+            let _ = self.mem_read(self.program_counter);
+            let _ = self.mem_read(self.program_counter);
+        }
+
+        self.stack_push_u16(self.program_counter);
+
+        // Late vector decision (the hardware latches the interrupt source around
+        // the cycle that pushes PCL): a latched NMI wins and is consumed here,
+        // stealing the vector even from a BRK or IRQ that started the sequence.
+        let vector = if self.nmi_pending {
+            self.nmi_pending = false;
+            self.nmi_pending_delayed = false;
+            0xfffa
+        } else {
+            0xfffe
+        };
+
         let mut flag = self.status.clone();
-        flag.insert(CpuFlags::BREAK);
-        flag.insert(CpuFlags::BREAK2);
+        flag.set(CpuFlags::BREAK, brk);
+        flag.set(CpuFlags::BREAK2, true);
         self.stack_push(flag.bits());
         self.status.insert(CpuFlags::INTERRUPT_DISABLE);
-        self.program_counter = self.mem_read_u16(0xfffe);
-    }
 
-    fn interrupt_nmi(&mut self) {
-        self.stack_push_u16(self.program_counter);
-        let mut flag = self.status.clone();
-        flag.set(CpuFlags::BREAK, false);
-        flag.set(CpuFlags::BREAK2, true);
-
-        self.stack_push(flag.bits);
-        self.status.insert(CpuFlags::INTERRUPT_DISABLE);
-
-        self.bus.tick(2);
-        self.program_counter = self.mem_read_u16(0xfffA);
-    }
-
-    // Maskable interrupt (the APU frame counter and DMC assert it); same as
-    // NMI but through the $FFFE vector. The line is level-triggered, so the
-    // handler must acknowledge the source (e.g. read $4015) or it will fire
-    // again after RTI.
-    fn interrupt_irq(&mut self) {
-        self.stack_push_u16(self.program_counter);
-        let mut flag = self.status.clone();
-        flag.set(CpuFlags::BREAK, false);
-        flag.set(CpuFlags::BREAK2, true);
-
-        self.stack_push(flag.bits);
-        self.status.insert(CpuFlags::INTERRUPT_DISABLE);
-
-        self.bus.tick(2);
-        self.program_counter = self.mem_read_u16(0xfffE);
+        let lo = self.mem_read(vector) as u16;
+        let hi = self.mem_read(vector + 1) as u16;
+        self.program_counter = (hi << 8) | lo;
     }
 
     pub fn run(&mut self) {
@@ -1010,12 +1064,12 @@ impl<'a> CPU<'a> {
             let irq_disabled_before = self.status.contains(CpuFlags::INTERRUPT_DISABLE);
 
             // BRK as a real software interrupt (test ROMs clear `halt_on_brk`).
-            // Its pushes and vector reads tick as real accesses; the remaining
-            // budget covers the internal cycles of the 7-cycle sequence.
+            // The seven-cycle sequence runs entirely as ticking accesses and may
+            // have its vector hijacked by a pending NMI. The interrupt handler's
+            // first instruction runs before interrupts are polled again, so no
+            // poll happens here.
             if code == 0x00 {
-                self.brk();
-                self.finish_instruction(opcode.cycles);
-                self.poll_interrupts(irq_disabled_before);
+                self.service_interrupt(true);
                 continue;
             }
 
@@ -1385,18 +1439,36 @@ impl<'a> CPU<'a> {
                 self.program_counter += (opcode.len - 1) as u16;
             }
 
-            self.poll_interrupts(irq_disabled_before);
+            // RTI restores the I flag from the stack immediately, so it does not
+            // get the one-instruction delay that CLI/SEI/PLP do; its IRQ poll
+            // uses the post-instruction I flag.
+            self.poll_interrupts(irq_disabled_before, code == 0x40);
         }
     }
 
-    // Recognize a pending interrupt at an instruction boundary. NMI wins over
-    // IRQ, and IRQ honors the interrupt-disable state sampled before the
-    // instruction so CLI/SEI/PLP are delayed by one instruction.
-    fn poll_interrupts(&mut self, irq_disabled_before: bool) {
-        if self.bus.poll_nmi_status().is_some() {
-            self.interrupt_nmi();
-        } else if !irq_disabled_before && self.bus.poll_irq_status() {
-            self.interrupt_irq();
+    // Recognize an interrupt latched as of the penultimate cycle (the 6502 poll
+    // point). NMI wins over IRQ. IRQ honors the interrupt-disable flag: for most
+    // instructions that is the value sampled *before* the instruction, so a
+    // CLI/SEI/PLP that changes it is delayed one instruction; RTI's change is
+    // immediate, so it uses the post-instruction flag.
+    fn poll_interrupts(&mut self, irq_disabled_before: bool, i_flag_immediate: bool) {
+        // Branches carry their own fixed poll point; every other instruction is
+        // recognized from the penultimate-cycle (`_delayed`) sample.
+        let (nmi, irq) = self
+            .branch_poll
+            .take()
+            .unwrap_or((self.nmi_pending_delayed, self.irq_line_delayed));
+        if nmi {
+            self.service_interrupt(false);
+            return;
+        }
+        let i_flag = if i_flag_immediate {
+            self.status.contains(CpuFlags::INTERRUPT_DISABLE)
+        } else {
+            irq_disabled_before
+        };
+        if irq && !i_flag {
+            self.service_interrupt(false);
         }
     }
 
