@@ -1,0 +1,16 @@
+# Cross-compilation to native Windows from WSL.
+#
+# `cargo win -- <rom> [flags]` builds a Windows .exe with the mingw-w64
+# toolchain and launches it through WSL's Windows-interop, so it runs as a
+# real Windows process: SDL3 talks to WASAPI and the compositor directly,
+# bypassing the WSLg audio bridge that wedges (see fix_apu.md).
+#
+# Requires: sudo apt-get install gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
+#           rustup target add x86_64-pc-windows-gnu
+
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+
+[alias]
+win = "run --release --target x86_64-pc-windows-gnu"
+win-build = "build --release --target x86_64-pc-windows-gnu"

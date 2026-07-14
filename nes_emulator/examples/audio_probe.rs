@@ -1,75 +1,73 @@
-// Host-audio isolation probe: pushes a pure 440 Hz tone into an SDL
-// AudioQueue at exactly the device rate, paced by the wall clock, with no
-// emulator logic at all. Logs the queue depth once per second.
-//
-// If the queue depth diverges or consumption collapses here too, the fault
-// is in the SDL/PulseAudio/WSLg layer, not the emulator's game loop.
+// Host-audio isolation probe: pushes a pure 440 Hz tone through the exact
+// SDL3 stream pump used by the emulator, without video initialization or any
+// emulation workload.
 //
 // Usage: cargo run --release --example audio_probe [seconds]
 
-use sdl2::audio::{AudioQueue, AudioSpecDesired};
+#[allow(dead_code)]
+#[path = "../src/audio.rs"]
+mod audio;
+
 use std::f32::consts::TAU;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 fn main() {
     let seconds: u64 = std::env::args()
         .nth(1)
-        .and_then(|s| s.parse().ok())
+        .and_then(|value| value.parse().ok())
         .unwrap_or(90);
 
-    let sdl = sdl2::init().unwrap();
-    let audio = sdl.audio().unwrap();
-    let desired = AudioSpecDesired {
-        freq: Some(44100),
-        channels: Some(1),
-        samples: Some(1024),
-    };
-    let device: AudioQueue<f32> = audio.open_queue(None, &desired).unwrap();
-    let rate = device.spec().freq as u64;
-    eprintln!("driver={} rate={}", audio.current_audio_driver(), rate);
+    let mut config = audio::AudioConfig::for_profile(audio::AudioProfile::LowLatency);
+    config.pulse_latency_ms = 60;
+    let chunk_samples = config.delivery_samples;
+    let pump = audio::AudioPump::start_with_config(config);
+    let mut phase = 0.0f32;
+    let chunk_duration = Duration::from_secs_f64(chunk_samples as f64 / audio::SAMPLE_RATE as f64);
+    let start = Instant::now();
+    let mut next_chunk = start;
+    let mut next_log = start + Duration::from_secs(1);
+    let mut produced = 0u64;
 
-    // Prime ~100 ms then start playback.
-    let mut phase = 0f32;
-    let mut tone = |n: usize| -> Vec<f32> {
-        (0..n)
+    while start.elapsed().as_secs() < seconds {
+        let samples: Vec<f32> = (0..chunk_samples)
             .map(|_| {
-                phase = (phase + 440.0 / rate as f32) % 1.0;
+                phase = (phase + 440.0 / audio::SAMPLE_RATE as f32) % 1.0;
                 (phase * TAU).sin() * 0.05
             })
-            .collect()
-    };
-    device.queue(&tone((rate / 10) as usize));
-    device.resume();
+            .collect();
+        pump.push(samples);
+        produced += chunk_samples as u64;
+        next_chunk += chunk_duration;
 
-    let start = Instant::now();
-    let mut produced: u64 = rate / 10;
-    let mut last_log = 0u64;
-    loop {
-        let elapsed = start.elapsed();
-        if elapsed.as_secs() >= seconds {
-            break;
-        }
-        // Top production up to wall-clock rate + the 100 ms priming lead.
-        let target = rate / 10 + elapsed.as_micros() as u64 * rate / 1_000_000;
-        if target > produced {
-            let chunk = tone((target - produced) as usize);
-            if !device.queue(&chunk) {
-                eprintln!("t={:6.2}s queue() FAILED", elapsed.as_secs_f64());
-            }
-            produced = target;
-        }
-
-        if elapsed.as_secs() > last_log {
-            last_log = elapsed.as_secs();
-            let queued = device.size();
+        if Instant::now() >= next_log {
+            let queued = pump.queued_bytes();
+            let queued_label = if queued == audio::BACKLOG_UNAVAILABLE {
+                "unavailable".to_string()
+            } else {
+                format!("{}B/{:.1}ms", queued, queued as f64 / 96.0)
+            };
             eprintln!(
-                "t={:6.2}s queued={}B ({:.1}ms) produced={}",
-                elapsed.as_secs_f64(),
-                queued,
-                queued as f64 / (rate as f64 * 4.0) * 1000.0,
+                "t={:6.2}s queued={} pending={}B rate_adjust={:+}ppm produced={} reopens={} resumes={} backpressure={} dropped={} underflows={}",
+                start.elapsed().as_secs_f64(),
+                queued_label,
+                pump.pending_bytes(),
+                pump.stats.rate_adjust_ppm.load(Ordering::Relaxed),
                 produced,
+                pump.stats.reopens.load(Ordering::Relaxed),
+                pump.stats.device_resumes.load(Ordering::Relaxed),
+                pump.stats.backpressure_events.load(Ordering::Relaxed),
+                pump.stats.dropped_samples.load(Ordering::Relaxed),
+                pump.stats.underflow_samples.load(Ordering::Relaxed),
             );
+            next_log += Duration::from_secs(1);
         }
-        std::thread::sleep(Duration::from_millis(4));
+
+        let now = Instant::now();
+        if now < next_chunk {
+            std::thread::sleep(next_chunk - now);
+        } else if now.duration_since(next_chunk) > Duration::from_millis(50) {
+            next_chunk = now;
+        }
     }
 }

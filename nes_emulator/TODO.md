@@ -6,15 +6,15 @@ current plans. The Rust emulator under `nes_emulator/` is the active project;
 the older C emulator under `NES/` is retained as a reference and has a separate,
 lower-priority backlog at the end of this file.
 
-Current verified baseline (2026-07-13):
+Current verified baseline (2026-07-14):
 
-- 205 passing Rust tests.
+- 211 passing Rust tests.
 - All official 6502 opcodes; `nestest` matches 5,003 official-opcode entries.
 - NROM, MMC1, UxROM, CNROM, MMC3, AxROM, and GxROM/GNROM.
 - Dot-driven background and sprite rendering with mapper-visible PPU fetches.
 - P1 PPU register and memory behavior complete; DMA/bus timing is the next
   active P1 foundation.
-- Five-channel APU including DMC DMA, filtering, and SDL2 playback.
+- Five-channel APU including DMC DMA, filtering, and SDL3 bound-stream playback.
 - Deterministic visual regressions for SMB1, Zelda, and SMB2.
 - Two-minute release probes exceed real-time performance with stable sample
   production; see `probes/RESULTS.md`.
@@ -157,9 +157,10 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
 
 ## P1 — Low-latency host presentation, input, and audio
 
-Status: complete. The normal path preserves console timing, while optional
-run-ahead reduces game-internal response latency without committing speculative
-machine or audio state.
+Status: implementation complete; real-device WSLg acceptance is pending. The
+normal path preserves console timing, while optional run-ahead reduces
+game-internal response latency without committing speculative machine or audio
+state.
 
 - [x] Raise a host `frame_ready` event at the start of vblank independently of
   NMI enable, and service it before any NMI-handler controller poll.
@@ -167,11 +168,22 @@ machine or audio state.
   callback so the frontend owns explicit frame boundaries.
 - [x] Deliver APU output every 256 samples and pace those chunks across wall
   time instead of producing a frame-sized burst followed by a long sleep.
-- [x] Add native low-latency and WSLg-safe balanced profiles, adaptive queue
-  growth after underflow, a bounded total queued+pending budget, and stale-
-  audio dropping when the sink falls behind.
+- [x] Add native low-latency and WSLg-safe profiles, a bounded total
+  queued+pending budget, and stale-audio dropping when the sink falls behind.
+  Playback uses a 48 kHz signed-16-bit bound stream in the same process-wide
+  SDL3 runtime as video and input, matching the stable C frontend lifecycle. A
+  small pre-SDL sample-count controller absorbs host-clock drift without
+  changing emulation speed or repeatedly mutating the live SDL stream;
+  high-water backpressure preserves the live stream and discards only excess
+  samples that SDL has not accepted yet. The pump checks and writes at most
+  once per 16 ms interval, matching the C frontend's frame-rate call cadence,
+  and resumes a paused bound device in place instead of reopening it.
+- [x] Pace exclusively from the fixed 48 kHz sample timeline. Queue depth is
+  diagnostic/control state only, avoiding the former feedback loop that ran
+  SMB1 at ~61.6 FPS while dropping about 1,100 samples per second.
 - [x] Report presentation time, queued/pending/target/device audio depths,
-  drops, underflows, reopens, production rate, and input-to-`$4016` poll time.
+  playback-rate correction, backpressure events, paused-device resumes, drops,
+  underflows, reopens, production rate, and input-to-`$4016` poll time.
 - [x] Add deep snapshots for CPU, bus, PPU, APU, joypad, and every supported
   mapper; use them for optional one-frame run-ahead with speculative audio
   delivery suppressed and canonical state advanced exactly once.
@@ -179,9 +191,10 @@ machine or audio state.
   input one frame to represent the same game-state moments at the new boundary.
 
 Acceptance: all unit tests and reviewed visual regressions pass; low-latency
-mode keeps total application-side audio below 29 ms; balanced mode remains the
-automatic WSL fallback; snapshot restore reproduces the same next frame and
-mapper RAM; speculative audio never reaches SDL.
+mode uses a 40 ms SDL3 input target, balanced mode remains the automatic WSL
+fallback, and stale input is bounded without a synchronous device reopen;
+snapshot restore reproduces the same next frame and mapper RAM; speculative
+audio never reaches SDL.
 
 ## P1 — Harden existing mappers and cartridge memory
 

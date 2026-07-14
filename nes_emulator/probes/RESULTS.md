@@ -6,7 +6,7 @@ on the target host before changing PPU timing.
 
 ## Deterministic timing validation
 
-The Rust suite now has 205 passing tests. P0/P1 coverage records exact
+The Rust suite now has 211 passing tests. P0/P1 coverage records exact
 mapper-visible background, prefetch, dummy, and sprite fetch addresses/dots;
 blanked rendering; sprite-zero left-edge and x=255 behavior; vblank/NMI races;
 odd-frame skipping; all background/sprite pattern-table combinations; PPUDATA
@@ -119,3 +119,21 @@ with zero dropped samples or device reopens and a measured application queue of
 ran at its own 63.1 FPS effective clock, so this is an integration smoke test,
 not a real-device latency claim. The sandboxed Pulse device remained
 unavailable; real-device acceptance must be rerun on the target host.
+
+The unified process-wide SDL3 revision was run through the full SMB1 frontend
+for 1,500 frames (24.96 seconds) with a 60 ms target. SDL's dummy sink held the
+submitted queue at 5,760 bytes; pending audio stayed within its 8,192-byte
+budget, with zero stream reopens and zero underflows. The dummy clock was slow
+enough to force pending-sample drops, confirming that sustained pressure stays
+bounded without clearing the live stream. The release executable statically
+contains one SDL3 runtime and has no SDL2 dependency. This is a recovery-path
+check, not a real-device quality or drift result.
+
+After the WSLg stall investigation, the pump was aligned with the stable C
+frontend's call cadence: one queue query and at most one submission per 16 ms,
+with in-place recovery if a backpressured bound device reports itself paused.
+The bundled SDL3 build also uses its normal desktop configuration instead of
+Unix-console mode. A 1,320-frame (21.96-second) dummy-sink soak crossed the old
+18-second failure point with zero reopens, paused-device resumes, or
+underflows. The deliberately slow dummy clock filled the bounded pending queue
+and forced drops, so real WSLg acceptance remains a target-host test.

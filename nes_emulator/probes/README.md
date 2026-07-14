@@ -15,7 +15,13 @@ and chunk pacer. That mode additionally records queue minimum/maximum/end
 depth, dropped samples, estimated underflow samples, and device reopens. Select
 `NES_AUDIO_PROFILE=low|balanced` exactly as in the windowed emulator. It needs
 a working SDL audio device; CI can use `SDL_AUDIODRIVER=dummy` to exercise the
-pipeline without speakers.
+pipeline without speakers. Normal playback and the standalone `audio_probe`
+example use the same process-wide SDL3 bound-stream pump, 48 kHz signed-16-bit
+format, adaptive queue controller, and pending-only high-water backpressure.
+Clock correction happens in the pump before SDL; the live stream remains fixed
+at 48 kHz. SDL queue inspection and submission happen at most once per 16 ms
+interval, and a bound device found paused under backpressure is resumed in
+place.
 
 ## Deterministic images and reports
 

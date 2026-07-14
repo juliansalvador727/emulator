@@ -4,8 +4,9 @@ A playable NES emulator written in Rust. It currently combines a complete
 official 6502 instruction set with a dot-driven PPU renderer, mapper-controlled
 banking and IRQs, controller input, and five-channel audio.
 
-The emulator is NTSC-oriented and uses SDL2 for video, keyboard input, and
-audio. NES documentation and test ROMs are the sources of truth for hardware
+The emulator is NTSC-oriented. Video, keyboard input, and bound-stream audio
+share one bundled SDL3 runtime, matching the lifecycle used by the stable C
+frontend. NES documentation and test ROMs are the sources of truth for hardware
 behaviour.
 
 ## Current support
@@ -17,23 +18,23 @@ behaviour.
   and the eight-sprites-per-line limit
 - NROM (0), MMC1 (1), UxROM (2), CNROM (3), MMC3 (4), AxROM (7), and GxROM (66)
 - Fetch-driven MMC3 IRQs using qualified PPU A12 edges
-- Pulse, triangle, noise, and DMC audio with IRQs, DMA, filtering, and SDL2
+- Pulse, triangle, noise, and DMC audio with IRQs, DMA, filtering, and SDL3
   playback
 - One standard controller through `$4016`
 - Headless performance probes and deterministic visual regression tests
 
-The test suite currently contains 205 passing tests. The prioritized remaining
+The test suite currently contains 211 passing tests. The prioritized remaining
 work is tracked in [`nes_emulator/TODO.md`](nes_emulator/TODO.md).
 
 ## Requirements
 
 - A current Rust toolchain
-- SDL2 development libraries
+- A C compiler and CMake (to build the bundled SDL3 runtime)
 
 On Debian or Ubuntu:
 
 ```bash
-sudo apt install libsdl2-dev
+sudo apt install build-essential cmake
 ```
 
 ROM images are not required to build or run the unit tests. Only use ROMs that
@@ -64,15 +65,31 @@ cargo run --release -- games/mario.nes \
   --audio-profile low --audio-latency-ms 40 --run-ahead 1
 ```
 
-`low` uses 256-sample delivery chunks with a roughly 17 ms SDL target and a
-29 ms application-side ceiling. `balanced` retains the larger WSLg-safe device
-period and is selected automatically under WSL; use it explicitly if the low
-profile reports underflows or device reopens. `--audio-latency-ms` controls the
-PulseAudio request, while `--latency-debug` reports presentation time, SDL
-queued/pending audio, adaptive target depth, and sampled-input-to-controller-
-poll time once per second. The equivalent environment variables are
-`NES_AUDIO_PROFILE`, `NES_AUDIO_LATENCY_MS`, `NES_RUN_AHEAD_FRAMES`, and
-`NES_LATENCY_DEBUG`.
+`low` delivers 256-sample chunks to a 48 kHz signed-16-bit SDL3 bound stream
+and targets 40 ms of queued input. `balanced` targets 80 ms and is selected
+automatically under WSL; `--audio-latency-ms` overrides either target. The
+process-wide SDL3 transport uses a small adaptive sample-count correction (at
+most 1.5%) before SDL to absorb host-clock drift without changing NES CPU or
+video speed. The SDL stream itself stays at a fixed 48 kHz, matching the stable
+C transport behavior.
+
+`--latency-debug` reports presentation time, queued/pending audio, playback
+correction, backpressure, paused-device resumes, drops, underflows, and
+sampled-input-to-controller-poll time once per second. SDL queue inspection and
+submission happen at most once every 16 ms, matching the stable C frontend's
+frame-rate cadence. Queue pressure is bounded without clearing the live SDL
+stream: feeding stops at the target and only excess not-yet-submitted samples
+are discarded. A bound device found paused under backpressure is resumed in
+place; the emulator never waits for a blocked WSLg device close. The equivalent
+environment variables are `NES_AUDIO_PROFILE`, `NES_AUDIO_LATENCY_MS`,
+`NES_RUN_AHEAD_FRAMES`, and `NES_LATENCY_DEBUG`.
+
+If audio goes silent, `backpressure` climbs continuously, and
+`/mnt/wslg/pulseaudio.log` contains
+`rdp-sink ... data_send: send failed`, the Windows-side WSLg audio transport has
+failed; no Linux audio client can consume normally in that state. Run
+`wsl --shutdown` from Windows PowerShell, then reopen the distro before testing
+again.
 
 With no argument, the emulator tries `games/pacman.nes`.
 

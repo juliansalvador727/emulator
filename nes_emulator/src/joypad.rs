@@ -40,13 +40,9 @@ impl Joypad {
 
     pub fn read(&mut self) -> u8 {
         if !self.strobe && self.button_index == 0 {
-            if let Some(sampled_at) = self.last_input_sampled_at {
-                self.last_input_to_poll_us = Some(
-                    sampled_at
-                        .elapsed()
-                        .as_micros()
-                        .min(u128::from(u64::MAX)) as u64,
-                );
+            if let Some(sampled_at) = self.last_input_sampled_at.take() {
+                self.last_input_to_poll_us =
+                    Some(sampled_at.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
             }
         }
         if self.button_index > 7 {
@@ -110,5 +106,19 @@ mod test {
         for _ in 0..3 {
             assert_eq!(joypad.read(), 1);
         }
+    }
+
+    #[test]
+    fn input_latency_is_recorded_only_for_the_first_following_poll() {
+        let mut joypad = Joypad::new();
+        joypad.set_button_pressed_status(JoypadButton::BUTTON_A, true);
+        joypad.write(0);
+        assert_eq!(joypad.read(), 1);
+        let first = joypad.last_input_to_poll_us();
+
+        joypad.write(1);
+        joypad.write(0);
+        assert_eq!(joypad.read(), 1);
+        assert_eq!(joypad.last_input_to_poll_us(), first);
     }
 }

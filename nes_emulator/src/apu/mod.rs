@@ -25,7 +25,7 @@ pub mod triangle;
 // https://www.nesdev.org/wiki/Cycle_reference_chart
 const CPU_HZ: f64 = 1_789_773.0;
 
-const DEFAULT_SAMPLE_RATE: u32 = 44100;
+const DEFAULT_SAMPLE_RATE: u32 = 48000;
 
 #[derive(Clone)]
 pub struct NesAPU {
@@ -81,7 +81,7 @@ impl NesAPU {
         apu
     }
 
-    // Call before running if the host audio device didn't open at 44.1 kHz.
+    // Call before running if the host audio device didn't open at 48 kHz.
     pub fn set_sample_rate(&mut self, sample_rate: u32) {
         self.cycles_per_sample = CPU_HZ / sample_rate as f64;
         self.max_buffered_samples = sample_rate as usize;
@@ -378,8 +378,8 @@ mod test {
             apu.tick(255);
         }
         let n = apu.drain_samples().len();
-        // ~1 second of emulated time -> ~44100 samples (+-1%).
-        assert!((43000..45000).contains(&n), "got {} samples", n);
+        // ~1 second of emulated time -> ~48000 samples (+-1%).
+        assert!((47000..49000).contains(&n), "got {} samples", n);
     }
 
     #[test]
