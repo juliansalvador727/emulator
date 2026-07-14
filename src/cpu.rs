@@ -63,6 +63,16 @@ pub struct CPU<'a> {
     pub stack_pointer: u8,
     pub bus: Bus<'a>,
     additional_cycles: u8,
+    // Number of real bus accesses issued by the instruction currently
+    // executing. Each access advances the machine one CPU cycle, so at the end
+    // of the instruction the remaining (internal, non-bus) cycles are the
+    // difference between the opcode's cycle budget and this count.
+    instr_accesses: u8,
+    // True only while an instruction is being executed inside the run loop.
+    // Memory accesses tick the PPU/APU one cycle each while set; inspection
+    // accesses from the trace formatter, test setup, and assertions leave it
+    // clear so they do not advance time.
+    executing: bool,
     // When true, executing BRK ($00) returns from the run loop instead of
     // taking the interrupt. This core uses BRK as the halt sentinel for
     // nestest automation and the small `load_and_run` unit-test programs; test
@@ -102,19 +112,19 @@ pub trait Mem {
 
 impl Mem for CPU<'_> {
     fn mem_read(&mut self, addr: u16) -> u8 {
-        self.bus.mem_read(addr)
+        let value = self.bus.mem_read(addr);
+        self.bus_cycle();
+        value
     }
 
     fn mem_write(&mut self, addr: u16, data: u8) {
-        self.bus.mem_write(addr, data)
-    }
-    fn mem_read_u16(&mut self, pos: u16) -> u16 {
-        self.bus.mem_read_u16(pos)
+        self.bus.mem_write(addr, data);
+        self.bus_cycle();
     }
 
-    fn mem_write_u16(&mut self, pos: u16, data: u16) {
-        self.bus.mem_write_u16(pos, data)
-    }
+    // The u16 helpers deliberately fall back to the trait default so each byte
+    // is its own ticking `mem_read`/`mem_write`, matching the two real bus
+    // cycles the 6502 spends on a 16-bit access.
 }
 
 impl<'a> CPU<'a> {
@@ -128,7 +138,41 @@ impl<'a> CPU<'a> {
             stack_pointer: STACK_RESET,
             bus,
             additional_cycles: 0,
+            instr_accesses: 0,
+            executing: false,
             halt_on_brk: true,
+        }
+    }
+
+    // Advance the machine one CPU cycle for a bus access performed while an
+    // instruction is executing, and count it toward the instruction's access
+    // total. Accesses outside instruction execution (trace formatting, test
+    // setup, and assertions) leave `executing` clear and do not tick.
+    #[inline]
+    fn bus_cycle(&mut self) {
+        if self.executing {
+            self.instr_accesses = self.instr_accesses.saturating_add(1);
+            self.bus.tick(1);
+        }
+    }
+
+    // Tick the internal (non-bus-access) cycles that remain after an
+    // instruction's real accesses, keeping the total exactly the opcode's cycle
+    // budget plus any page-cross/branch penalty. Internal cycles never touch an
+    // externally visible register, so batching them at the end is cycle-exact
+    // for PPU/APU-visible timing.
+    #[inline]
+    fn finish_instruction(&mut self, base_cycles: u8) {
+        let expected = base_cycles as i16 + self.additional_cycles as i16;
+        let remaining = expected - self.instr_accesses as i16;
+        debug_assert!(
+            remaining >= 0,
+            "instruction issued {} accesses but budget is {}",
+            self.instr_accesses,
+            expected
+        );
+        if remaining > 0 {
+            self.bus.tick(remaining as u8);
         }
     }
 
@@ -929,10 +973,31 @@ impl<'a> CPU<'a> {
         let ref opcodes: HashMap<u8, &'static opcodes::OpCode> = *opcodes::OPCODES_MAP;
 
         loop {
+            // The trace formatter and any stop condition run with `executing`
+            // clear so their memory reads do not advance the PPU/APU.
+            self.executing = false;
             if callback(self) {
                 return;
             }
 
+            // Honor the BRK halt sentinel before spending a cycle on the fetch:
+            // the sentinel is an automation stop marker, not a real executed
+            // instruction, so it must not advance the machine. The peek reads
+            // the opcode from code space (never a side-effecting register) and
+            // does not tick.
+            if self.halt_on_brk && self.bus.mem_read(self.program_counter) == 0x00 {
+                // Match the historical halt convention: PC stops one past the
+                // sentinel byte, but no cycle is consumed.
+                self.program_counter = self.program_counter.wrapping_add(1);
+                self.executing = false;
+                return;
+            }
+
+            // Each real bus access from here on ticks one CPU cycle and counts
+            // toward the instruction's access total; `finish_instruction` ticks
+            // whatever internal cycles remain in the opcode's budget.
+            self.executing = true;
+            self.instr_accesses = 0;
             let code = self.mem_read(self.program_counter);
             self.program_counter += 1;
             let program_counter_state = self.program_counter;
@@ -944,22 +1009,15 @@ impl<'a> CPU<'a> {
             // instruction's penultimate cycle, before such a flag write lands.
             let irq_disabled_before = self.status.contains(CpuFlags::INTERRUPT_DISABLE);
 
-            // The CPU core executes an instruction atomically, but PPU/APU
-            // register accesses occur on its final bus cycle. Advance the
-            // fixed portion first so those externally visible accesses are
-            // placed at the end of the instruction rather than its start.
-            // BRK is either the halt sentinel or a real software interrupt,
-            // depending on `halt_on_brk`.
+            // BRK as a real software interrupt (test ROMs clear `halt_on_brk`).
+            // Its pushes and vector reads tick as real accesses; the remaining
+            // budget covers the internal cycles of the 7-cycle sequence.
             if code == 0x00 {
-                if self.halt_on_brk {
-                    return;
-                }
-                self.bus.tick(opcode.cycles);
                 self.brk();
+                self.finish_instruction(opcode.cycles);
                 self.poll_interrupts(irq_disabled_before);
                 continue;
             }
-            self.bus.tick(opcode.cycles);
 
             match code {
                 // LDA
@@ -1318,9 +1376,10 @@ impl<'a> CPU<'a> {
 
                 0x00 => unreachable!(),
             }
-            // Taken-branch and indexed-read penalties are discovered while
-            // executing the instruction.
-            self.bus.tick(self.additional_cycles);
+            // Real bus accesses have already ticked; tick the internal cycles
+            // that remain in the budget, including taken-branch and indexed-read
+            // page-cross penalties discovered while executing.
+            self.finish_instruction(opcode.cycles);
 
             if program_counter_state == self.program_counter {
                 self.program_counter += (opcode.len - 1) as u16;
