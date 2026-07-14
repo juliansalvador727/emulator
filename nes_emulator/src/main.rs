@@ -5,6 +5,7 @@ pub mod cartridge;
 pub mod cpu;
 pub mod joypad;
 pub mod mapper;
+pub mod menu;
 pub mod opcodes;
 pub mod ppu;
 pub mod probe;
@@ -35,6 +36,16 @@ use sdl3::render::{FRect, ScaleMode};
 
 const NES_WIDTH: u32 = 256;
 const NES_HEIGHT: u32 = 240;
+
+// How a gameplay session ended, so the caller can decide whether to return to
+// the selection screen or close the program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GameOutcome {
+    /// The user pressed Escape: hand control back to the menu.
+    BackToMenu,
+    /// The window was closed: shut the whole program down.
+    Quit,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WindowMode {
@@ -72,7 +83,7 @@ fn run_game(
     latency_debug: bool,
     run_ahead_frames: u8,
     window_mode: WindowMode,
-) {
+) -> GameOutcome {
     let sdl_context = sdl3::init().unwrap();
     let video_subsystem = sdl_context.video().unwrap();
     let window_builder = match window_mode {
@@ -304,11 +315,11 @@ fn run_game(
 
         for event in event_pump.poll_iter() {
             match event {
-                Event::Quit { .. }
-                | Event::KeyDown {
+                Event::Quit { .. } => return GameOutcome::Quit,
+                Event::KeyDown {
                     keycode: Some(Keycode::Escape),
                     ..
-                } => std::process::exit(0),
+                } => return GameOutcome::BackToMenu,
                 Event::KeyDown {
                     keycode: Some(Keycode::F11),
                     repeat: false,
@@ -540,26 +551,43 @@ fn main() {
         }
         Some("tiles") => run_tiles(args.get(2).map(|s| s.as_str()).unwrap_or("nestest.nes")),
         Some(rom_path) => match parse_game_options(&args[2..]) {
-            Ok((audio_config, latency_debug, run_ahead_frames, window_mode)) => run_game(
-                rom_path,
-                audio_config,
-                latency_debug,
-                run_ahead_frames,
-                window_mode,
-            ),
+            Ok((audio_config, latency_debug, run_ahead_frames, window_mode)) => {
+                run_game(
+                    rom_path,
+                    audio_config,
+                    latency_debug,
+                    run_ahead_frames,
+                    window_mode,
+                );
+            }
             Err(err) => {
                 eprintln!("game options: {err}");
                 std::process::exit(2);
             }
         },
+        // No ROM given: open the selection screen and loop back to it whenever a
+        // game is exited with Escape, so the picker is the program's home base.
         None => match parse_game_options(&[]) {
-            Ok((audio_config, latency_debug, run_ahead_frames, window_mode)) => run_game(
-                "games/pacman.nes",
-                audio_config,
-                latency_debug,
-                run_ahead_frames,
-                window_mode,
-            ),
+            Ok((audio_config, latency_debug, run_ahead_frames, window_mode)) => {
+                let roms_dir = Path::new("games");
+                loop {
+                    match menu::run_menu(roms_dir) {
+                        menu::MenuChoice::Play(path) => {
+                            let outcome = run_game(
+                                &path.to_string_lossy(),
+                                audio_config.clone(),
+                                latency_debug,
+                                run_ahead_frames,
+                                window_mode,
+                            );
+                            if outcome == GameOutcome::Quit {
+                                break;
+                            }
+                        }
+                        menu::MenuChoice::Quit => break,
+                    }
+                }
+            }
             Err(err) => {
                 eprintln!("audio configuration: {err}");
                 std::process::exit(2);
