@@ -5,9 +5,8 @@ official 6502 instruction set with a dot-driven PPU renderer, mapper-controlled
 banking and IRQs, controller input, and five-channel audio.
 
 The emulator is NTSC-oriented. Video, keyboard input, and bound-stream audio
-share one bundled SDL3 runtime, matching the lifecycle used by the stable C
-frontend. NES documentation and test ROMs are the sources of truth for hardware
-behaviour.
+share one bundled SDL3 runtime with a single, carefully managed lifecycle. NES
+documentation and test ROMs are the sources of truth for hardware behaviour.
 
 ## Current support
 
@@ -74,14 +73,13 @@ and targets 40 ms of queued input. `balanced` targets 80 ms and is selected
 automatically under WSL; `--audio-latency-ms` overrides either target. The
 process-wide SDL3 transport uses a small adaptive sample-count correction (at
 most 1.5%) before SDL to absorb host-clock drift without changing NES CPU or
-video speed. The SDL stream itself stays at a fixed 48 kHz, matching the stable
-C transport behavior.
+video speed. The SDL stream itself stays at a fixed 48 kHz.
 
 `--latency-debug` reports presentation time, queued/pending audio, playback
 correction, backpressure, paused-device resumes, drops, underflows, and
 sampled-input-to-controller-poll time once per second. SDL queue inspection and
-submission happen at most once every 16 ms, matching the stable C frontend's
-frame-rate cadence. Queue pressure is bounded without clearing the live SDL
+submission happen at most once every 16 ms, matching the display's frame-rate
+cadence. Queue pressure is bounded without clearing the live SDL
 stream: feeding stops at the target and only excess not-yet-submitted samples
 are discarded. The equivalent environment variables are `NES_AUDIO_PROFILE`,
 `NES_AUDIO_LATENCY_MS`, `NES_RUN_AHEAD_FRAMES`, and `NES_LATENCY_DEBUG`.
@@ -185,3 +183,8 @@ cargo run -- tiles /path/to/game.nes
   DMC-DMA arbitration.
 - Unofficial 6502 opcodes, NES 2.0, PAL/Dendy timing, battery saves, save
   states, and a second controller remain to be implemented.
+
+## License
+
+Released under the [MIT License](LICENSE). This repository ships no game ROMs;
+supply your own dumps of titles you legally own.
