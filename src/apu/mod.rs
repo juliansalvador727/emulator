@@ -176,6 +176,11 @@ impl NesAPU {
         self.dmc.dma_load(value);
     }
 
+    #[cfg(test)]
+    pub(crate) fn cycle_count(&self) -> usize {
+        self.cycles
+    }
+
     pub fn tick(&mut self, cycles: u8) {
         for _ in 0..cycles {
             self.tick_cycle();

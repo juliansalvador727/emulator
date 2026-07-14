@@ -18,7 +18,16 @@ pub fn trace(cpu: &mut CPU) -> String {
         AddressingMode::Immediate | AddressingMode::NoneAddressing => (0, 0),
         _ => {
             let addr = cpu.get_absolute_address(&ops.mode, begin + 1);
-            (addr, cpu.mem_read(addr))
+            // The disassembly annotation must not disturb emulator state.
+            // Reading a PPU or APU/I-O register ($2000-$3FFF, $4000-$401F) has
+            // side effects (e.g. $2002 clears vblank, $4015 clears the frame
+            // IRQ), so show the open-bus value instead of performing the read.
+            // These addresses hold no persistent value to display anyway.
+            let value = match addr {
+                0x2000..=0x3fff | 0x4000..=0x401f => 0xff,
+                _ => cpu.mem_read(addr),
+            };
+            (addr, value)
         }
     };
 
@@ -119,7 +128,14 @@ pub fn trace(cpu: &mut CPU) -> String {
         .map(|z| format!("{:02x}", z))
         .collect::<Vec<String>>()
         .join(" ");
-    let asm_str = format!("{:04x}  {:8} {: >4} {}", begin, hex_str, ops.mnemonic, tmp)
+    // Undocumented opcodes disassemble with a leading `*`, e.g. `*NOP`; the
+    // resulting four-character token keeps nestest's column alignment.
+    let mnemonic = if ops.unofficial {
+        format!("*{}", ops.mnemonic)
+    } else {
+        format!(" {}", ops.mnemonic)
+    };
+    let asm_str = format!("{:04x}  {:8} {:>4} {}", begin, hex_str, mnemonic, tmp)
         .trim()
         .to_string();
 

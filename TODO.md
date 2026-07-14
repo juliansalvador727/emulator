@@ -8,12 +8,16 @@ and has a separate, lower-priority backlog at the end of this file.
 
 Current verified baseline (2026-07-14):
 
-- 220 passing Rust tests.
-- All official 6502 opcodes; `nestest` matches 5,003 official-opcode entries.
+- 234 passing Rust tests.
+- All 256 6502 opcodes (official and undocumented); `nestest` matches the
+  reference for all 8,991 instruction lines. `instr_test-v5` (16/16),
+  `instr_timing` (2/2), and `instr_misc` (4/4) pass.
 - NROM, MMC1, UxROM, CNROM, MMC3, AxROM, and GxROM/GNROM.
 - Dot-driven background and sprite rendering with mapper-visible PPU fetches.
-- P1 PPU register and memory behavior complete; DMA/bus timing is the next
-  active P1 foundation.
+- P1 PPU register and memory behavior complete. OAM DMA is modeled as real
+  alternating get/put cycles with OAMADDR wrapping, and DMC DMA arbitrates with
+  it on get cycles; the remaining sub-cycle DMA fidelity is gated on the
+  cycle-accurate CPU bus-timing work.
 - Five-channel APU including DMC DMA, filtering, and SDL3 bound-stream playback.
 - Audio stall watchdog with staged recovery; stream open/destroy isolated on a
   helper thread (see the host audio section below for the WSLg failure model).
@@ -134,25 +138,55 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
 
 - [x] Give OAM DMA its real 513/514 CPU-cycle stall based on CPU parity.
 - [x] Advance the PPU and APU while the CPU is stalled.
-- [ ] Model OAM DMA reads/writes on alternating CPU cycles and preserve the
-  current OAMADDR wrapping behavior.
-- [ ] Define and test DMC DMA/OAM DMA arbitration, including DMC steals during
-  OAM DMA and instruction-boundary effects.
-- [ ] Add integration tests for parity, elapsed PPU dots, APU progression, and
-  DMA interaction; validate with DMA timing test ROMs.
+- [x] Model OAM DMA reads/writes on alternating CPU cycles and preserve the
+  current OAMADDR wrapping behavior. `Bus::run_oam_dma` streams the page one
+  byte per get/put pair through `NesPPU::oam_dma_write` (post-incrementing
+  OAMADDR, discarded during rendering) instead of copying it atomically at the
+  `$4014` write.
+- [x] Define and test DMC DMA/OAM DMA arbitration for the common (non-
+  corrupting) alignment: `Bus::service_dmc_during_oam` gives a pending DMC
+  fetch priority on a get cycle, adding a halt/alignment cycle plus the DMC get
+  and delaying — never dropping — the OAM data. The rarer sub-cycle case where
+  the steal corrupts an OAM byte, and true instruction-boundary effects, depend
+  on a mid-instruction cycle-accurate CPU and are tracked under "CPU
+  compatibility and timing" below; `sprdma_and_dmc_dma` still reports $0F for
+  that reason.
+- [x] Add integration tests for parity, elapsed PPU dots, APU progression, and
+  DMA interaction (`bus.rs`: page copy with OAMADDR wrap, PPU/APU advancement
+  across the whole stall, and a DMC steal during OAM DMA). DMA timing ROM
+  validation: `sprdma_and_dmc_dma`/`_512` and `dmc_dma_during_read4/*` require
+  the cycle-accurate CPU bus timing above and remain deferred with it.
 
 ## P1 — CPU compatibility and timing
 
-- [ ] Implement commonly used unofficial 6502 opcodes, addressing modes,
+- [x] Implement commonly used unofficial 6502 opcodes, addressing modes,
   flags, dummy accesses, page-cross timing, and unstable-opcode behavior where
-  commercial software requires it. Replace the remaining `todo!()` dispatch.
-- [ ] Complete the `nestest` trace beyond the first unofficial opcode and add
-  dedicated illegal-opcode test ROM results.
-- [ ] Audit instruction, interrupt, reset, and DMA timing at bus-cycle
-  granularity as needed by timing ROMs and mapper write quirks; make the older
-  standalone `vbl_nmi_timing` suite pass without a compensating PPU offset.
+  commercial software requires it. All 256 opcodes now have a table entry and a
+  dispatch arm (`opcodes.rs`/`cpu.rs`); the `todo!()` fallthrough is gone. NOP,
+  LAX, SAX, SBC, DCP, ISB, SLO, RLA, SRE, RRA, ANC, ALR, ARR, AXS and the
+  unstable ANE/LXA/SHx/TAS/LAS/JAM are covered. Indexed reads, indexed stores,
+  and read-modify-writes issue their dummy read at the un-carried address, and
+  ROL/ROR on memory now set the Z flag. Unstable ANE/LXA use the all-ones magic
+  constant blargg's tests were captured with.
+- [x] Complete the `nestest` trace beyond the first unofficial opcode and add
+  dedicated illegal-opcode test ROM results. The trace marks undocumented
+  opcodes with `*` and is now side-effect-free (it no longer reads PPU/APU
+  registers for its `= xx` annotation), so `cargo run --release -- nestest`
+  matches the reference for all 8,991 instruction lines. Test ROM results
+  (blargg `$6000`): `instr_test-v5` 16/16, `instr_timing` 2/2, and
+  `instr_misc` 4/4 (including all four dummy-read groups) pass.
+- [~] Audit instruction, interrupt, reset, and DMA timing at bus-cycle
+  granularity. Instruction timing (`instr_timing`), dummy reads (`instr_misc`),
+  page-cross penalties, and one-instruction CLI/SEI/PLP interrupt latency (IRQ
+  is polled at the instruction boundary using the pre-instruction I flag) are
+  done and tested. The remaining sub-cycle cases — NMI/BRK hijacking, exact RTI
+  and branch interrupt-delay timing (`cpu_interrupts_v2`), and making
+  `vbl_nmi_timing` pass without a compensating PPU offset — require a fully
+  cycle-stepped CPU that ticks the PPU/APU on each memory access, which is the
+  next slice of this item.
 - [ ] Implement accurate reset and power-cycle state separately; do not treat
   application startup, reset, and save-state restore as the same operation.
+  (Still one `reset()`; power-on vs. reset RAM/APU/PPU differences are unmodeled.)
 
 ## P1 — APU correctness
 

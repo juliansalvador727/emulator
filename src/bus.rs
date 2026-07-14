@@ -19,7 +19,9 @@ pub struct Bus<'call> {
     pub apu: NesAPU,
 
     cycles: usize,
-    oam_dma_pending: bool,
+    // Page selected by the last $4014 write, consumed on the next tick so the
+    // 513/514-cycle stall begins at the following CPU-cycle boundary.
+    oam_dma_page: Option<u8>,
     gameloop_callback: Box<dyn FnMut(&NesPPU, &mut NesAPU, &mut Joypad) + 'call>,
     audio_chunk_samples: Option<usize>,
     audio_callback: Box<dyn FnMut(Vec<f32>) + 'call>,
@@ -34,7 +36,9 @@ pub struct BusSnapshot {
     ppu: NesPPU,
     apu: NesAPU,
     cycles: usize,
-    oam_dma_pending: bool,
+    // Page selected by the last $4014 write, consumed on the next tick so the
+    // 513/514-cycle stall begins at the following CPU-cycle boundary.
+    oam_dma_page: Option<u8>,
     audio_delivery_enabled: bool,
     host_frame_ready: bool,
     joypad1: Joypad,
@@ -70,7 +74,7 @@ impl<'a> Bus<'a> {
             ppu: ppu,
             apu: NesAPU::new(),
             cycles: 0,
-            oam_dma_pending: false,
+            oam_dma_page: None,
             gameloop_callback: Box::from(gameloop_callback),
             audio_chunk_samples: (audio_chunk_samples != usize::MAX)
                 .then_some(audio_chunk_samples),
@@ -101,26 +105,19 @@ impl<'a> Bus<'a> {
         self.ppu.tick(cycles * 3);
         let mut frame_ready = self.ppu.take_frame_ready();
 
-        // OAM DMA halts the CPU for 513 cycles, plus one alignment cycle when
-        // it starts on an odd CPU cycle. The PPU and APU continue to run.
-        // Defer this until the instruction containing the $4014 write has
-        // completed so the halt begins at the following CPU-cycle boundary.
-        if self.oam_dma_pending {
-            self.oam_dma_pending = false;
-            let stall = 513 + (self.cycles & 1);
-            self.cycles += stall;
-            for _ in 0..stall {
-                self.apu.tick(1);
-                self.ppu.tick(3);
-                frame_ready |= self.ppu.take_frame_ready();
-            }
+        // OAM DMA halts the CPU and copies a page into OAM one byte per pair
+        // of CPU cycles. Deferring it to the tick after the $4014 write means
+        // the halt begins at the following CPU-cycle boundary, and the modeled
+        // get/put cycles keep the PPU and APU running throughout.
+        if let Some(page) = self.oam_dma_page.take() {
+            self.run_oam_dma(page, &mut frame_ready);
         }
 
-        // DMC sample fetch: when the APU's memory reader wants a byte, the
-        // bus reads it and stalls the CPU. Hardware stalls 1-4 cycles
-        // depending on alignment (https://www.nesdev.org/wiki/DMA); we use
-        // the common case of 4 and keep the PPU and APU running through it.
-        // Servicing once per CPU instruction (rather than the moment the
+        // DMC sample fetch outside of an OAM DMA: when the APU's memory reader
+        // wants a byte, the bus reads it and stalls the CPU. Hardware stalls
+        // 1-4 cycles depending on alignment (https://www.nesdev.org/wiki/DMA);
+        // we use the common case of 4 and keep the PPU and APU running through
+        // it. Servicing once per CPU instruction (rather than the moment the
         // sample buffer empties) is at most a few cycles late.
         while let Some(addr) = self.apu.dmc_dma_request() {
             let value = self.mem_read(addr);
@@ -140,6 +137,63 @@ impl<'a> Bus<'a> {
         if frame_ready {
             self.host_frame_ready = true;
             (self.gameloop_callback)(&self.ppu, &mut self.apu, &mut self.joypad1);
+        }
+    }
+
+    // One halted CPU cycle: the CPU is stopped for DMA, but the PPU (3 dots)
+    // and APU (1 cycle) keep running. Returns nothing; `frame_ready` collects
+    // any vblank that starts mid-transfer so the host frame is not lost.
+    #[inline]
+    fn dma_cpu_cycle(&mut self, frame_ready: &mut bool) {
+        self.cycles += 1;
+        self.apu.tick(1);
+        self.ppu.tick(3);
+        *frame_ready |= self.ppu.take_frame_ready();
+    }
+
+    // Perform one OAM DMA. The transfer is 512 alternating get (read) and put
+    // (OAM write) cycles, preceded by a halt cycle and, when the DMA starts on
+    // an odd CPU cycle, an alignment cycle. This reproduces the hardware
+    // 513/514-cycle stall and places every read and write on its real CPU
+    // cycle rather than copying the page atomically.
+    fn run_oam_dma(&mut self, page: u8, frame_ready: &mut bool) {
+        self.ppu.note_oam_dma_start();
+        let base = (page as u16) << 8;
+
+        // Halt cycle, plus an alignment cycle when the DMA begins on an odd
+        // CPU cycle. Evaluated at entry so the stall is 513 cycles on an even
+        // boundary and 514 on an odd one.
+        let alignment = self.cycles & 1;
+        for _ in 0..(1 + alignment) {
+            self.dma_cpu_cycle(frame_ready);
+        }
+
+        for offset in 0..256u16 {
+            // The DMC memory reader has priority over OAM DMA and steals the
+            // bus on a get cycle before the OAM read is allowed to proceed.
+            self.service_dmc_during_oam(frame_ready);
+
+            let value = self.mem_read(base + offset); // get cycle
+            self.dma_cpu_cycle(frame_ready);
+            self.ppu.oam_dma_write(value); // put cycle
+            self.dma_cpu_cycle(frame_ready);
+        }
+    }
+
+    // DMC/OAM DMA arbitration. When the DMC's sample buffer empties during an
+    // OAM DMA the DMC steals the bus: it inserts a halt/alignment cycle and
+    // then reads its byte on a get cycle. That is two CPU cycles of added
+    // stall per fetch on top of the OAM transfer, with the OAM read that would
+    // have happened simply delayed. The rarer sub-cycle case where the steal
+    // lands so as to corrupt an OAM byte depends on the exact CPU bus cycle of
+    // the fetch and is deferred to the cycle-accurate CPU work; OAM data
+    // integrity is preserved here, matching the common aligned behavior.
+    fn service_dmc_during_oam(&mut self, frame_ready: &mut bool) {
+        if let Some(addr) = self.apu.dmc_dma_request() {
+            self.dma_cpu_cycle(frame_ready); // halt/alignment cycle
+            let value = self.mem_read(addr);
+            self.apu.dmc_dma_load(value);
+            self.dma_cpu_cycle(frame_ready); // DMC get cycle
         }
     }
 
@@ -173,7 +227,7 @@ impl<'a> Bus<'a> {
             ppu,
             apu: self.apu.clone(),
             cycles: self.cycles,
-            oam_dma_pending: self.oam_dma_pending,
+            oam_dma_page: self.oam_dma_page,
             audio_delivery_enabled: self.audio_delivery_enabled,
             host_frame_ready: self.host_frame_ready,
             joypad1: self.joypad1.clone(),
@@ -186,7 +240,7 @@ impl<'a> Bus<'a> {
         self.ppu = snapshot.ppu;
         self.apu = snapshot.apu;
         self.cycles = snapshot.cycles;
-        self.oam_dma_pending = snapshot.oam_dma_pending;
+        self.oam_dma_page = snapshot.oam_dma_page;
         self.audio_delivery_enabled = snapshot.audio_delivery_enabled;
         self.host_frame_ready = snapshot.host_frame_ready;
         self.joypad1 = snapshot.joypad1;
@@ -281,17 +335,12 @@ impl Mem for Bus<'_> {
                 self.mem_write(mirror_down_addr, data);
             }
 
-            // OAM DMA ($4014): copy CPU page $XX00-$XXFF into PPU OAM.
-            // The book wires this in ch7; doing it now keeps write_oam_dma live
-            // and games that DMA sprites during boot behave correctly.
+            // OAM DMA ($4014): schedule a copy of CPU page $XX00-$XXFF into
+            // PPU OAM. The transfer itself runs on the next tick so its reads
+            // and writes land on their real alternating CPU cycles and can be
+            // interrupted by DMC DMA (see `run_oam_dma`).
             0x4014 => {
-                let hi: u16 = (data as u16) << 8;
-                let mut buffer: [u8; 256] = [0; 256];
-                for i in 0..256u16 {
-                    buffer[i as usize] = self.mem_read(hi + i);
-                }
-                self.ppu.write_oam_dma(&buffer);
-                self.oam_dma_pending = true;
+                self.oam_dma_page = Some(data);
             }
 
             // APU registers ($4014 is OAM DMA above, $4016 the joypad below;
@@ -434,6 +483,79 @@ mod test {
         odd_bus.tick(4);
 
         assert_eq!(odd_bus.cycles, 1 + 4 + 514);
+    }
+
+    #[test]
+    fn oam_dma_copies_the_page_into_oam_with_oamaddr_wrapping() {
+        let mut bus = test_bus();
+        // Fill the source page (zero page) with a recognizable pattern.
+        for i in 0..256u16 {
+            bus.mem_write(i, (i as u8) ^ 0x5a);
+        }
+        // Start the transfer at OAMADDR $10 so the destination wraps.
+        bus.mem_write(0x2003, 0x10);
+        bus.mem_write(0x4014, 0x00);
+        bus.tick(1); // runs the deferred, cycle-stepped DMA
+
+        for i in 0..256usize {
+            let dst = (0x10 + i) & 0xff;
+            assert_eq!(bus.ppu().oam_data[dst], (i as u8) ^ 0x5a);
+        }
+        // 256 post-incrementing writes wrap OAMADDR back to where it started.
+        assert_eq!(bus.ppu().oam_addr, 0x10);
+    }
+
+    #[test]
+    fn oam_dma_advances_ppu_and_apu_across_the_whole_stall() {
+        let mut bus = test_bus();
+        let ppu_dots_before = bus.ppu().total_dots();
+        let apu_before = bus.apu.cycle_count();
+
+        bus.mem_write(0x4014, 0x02);
+        bus.tick(2); // even boundary -> 513-cycle stall on top of the 2 ticks
+        let elapsed = bus.cycles; // started at zero
+
+        assert_eq!(elapsed, 2 + 513);
+        // Every halted CPU cycle still clocks the PPU three dots and the APU
+        // one cycle, so no time is lost during the transfer.
+        assert_eq!(bus.ppu().total_dots() - ppu_dots_before, elapsed as u64 * 3);
+        assert_eq!(bus.apu.cycle_count() - apu_before, elapsed);
+    }
+
+    #[test]
+    fn dmc_dma_steals_cycles_during_oam_dma_without_dropping_bytes() {
+        let mut bus = test_bus();
+        for i in 0..256u16 {
+            bus.mem_write(i, i as u8);
+        }
+        // Arm the DMC so its buffer is empty and a fetch is pending the moment
+        // the OAM DMA reaches its first get cycle. The slow default rate means
+        // exactly one fetch is stolen during the ~514-cycle transfer.
+        bus.mem_write(0x4012, 0x00); // sample address $C000
+        bus.mem_write(0x4013, 0x10); // 257-byte sample: stays active
+        bus.mem_write(0x4015, 0x10); // enable DMC
+
+        let apu_before = bus.apu.cycle_count();
+        let ppu_dots_before = bus.ppu().total_dots();
+        bus.mem_write(0x4014, 0x00);
+        bus.tick(1); // odd boundary -> 514-cycle base stall
+
+        // One steal adds a halt/alignment cycle plus a DMC get cycle: two CPU
+        // cycles on top of the one tick and the 514-cycle OAM transfer.
+        assert_eq!(bus.cycles, 1 + 514 + 2);
+        // The PPU and APU are clocked through the stolen cycles as well.
+        assert_eq!(bus.apu.cycle_count() - apu_before, bus.cycles);
+        assert_eq!(
+            bus.ppu().total_dots() - ppu_dots_before,
+            bus.cycles as u64 * 3
+        );
+        // The steal delays, but never drops, the OAM data: the page still
+        // copies in full.
+        for i in 0..256usize {
+            assert_eq!(bus.ppu().oam_data[i], i as u8);
+        }
+        // The DMC actually took its byte and is still playing the sample.
+        assert_eq!(bus.mem_read(0x4015) & 0x10, 0x10);
     }
 
     #[test]

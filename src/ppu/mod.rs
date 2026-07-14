@@ -843,20 +843,36 @@ impl NesPPU {
         self.loopy.write_scroll(value);
     }
 
-    // OAM DMA: copy a 256-byte page (supplied by the bus from CPU RAM)
-    // into OAM starting at the current oam_addr.
-    pub fn write_oam_dma(&mut self, data: &[u8; 256]) {
+    // Record the start of an OAM DMA transfer for probe diagnostics. The bus
+    // then streams the 256 bytes one at a time through `oam_dma_write` so the
+    // reads and writes land on their real alternating CPU cycles.
+    pub fn note_oam_dma_start(&mut self) {
         self.probe_diagnostics.oam_dma_count += 1;
+    }
+
+    // One byte of an OAM DMA transfer. Electrically this is a $2004 write
+    // driven by the DMA unit rather than the CPU, so it lands at the current
+    // OAMADDR and post-increments it, wrapping through the 256-byte page.
+    pub fn oam_dma_write(&mut self, value: u8) {
         if self.rendering_in_progress() {
-            // OAMDMA is electrically a sequence of $2004 writes. With the
-            // current atomic DMA representation, 256 discarded +4 address
-            // bumps wrap back to the starting OAMADDR.
-            self.drive_io_data_bus(data[255], 0xff);
+            // Rendering owns OAM, so the write is discarded while still
+            // driving the PPU I/O latch. Across a full DMA the 256 discarded
+            // +4 sprite-evaluation address bumps that $2004 applies during
+            // rendering wrap back to the starting OAMADDR, so we leave it put.
+            self.drive_io_data_bus(value, 0xff);
             return;
         }
-        for x in data.iter() {
-            self.oam_data[self.oam_addr as usize] = *x;
-            self.oam_addr = self.oam_addr.wrapping_add(1);
+        self.oam_data[self.oam_addr as usize] = value;
+        self.oam_addr = self.oam_addr.wrapping_add(1);
+    }
+
+    // Convenience path for unit tests and callers that already hold the whole
+    // page in a buffer; equivalent to 256 consecutive `oam_dma_write`s.
+    #[cfg(test)]
+    pub fn write_oam_dma(&mut self, data: &[u8; 256]) {
+        self.note_oam_dma_start();
+        for &byte in data.iter() {
+            self.oam_dma_write(byte);
         }
     }
 
@@ -948,6 +964,11 @@ impl NesPPU {
     #[cfg(test)]
     pub(crate) fn render_scroll(&self) -> (u16, u8) {
         (self.loopy.current(), self.loopy.fine_x())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn total_dots(&self) -> u64 {
+        self.total_dots
     }
 
     #[cfg(test)]

@@ -24,6 +24,9 @@ pub fn run(path: &str, max_instructions: u64) -> Result<(), String> {
     let rom = Rom::new(&bytes).map_err(|err| format!("failed to parse {path}: {err}"))?;
     let bus = Bus::new(rom, |_, _, _| {});
     let mut cpu = CPU::new(bus);
+    // These ROMs (e.g. the BRK and interrupt suites) execute BRK as a real
+    // software interrupt rather than a halt.
+    cpu.set_halt_on_brk(false);
     cpu.reset();
 
     let mut instructions = 0_u64;

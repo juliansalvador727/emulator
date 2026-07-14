@@ -7,6 +7,9 @@ pub struct OpCode {
     pub len: u8,
     pub cycles: u8,
     pub mode: AddressingMode,
+    // True for the undocumented ("illegal") 6502 opcodes. Disassembly prefixes
+    // these with `*`, matching nestest's trace format.
+    pub unofficial: bool,
 }
 
 impl OpCode {
@@ -17,6 +20,18 @@ impl OpCode {
             len: len,
             cycles: cycles,
             mode: mode,
+            unofficial: false,
+        }
+    }
+
+    fn illegal(code: u8, mnemonic: &'static str, len: u8, cycles: u8, mode: AddressingMode) -> Self {
+        OpCode {
+            code,
+            mnemonic,
+            len,
+            cycles,
+            mode,
+            unofficial: true,
         }
     }
 }
@@ -290,6 +305,145 @@ lazy_static! {
 
         // PLP
         OpCode::new(0x28, "PLP", 1, 4, AddressingMode::NoneAddressing),
+
+        // ---------------------------------------------------------------
+        // Undocumented ("illegal") opcodes. nestest exercises the stable
+        // subset; the unstable stores and immediates are included so no
+        // opcode falls through to an unimplemented dispatch arm.
+        // ---------------------------------------------------------------
+
+        // NOP (undocumented): implied, immediate, and read forms that only
+        // consume operand bytes / bus cycles.
+        OpCode::illegal(0x1a, "NOP", 1, 2, AddressingMode::NoneAddressing),
+        OpCode::illegal(0x3a, "NOP", 1, 2, AddressingMode::NoneAddressing),
+        OpCode::illegal(0x5a, "NOP", 1, 2, AddressingMode::NoneAddressing),
+        OpCode::illegal(0x7a, "NOP", 1, 2, AddressingMode::NoneAddressing),
+        OpCode::illegal(0xda, "NOP", 1, 2, AddressingMode::NoneAddressing),
+        OpCode::illegal(0xfa, "NOP", 1, 2, AddressingMode::NoneAddressing),
+        OpCode::illegal(0x80, "NOP", 2, 2, AddressingMode::Immediate),
+        OpCode::illegal(0x82, "NOP", 2, 2, AddressingMode::Immediate),
+        OpCode::illegal(0x89, "NOP", 2, 2, AddressingMode::Immediate),
+        OpCode::illegal(0xc2, "NOP", 2, 2, AddressingMode::Immediate),
+        OpCode::illegal(0xe2, "NOP", 2, 2, AddressingMode::Immediate),
+        OpCode::illegal(0x04, "NOP", 2, 3, AddressingMode::ZeroPage),
+        OpCode::illegal(0x44, "NOP", 2, 3, AddressingMode::ZeroPage),
+        OpCode::illegal(0x64, "NOP", 2, 3, AddressingMode::ZeroPage),
+        OpCode::illegal(0x14, "NOP", 2, 4, AddressingMode::ZeroPage_X),
+        OpCode::illegal(0x34, "NOP", 2, 4, AddressingMode::ZeroPage_X),
+        OpCode::illegal(0x54, "NOP", 2, 4, AddressingMode::ZeroPage_X),
+        OpCode::illegal(0x74, "NOP", 2, 4, AddressingMode::ZeroPage_X),
+        OpCode::illegal(0xd4, "NOP", 2, 4, AddressingMode::ZeroPage_X),
+        OpCode::illegal(0xf4, "NOP", 2, 4, AddressingMode::ZeroPage_X),
+        OpCode::illegal(0x0c, "NOP", 3, 4, AddressingMode::Absolute),
+        OpCode::illegal(0x1c, "NOP", 3, 4 /* +1 if page crossed */, AddressingMode::Absolute_X),
+        OpCode::illegal(0x3c, "NOP", 3, 4 /* +1 if page crossed */, AddressingMode::Absolute_X),
+        OpCode::illegal(0x5c, "NOP", 3, 4 /* +1 if page crossed */, AddressingMode::Absolute_X),
+        OpCode::illegal(0x7c, "NOP", 3, 4 /* +1 if page crossed */, AddressingMode::Absolute_X),
+        OpCode::illegal(0xdc, "NOP", 3, 4 /* +1 if page crossed */, AddressingMode::Absolute_X),
+        OpCode::illegal(0xfc, "NOP", 3, 4 /* +1 if page crossed */, AddressingMode::Absolute_X),
+
+        // LAX = LDA + LDX.
+        OpCode::illegal(0xa3, "LAX", 2, 6, AddressingMode::Indirect_X),
+        OpCode::illegal(0xa7, "LAX", 2, 3, AddressingMode::ZeroPage),
+        OpCode::illegal(0xaf, "LAX", 3, 4, AddressingMode::Absolute),
+        OpCode::illegal(0xb3, "LAX", 2, 5 /* +1 if page crossed */, AddressingMode::Indirect_Y),
+        OpCode::illegal(0xb7, "LAX", 2, 4, AddressingMode::ZeroPage_Y),
+        OpCode::illegal(0xbf, "LAX", 3, 4 /* +1 if page crossed */, AddressingMode::Absolute_Y),
+
+        // SAX = store (A & X).
+        OpCode::illegal(0x83, "SAX", 2, 6, AddressingMode::Indirect_X),
+        OpCode::illegal(0x87, "SAX", 2, 3, AddressingMode::ZeroPage),
+        OpCode::illegal(0x8f, "SAX", 3, 4, AddressingMode::Absolute),
+        OpCode::illegal(0x97, "SAX", 2, 4, AddressingMode::ZeroPage_Y),
+
+        // SBC (undocumented duplicate of the immediate SBC).
+        OpCode::illegal(0xeb, "SBC", 2, 2, AddressingMode::Immediate),
+
+        // DCP = DEC + CMP.
+        OpCode::illegal(0xc3, "DCP", 2, 8, AddressingMode::Indirect_X),
+        OpCode::illegal(0xc7, "DCP", 2, 5, AddressingMode::ZeroPage),
+        OpCode::illegal(0xcf, "DCP", 3, 6, AddressingMode::Absolute),
+        OpCode::illegal(0xd3, "DCP", 2, 8, AddressingMode::Indirect_Y),
+        OpCode::illegal(0xd7, "DCP", 2, 6, AddressingMode::ZeroPage_X),
+        OpCode::illegal(0xdb, "DCP", 3, 7, AddressingMode::Absolute_Y),
+        OpCode::illegal(0xdf, "DCP", 3, 7, AddressingMode::Absolute_X),
+
+        // ISB (a.k.a. ISC) = INC + SBC.
+        OpCode::illegal(0xe3, "ISB", 2, 8, AddressingMode::Indirect_X),
+        OpCode::illegal(0xe7, "ISB", 2, 5, AddressingMode::ZeroPage),
+        OpCode::illegal(0xef, "ISB", 3, 6, AddressingMode::Absolute),
+        OpCode::illegal(0xf3, "ISB", 2, 8, AddressingMode::Indirect_Y),
+        OpCode::illegal(0xf7, "ISB", 2, 6, AddressingMode::ZeroPage_X),
+        OpCode::illegal(0xfb, "ISB", 3, 7, AddressingMode::Absolute_Y),
+        OpCode::illegal(0xff, "ISB", 3, 7, AddressingMode::Absolute_X),
+
+        // SLO = ASL + ORA.
+        OpCode::illegal(0x03, "SLO", 2, 8, AddressingMode::Indirect_X),
+        OpCode::illegal(0x07, "SLO", 2, 5, AddressingMode::ZeroPage),
+        OpCode::illegal(0x0f, "SLO", 3, 6, AddressingMode::Absolute),
+        OpCode::illegal(0x13, "SLO", 2, 8, AddressingMode::Indirect_Y),
+        OpCode::illegal(0x17, "SLO", 2, 6, AddressingMode::ZeroPage_X),
+        OpCode::illegal(0x1b, "SLO", 3, 7, AddressingMode::Absolute_Y),
+        OpCode::illegal(0x1f, "SLO", 3, 7, AddressingMode::Absolute_X),
+
+        // RLA = ROL + AND.
+        OpCode::illegal(0x23, "RLA", 2, 8, AddressingMode::Indirect_X),
+        OpCode::illegal(0x27, "RLA", 2, 5, AddressingMode::ZeroPage),
+        OpCode::illegal(0x2f, "RLA", 3, 6, AddressingMode::Absolute),
+        OpCode::illegal(0x33, "RLA", 2, 8, AddressingMode::Indirect_Y),
+        OpCode::illegal(0x37, "RLA", 2, 6, AddressingMode::ZeroPage_X),
+        OpCode::illegal(0x3b, "RLA", 3, 7, AddressingMode::Absolute_Y),
+        OpCode::illegal(0x3f, "RLA", 3, 7, AddressingMode::Absolute_X),
+
+        // SRE = LSR + EOR.
+        OpCode::illegal(0x43, "SRE", 2, 8, AddressingMode::Indirect_X),
+        OpCode::illegal(0x47, "SRE", 2, 5, AddressingMode::ZeroPage),
+        OpCode::illegal(0x4f, "SRE", 3, 6, AddressingMode::Absolute),
+        OpCode::illegal(0x53, "SRE", 2, 8, AddressingMode::Indirect_Y),
+        OpCode::illegal(0x57, "SRE", 2, 6, AddressingMode::ZeroPage_X),
+        OpCode::illegal(0x5b, "SRE", 3, 7, AddressingMode::Absolute_Y),
+        OpCode::illegal(0x5f, "SRE", 3, 7, AddressingMode::Absolute_X),
+
+        // RRA = ROR + ADC.
+        OpCode::illegal(0x63, "RRA", 2, 8, AddressingMode::Indirect_X),
+        OpCode::illegal(0x67, "RRA", 2, 5, AddressingMode::ZeroPage),
+        OpCode::illegal(0x6f, "RRA", 3, 6, AddressingMode::Absolute),
+        OpCode::illegal(0x73, "RRA", 2, 8, AddressingMode::Indirect_Y),
+        OpCode::illegal(0x77, "RRA", 2, 6, AddressingMode::ZeroPage_X),
+        OpCode::illegal(0x7b, "RRA", 3, 7, AddressingMode::Absolute_Y),
+        OpCode::illegal(0x7f, "RRA", 3, 7, AddressingMode::Absolute_X),
+
+        // Immediate combination opcodes.
+        OpCode::illegal(0x0b, "ANC", 2, 2, AddressingMode::Immediate),
+        OpCode::illegal(0x2b, "ANC", 2, 2, AddressingMode::Immediate),
+        OpCode::illegal(0x4b, "ALR", 2, 2, AddressingMode::Immediate),
+        OpCode::illegal(0x6b, "ARR", 2, 2, AddressingMode::Immediate),
+        OpCode::illegal(0xcb, "AXS", 2, 2, AddressingMode::Immediate),
+        // Unstable immediates (magic-constant dependent on real hardware).
+        OpCode::illegal(0x8b, "ANE", 2, 2, AddressingMode::Immediate),
+        OpCode::illegal(0xab, "LXA", 2, 2, AddressingMode::Immediate),
+
+        // Unstable stores (AND with the high byte of the target address + 1).
+        OpCode::illegal(0x9c, "SHY", 3, 5, AddressingMode::Absolute_X),
+        OpCode::illegal(0x9e, "SHX", 3, 5, AddressingMode::Absolute_Y),
+        OpCode::illegal(0x93, "SHA", 2, 6, AddressingMode::Indirect_Y),
+        OpCode::illegal(0x9f, "SHA", 3, 5, AddressingMode::Absolute_Y),
+        OpCode::illegal(0x9b, "TAS", 3, 5, AddressingMode::Absolute_Y),
+        OpCode::illegal(0xbb, "LAS", 3, 4 /* +1 if page crossed */, AddressingMode::Absolute_Y),
+
+        // JAM / KIL: lock the processor.
+        OpCode::illegal(0x02, "JAM", 1, 2, AddressingMode::NoneAddressing),
+        OpCode::illegal(0x12, "JAM", 1, 2, AddressingMode::NoneAddressing),
+        OpCode::illegal(0x22, "JAM", 1, 2, AddressingMode::NoneAddressing),
+        OpCode::illegal(0x32, "JAM", 1, 2, AddressingMode::NoneAddressing),
+        OpCode::illegal(0x42, "JAM", 1, 2, AddressingMode::NoneAddressing),
+        OpCode::illegal(0x52, "JAM", 1, 2, AddressingMode::NoneAddressing),
+        OpCode::illegal(0x62, "JAM", 1, 2, AddressingMode::NoneAddressing),
+        OpCode::illegal(0x72, "JAM", 1, 2, AddressingMode::NoneAddressing),
+        OpCode::illegal(0x92, "JAM", 1, 2, AddressingMode::NoneAddressing),
+        OpCode::illegal(0xb2, "JAM", 1, 2, AddressingMode::NoneAddressing),
+        OpCode::illegal(0xd2, "JAM", 1, 2, AddressingMode::NoneAddressing),
+        OpCode::illegal(0xf2, "JAM", 1, 2, AddressingMode::NoneAddressing),
 
     ];
     pub static ref OPCODES_MAP: HashMap<u8, &'static OpCode> = {

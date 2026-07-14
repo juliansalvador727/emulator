@@ -63,6 +63,11 @@ pub struct CPU<'a> {
     pub stack_pointer: u8,
     pub bus: Bus<'a>,
     additional_cycles: u8,
+    // When true, executing BRK ($00) returns from the run loop instead of
+    // taking the interrupt. This core uses BRK as the halt sentinel for
+    // nestest automation and the small `load_and_run` unit-test programs; test
+    // ROMs that exercise real BRK/IRQ semantics clear it.
+    halt_on_brk: bool,
 }
 
 pub struct CpuSnapshot {
@@ -123,7 +128,15 @@ impl<'a> CPU<'a> {
             stack_pointer: STACK_RESET,
             bus,
             additional_cycles: 0,
+            halt_on_brk: true,
         }
+    }
+
+    // Opt into real BRK/IRQ semantics (used by CPU test ROMs). With this set,
+    // BRK pushes the return address and status, sets the interrupt-disable
+    // flag, and vectors through $FFFE instead of halting the run loop.
+    pub fn set_halt_on_brk(&mut self, halt: bool) {
+        self.halt_on_brk = halt;
     }
 
     pub fn snapshot(&self) -> CpuSnapshot {
@@ -212,6 +225,53 @@ impl<'a> CPU<'a> {
         }
     }
 
+    // Indexed stores have fixed timing but always perform a dummy read at the
+    // address formed with the un-carried high byte before writing. Like the
+    // indexed-read dummy read, this is observable on hardware registers.
+    fn indexed_write_addr(&mut self, base: u16, index: u8) -> u16 {
+        let addr = base.wrapping_add(index as u16);
+        let dummy = (base & 0xff00) | (addr & 0x00ff);
+        let _ = self.mem_read(dummy);
+        addr
+    }
+
+    // Effective address for a store, issuing the indexed-store dummy read.
+    fn get_write_operand_addressing(&mut self, mode: &AddressingMode) -> u16 {
+        match mode {
+            AddressingMode::Absolute_X => {
+                let base = self.mem_read_u16(self.program_counter);
+                self.indexed_write_addr(base, self.register_x)
+            }
+            AddressingMode::Absolute_Y => {
+                let base = self.mem_read_u16(self.program_counter);
+                self.indexed_write_addr(base, self.register_y)
+            }
+            AddressingMode::Indirect_Y => {
+                let base = self.mem_read(self.program_counter);
+                let lo = self.mem_read(base as u16);
+                let hi = self.mem_read(base.wrapping_add(1) as u16);
+                let pointer = (hi as u16) << 8 | lo as u16;
+                self.indexed_write_addr(pointer, self.register_y)
+            }
+            _ => self.get_operand_addressing(mode),
+        }
+    }
+
+    // Add an index to a base address for a value read. On a page cross the
+    // 6502 spends an extra cycle and, crucially, first performs a *dummy read*
+    // from the address formed with the un-carried high byte. That access is
+    // visible when it lands on a hardware register (e.g. reading $2007 twice),
+    // so we issue it rather than only counting the cycle.
+    fn indexed_read_addr(&mut self, base: u16, index: u8) -> u16 {
+        let addr = base.wrapping_add(index as u16);
+        if (base & 0xff00) != (addr & 0xff00) {
+            self.additional_cycles += 1;
+            let dummy = (base & 0xff00) | (addr & 0x00ff);
+            let _ = self.mem_read(dummy);
+        }
+        addr
+    }
+
     // Indexed reads take one additional cycle when their effective address
     // crosses a page. Indexed stores and read-modify-write instructions have
     // fixed timings, so only value-reading operations use this helper.
@@ -219,24 +279,18 @@ impl<'a> CPU<'a> {
         match mode {
             AddressingMode::Absolute_X => {
                 let base = self.mem_read_u16(self.program_counter);
-                let addr = base.wrapping_add(self.register_x as u16);
-                self.additional_cycles += u8::from((base & 0xff00) != (addr & 0xff00));
-                addr
+                self.indexed_read_addr(base, self.register_x)
             }
             AddressingMode::Absolute_Y => {
                 let base = self.mem_read_u16(self.program_counter);
-                let addr = base.wrapping_add(self.register_y as u16);
-                self.additional_cycles += u8::from((base & 0xff00) != (addr & 0xff00));
-                addr
+                self.indexed_read_addr(base, self.register_y)
             }
             AddressingMode::Indirect_Y => {
                 let base = self.mem_read(self.program_counter);
                 let lo = self.mem_read(base as u16);
                 let hi = self.mem_read(base.wrapping_add(1) as u16);
                 let pointer = (hi as u16) << 8 | lo as u16;
-                let addr = pointer.wrapping_add(self.register_y as u16);
-                self.additional_cycles += u8::from((pointer & 0xff00) != (addr & 0xff00));
-                addr
+                self.indexed_read_addr(pointer, self.register_y)
             }
             _ => self.get_operand_addressing(mode),
         }
@@ -263,7 +317,7 @@ impl<'a> CPU<'a> {
     }
 
     fn sta(&mut self, mode: &AddressingMode) {
-        let addr = self.get_operand_addressing(mode);
+        let addr = self.get_write_operand_addressing(mode);
         self.mem_write(addr, self.register_a);
     }
 
@@ -366,7 +420,7 @@ impl<'a> CPU<'a> {
     }
 
     fn asl(&mut self, mode: &AddressingMode) -> u8 {
-        let addr = self.get_operand_addressing(mode);
+        let addr = self.get_write_operand_addressing(mode);
         let mut data = self.mem_read(addr);
         if data >> 7 == 1 {
             self.set_carry_flag();
@@ -391,7 +445,7 @@ impl<'a> CPU<'a> {
     }
 
     fn lsr(&mut self, mode: &AddressingMode) -> u8 {
-        let addr = self.get_operand_addressing(mode);
+        let addr = self.get_write_operand_addressing(mode);
         let mut data = self.mem_read(addr);
         if data & 1 == 1 {
             self.set_carry_flag();
@@ -405,7 +459,7 @@ impl<'a> CPU<'a> {
     }
 
     fn rol(&mut self, mode: &AddressingMode) -> u8 {
-        let addr = self.get_operand_addressing(mode);
+        let addr = self.get_write_operand_addressing(mode);
         let mut data = self.mem_read(addr);
         let old_carry = self.status.contains(CpuFlags::CARRY);
 
@@ -419,7 +473,7 @@ impl<'a> CPU<'a> {
             data = data | 1;
         }
         self.mem_write(addr, data);
-        self.update_negative_flags(data);
+        self.update_zero_and_negative_flags(data);
         data
     }
 
@@ -440,7 +494,7 @@ impl<'a> CPU<'a> {
     }
 
     fn ror(&mut self, mode: &AddressingMode) -> u8 {
-        let addr = self.get_operand_addressing(mode);
+        let addr = self.get_write_operand_addressing(mode);
         let mut data = self.mem_read(addr);
         let old_carry = self.status.contains(CpuFlags::CARRY);
 
@@ -454,7 +508,7 @@ impl<'a> CPU<'a> {
             data = data | 0b10000000;
         }
         self.mem_write(addr, data);
-        self.update_negative_flags(data);
+        self.update_zero_and_negative_flags(data);
         data
     }
 
@@ -472,6 +526,186 @@ impl<'a> CPU<'a> {
             data = data | 0b10000000;
         }
         self.set_register_a(data);
+    }
+
+    // ---- Undocumented ("illegal") opcodes -------------------------------
+    // The combination read-modify-write opcodes reuse the legal building
+    // blocks (`asl`/`rol`/`lsr`/`ror`), which already perform the fixed-timing
+    // `get_operand_addressing` access, the memory write-back, and the carry
+    // update, then fold the second operation into the accumulator.
+
+    // LAX: load both A and X from memory (LDA + LDX).
+    fn lax(&mut self, mode: &AddressingMode) {
+        let addr = self.get_read_operand_addressing(mode);
+        let data = self.mem_read(addr);
+        self.register_a = data;
+        self.register_x = data;
+        self.update_zero_and_negative_flags(data);
+    }
+
+    // SAX: store A & X. Affects no flags.
+    fn sax(&mut self, mode: &AddressingMode) {
+        let addr = self.get_operand_addressing(mode);
+        self.mem_write(addr, self.register_a & self.register_x);
+    }
+
+    // Undocumented NOPs still fetch their operand, so indexed-absolute forms
+    // take the page-cross penalty and every form drives the bus.
+    fn nop_read(&mut self, mode: &AddressingMode) {
+        let addr = self.get_read_operand_addressing(mode);
+        let _ = self.mem_read(addr);
+    }
+
+    // DCP: decrement memory, then CMP it against A.
+    fn dcp(&mut self, mode: &AddressingMode) {
+        let addr = self.get_write_operand_addressing(mode);
+        let data = self.mem_read(addr).wrapping_sub(1);
+        self.mem_write(addr, data);
+        self.status.set(CpuFlags::CARRY, data <= self.register_a);
+        self.update_zero_and_negative_flags(self.register_a.wrapping_sub(data));
+    }
+
+    // ISB (ISC): increment memory, then SBC it from A.
+    fn isb(&mut self, mode: &AddressingMode) {
+        let addr = self.get_write_operand_addressing(mode);
+        let data = self.mem_read(addr).wrapping_add(1);
+        self.mem_write(addr, data);
+        self.add_to_register_a((data as i8).wrapping_neg().wrapping_sub(1) as u8);
+    }
+
+    // SLO: ASL memory, then ORA into A.
+    fn slo(&mut self, mode: &AddressingMode) {
+        let data = self.asl(mode);
+        self.set_register_a(self.register_a | data);
+    }
+
+    // RLA: ROL memory, then AND into A.
+    fn rla(&mut self, mode: &AddressingMode) {
+        let data = self.rol(mode);
+        self.set_register_a(self.register_a & data);
+    }
+
+    // SRE: LSR memory, then EOR into A.
+    fn sre(&mut self, mode: &AddressingMode) {
+        let data = self.lsr(mode);
+        self.set_register_a(self.register_a ^ data);
+    }
+
+    // RRA: ROR memory, then ADC into A. ROR leaves the shifted-out bit in
+    // carry, which the ADC then consumes.
+    fn rra(&mut self, mode: &AddressingMode) {
+        let data = self.ror(mode);
+        self.add_to_register_a(data);
+    }
+
+    // ANC: AND immediate, then copy bit 7 of the result into carry.
+    fn anc(&mut self) {
+        let data = self.mem_read(self.program_counter);
+        self.set_register_a(self.register_a & data);
+        self.status.set(CpuFlags::CARRY, self.register_a & 0x80 != 0);
+    }
+
+    // ALR (ASR): AND immediate, then LSR the accumulator.
+    fn alr(&mut self) {
+        let data = self.mem_read(self.program_counter);
+        let value = self.register_a & data;
+        self.status.set(CpuFlags::CARRY, value & 1 != 0);
+        self.set_register_a(value >> 1);
+    }
+
+    // ARR: AND immediate, rotate right through carry, then derive C and V
+    // from the two high bits of the result.
+    fn arr(&mut self) {
+        let data = self.mem_read(self.program_counter);
+        let value = self.register_a & data;
+        let carry_in = self.status.contains(CpuFlags::CARRY) as u8;
+        let result = (value >> 1) | (carry_in << 7);
+        self.set_register_a(result);
+        self.status.set(CpuFlags::CARRY, result & 0x40 != 0);
+        self.status.set(
+            CpuFlags::OVERFLOW,
+            ((result >> 6) & 1) ^ ((result >> 5) & 1) != 0,
+        );
+    }
+
+    // AXS (SBX): X = (A & X) - immediate, with carry set like a compare.
+    fn axs(&mut self) {
+        let data = self.mem_read(self.program_counter);
+        let base = self.register_a & self.register_x;
+        self.status.set(CpuFlags::CARRY, base >= data);
+        self.register_x = base.wrapping_sub(data);
+        self.update_zero_and_negative_flags(self.register_x);
+    }
+
+    // ANE (XAA) and LXA are unstable: on real hardware the result depends on a
+    // fluctuating analog "magic constant" ORed into the accumulator before the
+    // AND. blargg's instr_test-v5 was captured with that constant reading as
+    // all-ones, so 0xFF reproduces its expected results; no commercial NES game
+    // relies on the exact value.
+    const MAGIC: u8 = 0xff;
+
+    fn ane(&mut self) {
+        let data = self.mem_read(self.program_counter);
+        self.set_register_a((self.register_a | Self::MAGIC) & self.register_x & data);
+    }
+
+    fn lxa(&mut self) {
+        let data = self.mem_read(self.program_counter);
+        let value = (self.register_a | Self::MAGIC) & data;
+        self.register_a = value;
+        self.register_x = value;
+        self.update_zero_and_negative_flags(value);
+    }
+
+    // The base address and index register for an indexed store, without the
+    // page-cross timing penalty (these opcodes have fixed timing).
+    fn indexed_base(&mut self, mode: &AddressingMode) -> (u16, u8) {
+        match mode {
+            AddressingMode::Absolute_X => {
+                (self.mem_read_u16(self.program_counter), self.register_x)
+            }
+            AddressingMode::Absolute_Y => {
+                (self.mem_read_u16(self.program_counter), self.register_y)
+            }
+            AddressingMode::Indirect_Y => {
+                let ptr = self.mem_read(self.program_counter);
+                let lo = self.mem_read(ptr as u16);
+                let hi = self.mem_read(ptr.wrapping_add(1) as u16);
+                ((hi as u16) << 8 | lo as u16, self.register_y)
+            }
+            _ => unreachable!("unstable store with unexpected mode {:?}", mode),
+        }
+    }
+
+    // The unstable store opcodes AND the source register with (high byte of the
+    // base address + 1). When indexing crosses a page, the high byte of the
+    // effective address is itself replaced by the stored value -- the hardware
+    // quirk blargg's instr_test checks for.
+    fn sh_store(&mut self, mode: &AddressingMode, value_from_high: impl Fn(&Self, u8) -> u8) {
+        let (base, index) = self.indexed_base(mode);
+        let high = (base >> 8) as u8;
+        let value = value_from_high(self, high.wrapping_add(1));
+        let effective = base.wrapping_add(index as u16);
+        // Like any indexed store, the dummy read at the un-carried address
+        // still happens (observable on APU registers).
+        let dummy = (base & 0xff00) | (effective & 0x00ff);
+        let _ = self.mem_read(dummy);
+        let target = if (base & 0xff00) != (effective & 0xff00) {
+            (effective & 0x00ff) | ((value as u16) << 8)
+        } else {
+            effective
+        };
+        self.mem_write(target, value);
+    }
+
+    // LAS: A, X and SP all receive (memory & SP).
+    fn las(&mut self, mode: &AddressingMode) {
+        let addr = self.get_read_operand_addressing(mode);
+        let data = self.mem_read(addr) & self.stack_pointer;
+        self.register_a = data;
+        self.register_x = data;
+        self.stack_pointer = data;
+        self.update_zero_and_negative_flags(data);
     }
 
     fn stack_pop(&mut self) -> u8 {
@@ -533,7 +767,7 @@ impl<'a> CPU<'a> {
     }
 
     fn inc(&mut self, mode: &AddressingMode) -> u8 {
-        let addr = self.get_operand_addressing(mode);
+        let addr = self.get_write_operand_addressing(mode);
         let mut data = self.mem_read(addr);
         data = data.wrapping_add(1);
         self.mem_write(addr, data);
@@ -552,7 +786,7 @@ impl<'a> CPU<'a> {
     }
 
     fn dec(&mut self, mode: &AddressingMode) -> u8 {
-        let addr = self.get_operand_addressing(mode);
+        let addr = self.get_write_operand_addressing(mode);
         let mut data = self.mem_read(addr);
         data = data.wrapping_sub(1);
         self.mem_write(addr, data);
@@ -619,6 +853,20 @@ impl<'a> CPU<'a> {
         }
     }
 
+    // Software interrupt. The pushed return address is the byte after BRK's
+    // signature byte (PC already points one past the opcode, so +1), the
+    // pushed status has B set, and execution vectors through $FFFE.
+    fn brk(&mut self) {
+        let return_addr = self.program_counter.wrapping_add(1);
+        self.stack_push_u16(return_addr);
+        let mut flag = self.status.clone();
+        flag.insert(CpuFlags::BREAK);
+        flag.insert(CpuFlags::BREAK2);
+        self.stack_push(flag.bits());
+        self.status.insert(CpuFlags::INTERRUPT_DISABLE);
+        self.program_counter = self.mem_read_u16(0xfffe);
+    }
+
     fn interrupt_nmi(&mut self) {
         self.stack_push_u16(self.program_counter);
         let mut flag = self.status.clone();
@@ -681,14 +929,6 @@ impl<'a> CPU<'a> {
         let ref opcodes: HashMap<u8, &'static opcodes::OpCode> = *opcodes::OPCODES_MAP;
 
         loop {
-            if let Some(_nmi) = self.bus.poll_nmi_status() {
-                self.interrupt_nmi();
-            }
-
-            if self.bus.poll_irq_status() && !self.status.contains(CpuFlags::INTERRUPT_DISABLE) {
-                self.interrupt_irq();
-            }
-
             if callback(self) {
                 return;
             }
@@ -698,14 +938,26 @@ impl<'a> CPU<'a> {
             let program_counter_state = self.program_counter;
             let opcode = opcodes.get(&code).unwrap();
             self.additional_cycles = 0;
+            // The maskable IRQ is recognized using the interrupt-disable flag as
+            // it stood *before* this instruction runs, so CLI, SEI, and PLP take
+            // effect one instruction late -- the 6502 polls interrupts on an
+            // instruction's penultimate cycle, before such a flag write lands.
+            let irq_disabled_before = self.status.contains(CpuFlags::INTERRUPT_DISABLE);
 
             // The CPU core executes an instruction atomically, but PPU/APU
             // register accesses occur on its final bus cycle. Advance the
             // fixed portion first so those externally visible accesses are
             // placed at the end of the instruction rather than its start.
-            // BRK remains the test/program halt sentinel used by this core.
+            // BRK is either the halt sentinel or a real software interrupt,
+            // depending on `halt_on_brk`.
             if code == 0x00 {
-                return;
+                if self.halt_on_brk {
+                    return;
+                }
+                self.bus.tick(opcode.cycles);
+                self.brk();
+                self.poll_interrupts(irq_disabled_before);
+                continue;
             }
             self.bus.tick(opcode.cycles);
 
@@ -986,8 +1238,85 @@ impl<'a> CPU<'a> {
                     self.update_zero_and_negative_flags(self.register_a);
                 }
 
+                // ---- Undocumented opcodes -------------------------------
+
+                /* NOP (implied, undocumented) */
+                0x1a | 0x3a | 0x5a | 0x7a | 0xda | 0xfa => {}
+
+                /* NOP (immediate / read, undocumented) */
+                0x80 | 0x82 | 0x89 | 0xc2 | 0xe2 | 0x04 | 0x44 | 0x64 | 0x14 | 0x34 | 0x54
+                | 0x74 | 0xd4 | 0xf4 | 0x0c | 0x1c | 0x3c | 0x5c | 0x7c | 0xdc | 0xfc => {
+                    self.nop_read(&opcode.mode);
+                }
+
+                /* LAX */
+                0xa3 | 0xa7 | 0xaf | 0xb3 | 0xb7 | 0xbf => self.lax(&opcode.mode),
+
+                /* SAX */
+                0x83 | 0x87 | 0x8f | 0x97 => self.sax(&opcode.mode),
+
+                /* SBC (undocumented) */
+                0xeb => self.sbc(&opcode.mode),
+
+                /* DCP */
+                0xc3 | 0xc7 | 0xcf | 0xd3 | 0xd7 | 0xdb | 0xdf => self.dcp(&opcode.mode),
+
+                /* ISB / ISC */
+                0xe3 | 0xe7 | 0xef | 0xf3 | 0xf7 | 0xfb | 0xff => self.isb(&opcode.mode),
+
+                /* SLO */
+                0x03 | 0x07 | 0x0f | 0x13 | 0x17 | 0x1b | 0x1f => self.slo(&opcode.mode),
+
+                /* RLA */
+                0x23 | 0x27 | 0x2f | 0x33 | 0x37 | 0x3b | 0x3f => self.rla(&opcode.mode),
+
+                /* SRE */
+                0x43 | 0x47 | 0x4f | 0x53 | 0x57 | 0x5b | 0x5f => self.sre(&opcode.mode),
+
+                /* RRA */
+                0x63 | 0x67 | 0x6f | 0x73 | 0x77 | 0x7b | 0x7f => self.rra(&opcode.mode),
+
+                /* ANC */
+                0x0b | 0x2b => self.anc(),
+                /* ALR (ASR) */
+                0x4b => self.alr(),
+                /* ARR */
+                0x6b => self.arr(),
+                /* AXS (SBX) */
+                0xcb => self.axs(),
+                /* ANE (XAA), unstable */
+                0x8b => self.ane(),
+                /* LXA, unstable */
+                0xab => self.lxa(),
+
+                /* SHY, unstable */
+                0x9c => self.sh_store(&opcode.mode, |cpu, high| cpu.register_y & high),
+                /* SHX, unstable */
+                0x9e => self.sh_store(&opcode.mode, |cpu, high| cpu.register_x & high),
+                /* SHA (AHX), unstable */
+                0x93 | 0x9f => {
+                    self.sh_store(&opcode.mode, |cpu, high| {
+                        cpu.register_a & cpu.register_x & high
+                    })
+                }
+                /* TAS (SHS), unstable */
+                0x9b => {
+                    self.stack_pointer = self.register_a & self.register_x;
+                    self.sh_store(&opcode.mode, |cpu, high| {
+                        cpu.register_a & cpu.register_x & high
+                    });
+                }
+                /* LAS, unstable */
+                0xbb => self.las(&opcode.mode),
+
+                /* JAM / KIL: the processor locks up, refetching this opcode
+                 * forever, exactly as the real 6502 does. */
+                0x02 | 0x12 | 0x22 | 0x32 | 0x42 | 0x52 | 0x62 | 0x72 | 0x92 | 0xb2 | 0xd2
+                | 0xf2 => {
+                    self.program_counter = self.program_counter.wrapping_sub(1);
+                }
+
                 0x00 => unreachable!(),
-                _ => todo!(),
             }
             // Taken-branch and indexed-read penalties are discovered while
             // executing the instruction.
@@ -996,6 +1325,19 @@ impl<'a> CPU<'a> {
             if program_counter_state == self.program_counter {
                 self.program_counter += (opcode.len - 1) as u16;
             }
+
+            self.poll_interrupts(irq_disabled_before);
+        }
+    }
+
+    // Recognize a pending interrupt at an instruction boundary. NMI wins over
+    // IRQ, and IRQ honors the interrupt-disable state sampled before the
+    // instruction so CLI/SEI/PLP are delayed by one instruction.
+    fn poll_interrupts(&mut self, irq_disabled_before: bool) {
+        if self.bus.poll_nmi_status().is_some() {
+            self.interrupt_nmi();
+        } else if !irq_disabled_before && self.bus.poll_irq_status() {
+            self.interrupt_irq();
         }
     }
 
@@ -1013,13 +1355,6 @@ impl<'a> CPU<'a> {
         }
     }
 
-    fn update_negative_flags(&mut self, result: u8) {
-        if result >> 7 == 1 {
-            self.status.insert(CpuFlags::NEGATIV)
-        } else {
-            self.status.remove(CpuFlags::NEGATIV)
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1109,6 +1444,114 @@ mod test {
         cpu.run();
 
         assert_eq!(cpu.stack_pointer, STACK_RESET);
+    }
+
+    #[test]
+    fn cli_delays_irq_by_exactly_one_instruction() {
+        // CLI, NOP, NOP with a pending IRQ. The interrupt-disable clear is
+        // delayed one instruction, so the first NOP executes before the IRQ is
+        // taken: the pushed return address is $8002, not $8001.
+        let bus = Bus::new(test::test_rom(vec![0x58, 0xea, 0xea, 0xea]), |_, _, _| {});
+        let mut cpu = CPU::new(bus);
+        cpu.bus.apu.dmc.irq_flag = true;
+
+        cpu.run();
+
+        let return_lo = cpu.mem_read(0x01fc) as u16;
+        let return_hi = cpu.mem_read(0x01fd) as u16;
+        assert_eq!(return_hi << 8 | return_lo, 0x8002);
+        assert!(cpu.status.contains(CpuFlags::INTERRUPT_DISABLE));
+    }
+
+    #[test]
+    fn brk_vectors_through_fffe_when_not_halting() {
+        // With halt-on-BRK cleared, BRK is a real software interrupt: it pushes
+        // three bytes, sets I, and jumps to the $FFFE vector (0x0000 in the
+        // zero-filled test ROM). We stop the run right after it vectors, before
+        // the $00 at $0000 would loop back into another BRK.
+        let bus = Bus::new(test::test_rom(vec![0x00]), |_, _, _| {});
+        let mut cpu = CPU::new(bus);
+        cpu.set_halt_on_brk(false);
+
+        let mut steps = 0;
+        cpu.run_until(|_| {
+            steps += 1;
+            steps == 2
+        });
+
+        assert_eq!(cpu.program_counter, 0x0000);
+        assert_eq!(cpu.stack_pointer, STACK_RESET - 3);
+        assert!(cpu.status.contains(CpuFlags::INTERRUPT_DISABLE));
+        // BRK pushes the address after its signature byte: $8000 + 2.
+        let return_lo = cpu.mem_read(0x01fc) as u16;
+        let return_hi = cpu.mem_read(0x01fd) as u16;
+        assert_eq!(return_hi << 8 | return_lo, 0x8002);
+    }
+
+    #[test]
+    fn lax_loads_both_a_and_x() {
+        // A7: LAX $10 loads the same value into A and X.
+        let bus = Bus::new(test::test_rom(vec![0xa7, 0x10, 0x00]), |_, _, _| {});
+        let mut cpu = CPU::new(bus);
+        cpu.mem_write(0x10, 0x55);
+
+        cpu.run();
+
+        assert_eq!(cpu.register_a, 0x55);
+        assert_eq!(cpu.register_x, 0x55);
+    }
+
+    #[test]
+    fn sax_stores_a_and_x() {
+        // 87: SAX $10 stores A & X without touching any flag.
+        let bus = Bus::new(test::test_rom(vec![0x87, 0x10, 0x00]), |_, _, _| {});
+        let mut cpu = CPU::new(bus);
+        cpu.register_a = 0xf0;
+        cpu.register_x = 0x3c;
+
+        cpu.run();
+
+        assert_eq!(cpu.mem_read(0x10), 0x30);
+    }
+
+    #[test]
+    fn slo_shifts_memory_then_ors_into_a() {
+        // 07: SLO $10 = ASL memory, then ORA into A.
+        let bus = Bus::new(test::test_rom(vec![0x07, 0x10, 0x00]), |_, _, _| {});
+        let mut cpu = CPU::new(bus);
+        cpu.register_a = 0x01;
+        cpu.mem_write(0x10, 0x40);
+
+        cpu.run();
+
+        assert_eq!(cpu.mem_read(0x10), 0x80); // 0x40 << 1
+        assert_eq!(cpu.register_a, 0x81); // 0x01 | 0x80
+    }
+
+    #[test]
+    fn rol_memory_updates_the_zero_flag() {
+        // 26: ROL $10 on 0x80 with carry clear yields 0x00; Z must be set.
+        let bus = Bus::new(test::test_rom(vec![0x26, 0x10, 0x00]), |_, _, _| {});
+        let mut cpu = CPU::new(bus);
+        cpu.mem_write(0x10, 0x80);
+
+        cpu.run();
+
+        assert_eq!(cpu.mem_read(0x10), 0x00);
+        assert!(cpu.status.contains(CpuFlags::ZERO));
+        assert!(cpu.status.contains(CpuFlags::CARRY));
+    }
+
+    #[test]
+    fn undocumented_nop_consumes_its_operand_and_continues() {
+        // 04 (NOP zp) is a two-byte no-op: execution proceeds to the next
+        // instruction, which loads A.
+        let bus = Bus::new(test::test_rom(vec![0x04, 0x10, 0xa9, 0x42, 0x00]), |_, _, _| {});
+        let mut cpu = CPU::new(bus);
+
+        cpu.run();
+
+        assert_eq!(cpu.register_a, 0x42);
     }
 
     #[test]
