@@ -22,17 +22,23 @@ documentation and test ROMs are the sources of truth for hardware behaviour.
 - Automatic recovery from wedged host audio (stall watchdog with staged
   resume/clear/reopen; device open/close isolated on a helper thread)
 - One standard controller through `$4016`
+- On-launch game-selection menu: an arrow-key ROM picker that scans `games/`,
+  drawn through the same 256×240 frame pipeline as gameplay
 - Fullscreen and borderless windowed-fullscreen with aspect-correct black bars
-- Native Windows cross-build from WSL (`cargo win`)
+- Native Windows cross-build from WSL, wired as the default `cargo run` target
 - Headless performance probes and deterministic visual regression tests
 
-The test suite currently contains 220 passing tests. The prioritized remaining
+The test suite currently contains 224 passing tests. The prioritized remaining
 work is tracked in [`nes_emulator/TODO.md`](nes_emulator/TODO.md).
 
 ## Requirements
 
 - A current Rust toolchain
 - A C compiler and CMake (to build the bundled SDL3 runtime)
+- The mingw-w64 toolchain and the `x86_64-pc-windows-gnu` Rust target, since
+  that is the default build target on this project (see
+  [Native Windows build](#native-windows-build-preferred-on-wsl-hosts) for
+  setup); native-Linux builds via `cargo lin*` need only the C compiler and CMake
 
 On Debian or Ubuntu:
 
@@ -43,21 +49,49 @@ sudo apt install build-essential cmake
 ROM images are not required to build or run the unit tests. Only use ROMs that
 you are legally permitted to use.
 
-## Build and test
+## Default build target
 
-Run commands from the Rust project directory:
+`nes_emulator/.cargo/config.toml` sets the default cargo target to
+`x86_64-pc-windows-gnu`, so a bare `cargo run` / `cargo build` / `cargo test`
+cross-compiles to a native Windows binary — and `cargo run` launches it through
+WSL interop. This is deliberate: under WSL2 the WSLg audio bridge adds latency
+and can wedge, while a real Windows process talks straight to WASAPI (see
+[Native Windows build](#native-windows-build-preferred-on-wsl-hosts)). The
+first Windows build is slow because SDL3 compiles from source.
+
+Native-Linux builds and tests — the fast iteration path, since they skip the
+mingw link and interop launch — are available through one-word aliases (an
+explicit `--target x86_64-unknown-linux-gnu` on any cargo command is
+equivalent):
 
 ```bash
 cd nes_emulator
-cargo build --release
-cargo test
+cargo lin-build                  # build on native Linux
+cargo lin-test                   # run the unit tests on native Linux
+cargo lin -- games/pacman.nes    # run a game on native Linux
 ```
 
-Run a game by passing its path:
+## Build and test
+
+```bash
+cd nes_emulator
+cargo build --release            # Windows binary (default target)
+cargo lin-test                   # unit tests, native Linux
+```
+
+Run a game by passing its path (default target is Windows via WSL interop; use
+`cargo lin -- <rom>` to run natively on Linux instead):
 
 ```bash
 cargo run --release -- games/pacman.nes
 cargo run --release -- /path/to/game.nes
+```
+
+With no ROM argument, launch opens the [game-selection
+menu](#game-selection-menu):
+
+```bash
+cargo run --release
 ```
 
 For the lowest host latency on a native audio stack, select the low-latency
@@ -94,7 +128,24 @@ server returns. If WSLg audio dies permanently, `wsl --shutdown` from Windows
 PowerShell is the only full reset; running natively on Windows (below) avoids
 the problem entirely.
 
-With no argument, the emulator tries `games/pacman.nes`.
+### Game-selection menu
+
+Launched with no ROM argument, the emulator opens a selection screen instead of
+booting a fixed game. It scans the `games/` directory for `.nes` files and lists
+them alphabetically; drop a new ROM into the folder and it appears
+automatically. The screen is rendered with a built-in bitmap font into the same
+256×240 frame the emulator presents for gameplay, so it inherits the aspect-
+correct scaling and fullscreen handling.
+
+| Menu action    | Keyboard         |
+| -------------- | ---------------- |
+| Move selection | Up / Down        |
+| Launch game    | Enter or Space   |
+| Quit           | Escape           |
+
+Pressing Escape during a game returns to this menu rather than quitting; closing
+the window quits the program. Passing a ROM path bypasses the menu and boots
+straight into that game.
 
 ### Fullscreen
 
@@ -110,24 +161,28 @@ bars instead of stretching:
 Under WSL2, audio crosses the WSLg RDP bridge, which adds latency and can
 wedge mid-session. Building for Windows lets SDL3 talk directly to WASAPI and
 the compositor — measured result: no audio, fps, or input-latency issues, and
-lower latency targets (20 ms) work. One-time setup:
+lower latency targets (20 ms) work. Because this is the good path on a WSL host,
+`x86_64-pc-windows-gnu` is the **default** cargo target (see [Default build
+target](#default-build-target)). One-time setup:
 
 ```bash
 sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
 rustup target add x86_64-pc-windows-gnu
 ```
 
-Then, from `nes_emulator/`, build and run the Windows binary straight from the
-WSL shell (it launches as a real Windows process via WSL interop):
+A bare `cargo run -- ../games/mario.nes` now builds and launches the Windows
+binary straight from the WSL shell (it runs as a real Windows process via WSL
+interop). `.cargo/config.toml` also defines convenience aliases:
 
 ```bash
-cargo win -- ../games/mario.nes --fullscreen
+cargo win -- ../games/mario.nes --fullscreen   # same as cargo run, but --release
+cargo win-build                                 # release Windows build, no launch
+cargo lin -- ../games/mario.nes                 # run on native Linux instead
 ```
 
-`cargo win` and `cargo win-build` are aliases in `nes_emulator/.cargo/config.toml`.
 The first build is slow because SDL3 compiles from source. The `.exe` at
-`target/x86_64-pc-windows-gnu/release/julian_nes_emulator.exe` also runs from
-the Windows side directly. Native Windows builds always default to the
+`target/x86_64-pc-windows-gnu/{debug,release}/julian_nes_emulator.exe` also runs
+from the Windows side directly. Native Windows builds always default to the
 low-latency audio profile; the WSL detection is compile-time-disabled there
 because `WSL_DISTRO_NAME` leaks into Windows processes launched from WSL.
 
@@ -141,15 +196,21 @@ because `WSL_DISTRO_NAME` leaks into Windows processes launched from WSL.
 | Select      | Space      |
 | Start       | Enter      |
 | Fullscreen  | F11        |
-| Quit        | Escape     |
+| Back / quit | Escape     |
+
+Escape returns to the [game-selection menu](#game-selection-menu) when the game
+was launched from it, and otherwise quits.
 
 ## Validation and diagnostics
+
+These run on the native-Linux target via the `cargo lin` alias — that keeps the
+trace output line-ending-clean for the diff and skips the interop launch.
 
 Run the bundled `nestest` trace mode:
 
 ```bash
 cd nes_emulator
-cargo run -- nestest > mynes.log 2>/dev/null
+cargo lin -- nestest > mynes.log 2>/dev/null
 diff <(sed 's/ PPU:.*//' nestest.log | head -n "$(wc -l < mynes.log)") mynes.log
 ```
 
@@ -159,7 +220,7 @@ reaches its first unofficial opcode.
 Run a headless optimized probe with optional scripted input:
 
 ```bash
-cargo run --release -- probe games/mario.nes "start@120-135,right@350-" 2100
+cargo lin --release -- probe games/mario.nes "start@120-135,right@350-" 2100
 ```
 
 The probe reports frame timing, audio production and drift, frame hashes, DMA
@@ -171,8 +232,8 @@ options and the visual-regression runner.
 Inspect a CHR tile in an SDL window:
 
 ```bash
-cargo run -- tiles
-cargo run -- tiles /path/to/game.nes
+cargo lin -- tiles
+cargo lin -- tiles /path/to/game.nes
 ```
 
 ## Known limitations
