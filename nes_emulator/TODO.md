@@ -17,6 +17,10 @@ Current verified baseline (2026-07-14):
 - Five-channel APU including DMC DMA, filtering, and SDL3 bound-stream playback.
 - Audio stall watchdog with staged recovery; stream open/destroy isolated on a
   helper thread (see the host audio section below for the WSLg failure model).
+- Host audio uses the safe sdl3 crate API; the direct sdl3-sys dependency is
+  gone and the only remaining `unsafe` is two documented `impl Send` markers in
+  `src/audio.rs` (the crate's !Send audio types are conservative; SDL3 streams
+  are internally locked and documented thread-safe).
 - Fullscreen (`--fullscreen`, F11) and borderless windowed-fullscreen
   (`--windowed-fullscreen`/`--borderless`) with aspect-correct letterboxing.
 - Native Windows cross-build via `cargo win` (mingw-w64, aliases in

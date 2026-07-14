@@ -7,20 +7,13 @@
 // runtime so its device/event state follows the same lifecycle as that frontend.
 
 use std::collections::VecDeque;
-use std::ffi::CStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
-use sdl3_sys::audio::{
-    SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, SDL_AUDIO_S16, SDL_AudioSpec, SDL_AudioStream,
-    SDL_AudioStreamDevicePaused, SDL_ClearAudioStream, SDL_DestroyAudioStream,
-    SDL_GetAudioStreamQueued, SDL_OpenAudioDeviceStream, SDL_PutAudioStreamData,
-    SDL_ResumeAudioStreamDevice,
-};
-use sdl3_sys::error::SDL_GetError;
-use sdl3_sys::init::{SDL_INIT_AUDIO, SDL_InitSubSystem};
+use sdl3::AudioSubsystem;
+use sdl3::audio::{AudioFormat, AudioSpec, AudioStreamOwner};
 
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const HOST_SAMPLE_BYTES: u32 = std::mem::size_of::<i16>() as u32;
@@ -311,11 +304,21 @@ impl AudioPump {
             backpressure_events: AtomicU64::new(0),
             device_resumes: AtomicU64::new(0),
         });
+        // Acquire the audio subsystem on the caller's thread: the safe sdl3
+        // context is main-thread-only, and its init is refcounted so this
+        // coexists with the frontend's own sdl3::init().
+        let subsystem = match sdl3::init().and_then(|sdl| sdl.audio()) {
+            Ok(subsystem) => Some(SendAudioSubsystem(subsystem)),
+            Err(error) => {
+                eprintln!("SDL3 audio subsystem unavailable ({error}); running without audio");
+                None
+            }
+        };
         let (tx, rx) = std::sync::mpsc::channel();
         let thread_stats = Arc::clone(&stats);
         std::thread::Builder::new()
             .name("audio-pump".into())
-            .spawn(move || pump_thread(rx, thread_stats, config))
+            .spawn(move || pump_thread(rx, thread_stats, config, subsystem))
             .expect("failed to spawn audio pump thread");
         Self { stats, tx }
     }
@@ -382,89 +385,29 @@ impl AudioPacer {
     }
 }
 
-fn sdl3_error() -> String {
-    let error = SDL_GetError();
-    if error.is_null() {
-        "unknown SDL3 error".into()
-    } else {
-        unsafe { CStr::from_ptr(error) }
-            .to_string_lossy()
-            .into_owned()
-    }
-}
+// The sdl3 crate conservatively marks its audio types !Send because they hold
+// raw SDL pointers. SDL3 audio streams carry their own lock and their
+// functions are documented as callable from any thread; these wrappers exist
+// only so ownership can move between the pump and opener threads, and they
+// are the only unsafe code in this crate.
+struct SendAudioSubsystem(AudioSubsystem);
+unsafe impl Send for SendAudioSubsystem {}
 
-struct Sdl3AudioStream {
-    raw: *mut SDL_AudioStream,
-}
+struct SendStream(AudioStreamOwner);
+unsafe impl Send for SendStream {}
 
-impl Sdl3AudioStream {
-    fn open() -> Result<Self, String> {
-        let initialized = unsafe { SDL_InitSubSystem(SDL_INIT_AUDIO) };
-        if !initialized {
-            return Err(sdl3_error());
-        }
-        let spec = SDL_AudioSpec {
-            format: SDL_AUDIO_S16,
-            channels: 1,
-            freq: SAMPLE_RATE as i32,
-        };
-        let raw = unsafe {
-            SDL_OpenAudioDeviceStream(
-                SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
-                &spec,
-                None,
-                std::ptr::null_mut(),
-            )
-        };
-        if raw.is_null() {
-            Err(sdl3_error())
-        } else {
-            Ok(Self { raw })
-        }
-    }
-
-    fn queue(&self, samples: &[f32]) -> bool {
-        let pcm = pcm_s16(samples);
-        unsafe {
-            SDL_PutAudioStreamData(
-                self.raw,
-                pcm.as_ptr().cast(),
-                (pcm.len() as i32).saturating_mul(HOST_SAMPLE_BYTES as i32),
-            )
-        }
-    }
-
-    fn queued_bytes(&self) -> Result<u32, String> {
-        let queued = unsafe { SDL_GetAudioStreamQueued(self.raw) };
-        if queued < 0 {
-            Err(sdl3_error())
-        } else {
-            Ok(queued as u32)
-        }
-    }
-
-    fn resume(&self) -> bool {
-        unsafe { SDL_ResumeAudioStreamDevice(self.raw) }
-    }
-
-    fn device_paused(&self) -> bool {
-        unsafe { SDL_AudioStreamDevicePaused(self.raw) }
-    }
-
-    fn clear(&self) -> bool {
-        unsafe { SDL_ClearAudioStream(self.raw) }
-    }
-}
-
-// SDL3 audio streams carry their own lock and their functions are documented
-// as callable from any thread; ownership only moves across threads so that
-// create/destroy can run on the opener thread.
-unsafe impl Send for Sdl3AudioStream {}
-
-impl Drop for Sdl3AudioStream {
-    fn drop(&mut self) {
-        unsafe { SDL_DestroyAudioStream(self.raw) }
-    }
+fn open_stream(subsystem: &SendAudioSubsystem) -> Result<SendStream, String> {
+    let spec = AudioSpec {
+        freq: Some(SAMPLE_RATE as i32),
+        channels: Some(1),
+        format: Some(AudioFormat::s16_sys()),
+    };
+    subsystem
+        .0
+        .default_playback_device()
+        .open_device_stream(Some(&spec))
+        .map(SendStream)
+        .map_err(|error| error.to_string())
 }
 
 fn publish_stats(stats: &AudioStats, queued: u32, pending_samples: usize) {
@@ -485,11 +428,36 @@ fn mark_unavailable(stats: &AudioStats) {
         .store(BACKLOG_UNAVAILABLE, Ordering::Relaxed);
 }
 
-fn pump_thread(rx: Receiver<Vec<f32>>, stats: Arc<AudioStats>, config: AudioConfig) {
+fn pump_thread(
+    rx: Receiver<Vec<f32>>,
+    stats: Arc<AudioStats>,
+    config: AudioConfig,
+    subsystem: Option<SendAudioSubsystem>,
+) {
+    // Without a host audio subsystem there is nothing to open: stay alive to
+    // discard producer samples so gameplay continues unaffected.
+    let Some(subsystem) = subsystem else {
+        mark_unavailable(&stats);
+        loop {
+            loop {
+                match rx.try_recv() {
+                    Ok(samples) => {
+                        stats
+                            .dropped_samples
+                            .fetch_add(samples.len() as u64, Ordering::Relaxed);
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => return,
+                }
+            }
+            std::thread::sleep(TICK);
+        }
+    };
+
     let target_samples = config.target_queued_samples();
     let high_water_samples = config.high_water_samples();
     let target_bytes = target_samples.saturating_mul(HOST_SAMPLE_BYTES);
-    let mut stream: Option<Sdl3AudioStream> = None;
+    let mut stream: Option<SendStream> = None;
     let mut pending = VecDeque::new();
     let mut chunk = Vec::with_capacity(config.device_samples as usize);
     let mut corrector = ClockCorrector::new();
@@ -505,16 +473,15 @@ fn pump_thread(rx: Receiver<Vec<f32>>, stats: Arc<AudioStats>, config: AudioConf
     // WSLg/Pulse server and can block indefinitely once it stops responding.
     // Both run on a helper thread so a hung call leaves this thread alive to
     // drain the producer channel and keep `pending` bounded.
-    let (open_request_tx, open_request_rx) =
-        std::sync::mpsc::channel::<Option<Sdl3AudioStream>>();
+    let (open_request_tx, open_request_rx) = std::sync::mpsc::channel::<Option<SendStream>>();
     let (open_result_tx, open_result_rx) =
-        std::sync::mpsc::channel::<Result<Sdl3AudioStream, String>>();
+        std::sync::mpsc::channel::<Result<SendStream, String>>();
     std::thread::Builder::new()
         .name("audio-open".into())
         .spawn(move || {
             while let Ok(old_stream) = open_request_rx.recv() {
                 drop(old_stream);
-                if open_result_tx.send(Sdl3AudioStream::open()).is_err() {
+                if open_result_tx.send(open_stream(&subsystem)).is_err() {
                     return;
                 }
             }
@@ -578,8 +545,8 @@ fn pump_thread(rx: Receiver<Vec<f32>>, stats: Arc<AudioStats>, config: AudioConf
         }
 
         if let Some(active) = &stream {
-            let mut queued = match active.queued_bytes() {
-                Ok(queued) => queued,
+            let mut queued = match active.0.queued_bytes() {
+                Ok(queued) => queued.max(0) as u32,
                 Err(error) => {
                     eprintln!("SDL3 audio queue query failed ({error}); reopening stream");
                     let _ = open_request_tx.send(stream.take());
@@ -621,11 +588,11 @@ fn pump_thread(rx: Receiver<Vec<f32>>, stats: Arc<AudioStats>, config: AudioConf
                 if take > 0 {
                     corrector.render(&mut pending, &mut chunk, take);
                 }
-                if !chunk.is_empty() && !active.queue(&chunk) {
-                    eprintln!(
-                        "SDL3 audio queue failed ({}); reopening stream",
-                        sdl3_error()
-                    );
+                if let Err(error) = (!chunk.is_empty())
+                    .then(|| active.0.put_data_i16(&pcm_s16(&chunk)))
+                    .unwrap_or(Ok(()))
+                {
+                    eprintln!("SDL3 audio queue failed ({error}); reopening stream");
                     stats
                         .dropped_samples
                         .fetch_add(chunk.len() as u64, Ordering::Relaxed);
@@ -649,17 +616,20 @@ fn pump_thread(rx: Receiver<Vec<f32>>, stats: Arc<AudioStats>, config: AudioConf
 
             if let Some(active) = &stream {
                 if !started && queued >= target_bytes {
-                    if active.resume() {
-                        started = true;
-                    } else {
-                        eprintln!("SDL3 audio resume failed ({})", sdl3_error());
+                    match active.0.resume() {
+                        Ok(()) => started = true,
+                        Err(error) => eprintln!("SDL3 audio resume failed ({error})"),
                     }
                 }
 
                 // Device changes and RDP reconnects can leave an otherwise
                 // valid bound stream paused. Recover it in place; destroying
                 // and reopening the stream is much more disruptive on WSLg.
-                if started && backpressured && active.device_paused() && active.resume() {
+                if started
+                    && backpressured
+                    && active.0.device_paused().unwrap_or(false)
+                    && active.0.resume().is_ok()
+                {
                     stats.device_resumes.fetch_add(1, Ordering::Relaxed);
                 }
 
@@ -671,7 +641,7 @@ fn pump_thread(rx: Receiver<Vec<f32>>, stats: Arc<AudioStats>, config: AudioConf
                 match watchdog.observe(saturated, Instant::now()) {
                     StallAction::None => {}
                     StallAction::Resume => {
-                        if active.resume() {
+                        if active.0.resume().is_ok() {
                             stats.device_resumes.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -680,14 +650,14 @@ fn pump_thread(rx: Receiver<Vec<f32>>, stats: Arc<AudioStats>, config: AudioConf
                         // discontinuous; discarding the frozen queue restarts
                         // writes from empty and, when it works, avoids the far
                         // more hazardous destroy/reopen path.
-                        if active.clear() {
+                        if active.0.clear().is_ok() {
                             stats.dropped_samples.fetch_add(
                                 u64::from(queued_raw / HOST_SAMPLE_BYTES),
                                 Ordering::Relaxed,
                             );
                             corrector.reset_position();
                         }
-                        if active.resume() {
+                        if active.0.resume().is_ok() {
                             stats.device_resumes.fetch_add(1, Ordering::Relaxed);
                         }
                     }
