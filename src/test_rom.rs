@@ -33,8 +33,21 @@ pub fn run(path: &str, max_instructions: u64) -> Result<(), String> {
     let mut protocol_started = false;
     let mut result = None;
     let mut legacy_result = false;
+    let print_hook = std::env::var("PRINT_HOOK")
+        .ok()
+        .and_then(|s| u16::from_str_radix(s.trim_start_matches("0x"), 16).ok());
+    let mut captured = String::new();
     cpu.run_until(|cpu| {
         instructions += 1;
+        if let Some(hook) = print_hook {
+            if cpu.program_counter == hook {
+                captured.push(cpu.register_a as char);
+                if captured.trim_end().ends_with("Passed") || captured.trim_end().ends_with("Failed")
+                {
+                    return true;
+                }
+            }
+        }
         let status = cpu.mem_read(STATUS_ADDR);
         let signature = [
             cpu.mem_read(SIGNATURE_ADDR),
@@ -64,6 +77,10 @@ pub fn run(path: &str, max_instructions: u64) -> Result<(), String> {
         }
         instructions >= max_instructions
     });
+
+    if print_hook.is_some() {
+        eprintln!("PRINT_CAPTURE ({instructions} instrs):\n{captured}\n--- end capture ---");
+    }
 
     let status = result.ok_or_else(|| {
         if protocol_started {

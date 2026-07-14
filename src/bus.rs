@@ -213,7 +213,14 @@ impl<'a> Bus<'a> {
             return;
         };
         self.dmc_pending_ticks = 0;
-        for _ in 0..3 {
+        // The DMC's get (sample fetch) must land on a "get" cycle. RDY halts the
+        // CPU for a halt + dummy cycle, re-reading its own address, plus one
+        // extra alignment cycle when the get would otherwise fall on a "put"
+        // (odd) cycle. That is the 2-or-3 extra reads real hardware performs on
+        // a DMC-DMA-during-read, rather than a fixed three. The get read is
+        // aligned to an odd global cycle, matching the OAM DMA get alignment.
+        let stalls = if self.cycles % 2 == 0 { 3 } else { 2 };
+        for _ in 0..stalls {
             if let Some(addr) = re_read {
                 let _ = self.mem_read(addr);
             }
