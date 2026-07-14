@@ -20,10 +20,14 @@ behaviour.
 - Fetch-driven MMC3 IRQs using qualified PPU A12 edges
 - Pulse, triangle, noise, and DMC audio with IRQs, DMA, filtering, and SDL3
   playback
+- Automatic recovery from wedged host audio (stall watchdog with staged
+  resume/clear/reopen; device open/close isolated on a helper thread)
 - One standard controller through `$4016`
+- Fullscreen and borderless windowed-fullscreen with aspect-correct black bars
+- Native Windows cross-build from WSL (`cargo win`)
 - Headless performance probes and deterministic visual regression tests
 
-The test suite currently contains 211 passing tests. The prioritized remaining
+The test suite currently contains 220 passing tests. The prioritized remaining
 work is tracked in [`nes_emulator/TODO.md`](nes_emulator/TODO.md).
 
 ## Requirements
@@ -79,19 +83,55 @@ sampled-input-to-controller-poll time once per second. SDL queue inspection and
 submission happen at most once every 16 ms, matching the stable C frontend's
 frame-rate cadence. Queue pressure is bounded without clearing the live SDL
 stream: feeding stops at the target and only excess not-yet-submitted samples
-are discarded. A bound device found paused under backpressure is resumed in
-place; the emulator never waits for a blocked WSLg device close. The equivalent
-environment variables are `NES_AUDIO_PROFILE`, `NES_AUDIO_LATENCY_MS`,
-`NES_RUN_AHEAD_FRAMES`, and `NES_LATENCY_DEBUG`.
+are discarded. The equivalent environment variables are `NES_AUDIO_PROFILE`,
+`NES_AUDIO_LATENCY_MS`, `NES_RUN_AHEAD_FRAMES`, and `NES_LATENCY_DEBUG`.
 
-If audio goes silent, `backpressure` climbs continuously, and
-`/mnt/wslg/pulseaudio.log` contains
-`rdp-sink ... data_send: send failed`, the Windows-side WSLg audio transport has
-failed; no Linux audio client can consume normally in that state. Run
-`wsl --shutdown` from Windows PowerShell, then reopen the distro before testing
-again.
+A stall watchdog recovers wedged host audio automatically: sustained
+backpressure triggers an in-place resume after 250 ms, a queue clear at
+600 ms, and a full stream reopen at 1.25 s, with recovery only trusted after
+500 ms of continuous health. Stream open/destroy run on a helper thread, so
+even an SDL call that blocks forever (a fully wedged WSLg server) leaves
+gameplay, video, and memory bounds intact — audio simply stays off until the
+server returns. If WSLg audio dies permanently, `wsl --shutdown` from Windows
+PowerShell is the only full reset; running natively on Windows (below) avoids
+the problem entirely.
 
 With no argument, the emulator tries `games/pacman.nes`.
+
+### Fullscreen
+
+Both modes preserve the NES aspect ratio, filling leftover space with black
+bars instead of stretching:
+
+- `--fullscreen` (or F11 in-game): SDL fullscreen at desktop resolution.
+- `--windowed-fullscreen` (alias `--borderless`): a borderless window covering
+  the desktop; alt-tabs like a normal window and never owns the display mode.
+
+### Native Windows build (preferred on WSL hosts)
+
+Under WSL2, audio crosses the WSLg RDP bridge, which adds latency and can
+wedge mid-session. Building for Windows lets SDL3 talk directly to WASAPI and
+the compositor — measured result: no audio, fps, or input-latency issues, and
+lower latency targets (20 ms) work. One-time setup:
+
+```bash
+sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
+rustup target add x86_64-pc-windows-gnu
+```
+
+Then, from `nes_emulator/`, build and run the Windows binary straight from the
+WSL shell (it launches as a real Windows process via WSL interop):
+
+```bash
+cargo win -- ../games/mario.nes --fullscreen
+```
+
+`cargo win` and `cargo win-build` are aliases in `nes_emulator/.cargo/config.toml`.
+The first build is slow because SDL3 compiles from source. The `.exe` at
+`target/x86_64-pc-windows-gnu/release/julian_nes_emulator.exe` also runs from
+the Windows side directly. Native Windows builds always default to the
+low-latency audio profile; the WSL detection is compile-time-disabled there
+because `WSL_DISTRO_NAME` leaks into Windows processes launched from WSL.
 
 ### Controls
 
@@ -102,6 +142,7 @@ With no argument, the emulator tries `games/pacman.nes`.
 | B           | S          |
 | Select      | Space      |
 | Start       | Enter      |
+| Fullscreen  | F11        |
 | Quit        | Escape     |
 
 ## Validation and diagnostics

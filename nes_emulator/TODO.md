@@ -1,20 +1,27 @@
 # NES Emulator — Consolidated Roadmap
 
-This is the single source of truth for unfinished work in this repository.
-`PPU_PLAN.md` and `MAPPER_PLAN.md` are historical implementation handoffs, not
-current plans. The Rust emulator under `nes_emulator/` is the active project;
-the older C emulator under `NES/` is retained as a reference and has a separate,
-lower-priority backlog at the end of this file.
+This is the single source of truth for unfinished work in this repository, and
+the consolidation point for important operational knowledge (host audio failure
+model, native Windows build). The Rust emulator under `nes_emulator/` is the
+active project; the older C emulator under `NES/` is retained as a reference
+and has a separate, lower-priority backlog at the end of this file.
 
 Current verified baseline (2026-07-14):
 
-- 211 passing Rust tests.
+- 220 passing Rust tests.
 - All official 6502 opcodes; `nestest` matches 5,003 official-opcode entries.
 - NROM, MMC1, UxROM, CNROM, MMC3, AxROM, and GxROM/GNROM.
 - Dot-driven background and sprite rendering with mapper-visible PPU fetches.
 - P1 PPU register and memory behavior complete; DMA/bus timing is the next
   active P1 foundation.
 - Five-channel APU including DMC DMA, filtering, and SDL3 bound-stream playback.
+- Audio stall watchdog with staged recovery; stream open/destroy isolated on a
+  helper thread (see the host audio section below for the WSLg failure model).
+- Fullscreen (`--fullscreen`, F11) and borderless windowed-fullscreen
+  (`--windowed-fullscreen`/`--borderless`) with aspect-correct letterboxing.
+- Native Windows cross-build via `cargo win` (mingw-w64, aliases in
+  `.cargo/config.toml`); verified on hardware with no audio/fps/latency issues.
+  Native Windows is the preferred way to play on WSL hosts.
 - Deterministic visual regressions for SMB1, Zelda, and SMB2.
 - Two-minute release probes exceed real-time performance with stable sample
   production; see `probes/RESULTS.md`.
@@ -157,10 +164,49 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
 
 ## P1 — Low-latency host presentation, input, and audio
 
-Status: implementation complete; real-device WSLg acceptance is pending. The
+Status: implementation complete and validated on native Windows hardware. The
 normal path preserves console timing, while optional run-ahead reduces
 game-internal response latency without committing speculative machine or audio
 state.
+
+### Host audio failure model and recovery (consolidated from fix_apu.md)
+
+The WSLg/Pulse audio server wedges nondeterministically mid-session: the SDL3
+bound stream stops being consumed while `SDL_AudioStreamDevicePaused` still
+reports active. Observed on hardware (2026-07-14):
+
+- The queue freezes exactly at target, shutting the write gate; every fresh
+  sample then drops as backpressure while `underflows`/`reopens` stay 0.
+- A resume on the wedged stream "succeeds" and drains about one device buffer
+  before re-freezing, so equality-based freeze detection resets and never
+  escalates. Sustained backpressure is the reliable stall signal — a healthy
+  stream shows none at all.
+- After destroying a wedged stream, `SDL_OpenAudioDeviceStream` can block
+  forever (the server is wedged process-wide). Any blocking SDL open/destroy
+  on the pump thread would freeze stats and leak the unbounded producer
+  channel.
+
+Implemented response (`src/audio.rs`): a `StallWatchdog` keyed on sustained
+backpressure escalates resume (250 ms) → clear+resume (600 ms) → destroy and
+reopen (1.25 s), trusting recovery only after 500 ms of continuous health;
+open/destroy run on the `audio-open` helper thread so a hung SDL call leaves
+the pump draining and `pending` bounded. Residual limitation: if the open
+blocks forever, audio stays off for that session (one stuck helper thread);
+gameplay/video/input continue and only `wsl --shutdown` restores WSLg audio.
+
+- [ ] If WSLg wedges recur in practice, verify the clear+resume stage recovers
+  in place at least sometimes; otherwise consider retrying the blocked open on
+  a second helper thread with a cap.
+
+### Native Windows build (consolidated from windows.md)
+
+Running natively removes the WSLg bridge entirely — verified: no latency, fps,
+or audio issues, and lower latency targets (20 ms) work on WASAPI. `cargo win
+-- <rom>` cross-compiles with mingw-w64 (`gcc-mingw-w64-x86-64`,
+`g++-mingw-w64-x86-64`, `rustup target add x86_64-pc-windows-gnu`) and launches
+the `.exe` through WSL interop. Native builds pin the LowLatency profile at
+compile time because `WSL_DISTRO_NAME` leaks into Windows processes launched
+from a WSL shell. See README for user-facing instructions.
 
 - [x] Raise a host `frame_ready` event at the start of vblank independently of
   NMI enable, and service it before any NMI-handler controller poll.

@@ -30,7 +30,38 @@ use std::path::{Path, PathBuf};
 
 use sdl3::event::Event;
 use sdl3::keyboard::Keycode;
-use sdl3::pixels::PixelFormat;
+use sdl3::pixels::{Color, PixelFormat};
+use sdl3::render::{FRect, ScaleMode};
+
+const NES_WIDTH: u32 = 256;
+const NES_HEIGHT: u32 = 240;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowMode {
+    Windowed,
+    /// SDL fullscreen (borderless at desktop resolution; the compositor may
+    /// still promote it to exclusive flip on Windows).
+    Fullscreen,
+    /// A plain borderless window covering the desktop: looks fullscreen but
+    /// alt-tabs like any window and never owns the display mode.
+    WindowedFullscreen,
+}
+
+// Largest 256x240 rectangle that fits the output, centered, so fullscreen
+// keeps the NES aspect and fills the remainder with black bars instead of
+// stretching. At the 3x windowed size this is exactly the full window.
+fn letterbox_rect(output_width: u32, output_height: u32) -> FRect {
+    let scale =
+        (output_width as f32 / NES_WIDTH as f32).min(output_height as f32 / NES_HEIGHT as f32);
+    let width = NES_WIDTH as f32 * scale;
+    let height = NES_HEIGHT as f32 * scale;
+    FRect::new(
+        (output_width as f32 - width) / 2.0,
+        (output_height as f32 - height) / 2.0,
+        width,
+        height,
+    )
+}
 
 // Runs a game ROM, presenting the PPU's frame to an SDL3 window. The frontend
 // stops the CPU at each vblank boundary, samples input before the game's NMI
@@ -40,26 +71,47 @@ fn run_game(
     audio_config: audio::AudioConfig,
     latency_debug: bool,
     run_ahead_frames: u8,
+    window_mode: WindowMode,
 ) {
     let sdl_context = sdl3::init().unwrap();
     let video_subsystem = sdl_context.video().unwrap();
-    let window = video_subsystem
-        .window("NES game", (256.0 * 3.0) as u32, (240.0 * 3.0) as u32)
-        .position_centered()
-        .build()
-        .unwrap();
+    let window_builder = match window_mode {
+        WindowMode::WindowedFullscreen => {
+            let bounds = video_subsystem
+                .get_primary_display()
+                .and_then(|display| display.get_bounds())
+                .unwrap();
+            let mut builder =
+                video_subsystem.window("NES game", bounds.width(), bounds.height());
+            builder.borderless().position(bounds.x(), bounds.y());
+            builder
+        }
+        WindowMode::Windowed | WindowMode::Fullscreen => {
+            let mut builder =
+                video_subsystem.window("NES game", NES_WIDTH * 3, NES_HEIGHT * 3);
+            builder.position_centered();
+            if window_mode == WindowMode::Fullscreen {
+                builder.fullscreen();
+            }
+            builder
+        }
+    };
+    let window = window_builder.build().unwrap();
+    let mut fullscreen = window_mode == WindowMode::Fullscreen;
 
     // No present_vsync: the emulator is paced by the NES frame timer below.
     // Pacing by vsync instead would tie the game speed to the display's
     // refresh rate, which never quite matches the NES's 60.0988 fps.
     let mut canvas = window.into_canvas();
     let mut event_pump = sdl_context.event_pump().unwrap();
-    canvas.set_scale(3.0, 3.0).unwrap();
 
     let creator = canvas.texture_creator();
     let mut texture = creator
-        .create_texture_target(PixelFormat::RGB24, 256, 240)
+        .create_texture_target(PixelFormat::RGB24, NES_WIDTH, NES_HEIGHT)
         .unwrap();
+    // Nearest keeps pixels crisp at fullscreen's non-integer scales and is
+    // identical to linear at the exact 3x windowed scale.
+    texture.set_scale_mode(ScaleMode::Nearest);
 
     // All audio-device work happens on the pump's own thread (see
     // src/audio.rs); the game loop just pushes samples and reads the
@@ -150,8 +202,13 @@ fn run_game(
         let frame = run_ahead_frame
             .as_ref()
             .unwrap_or_else(|| cpu.bus.ppu().frame());
-        texture.update(None, &frame.data, 256 * 3).unwrap();
-        canvas.copy(&texture, None, None).unwrap();
+        texture.update(None, &frame.data, NES_WIDTH as usize * 3).unwrap();
+        let (output_width, output_height) = canvas.output_size().unwrap();
+        canvas.set_draw_color(Color::RGB(0, 0, 0));
+        canvas.clear();
+        canvas
+            .copy(&texture, None, letterbox_rect(output_width, output_height))
+            .unwrap();
         canvas.present();
         let present_us = present_started.elapsed().as_micros();
 
@@ -252,6 +309,17 @@ fn run_game(
                     keycode: Some(Keycode::Escape),
                     ..
                 } => std::process::exit(0),
+                Event::KeyDown {
+                    keycode: Some(Keycode::F11),
+                    repeat: false,
+                    ..
+                } => {
+                    fullscreen = !fullscreen;
+                    if let Err(error) = canvas.window_mut().set_fullscreen(fullscreen) {
+                        eprintln!("fullscreen toggle failed: {error}");
+                        fullscreen = !fullscreen;
+                    }
+                }
                 Event::KeyDown { keycode, .. } => {
                     if let Some(button) = keycode.and_then(|k| key_map.get(&k)) {
                         cpu.bus
@@ -362,10 +430,13 @@ fn run_tiles(rom_path: &str) {
     }
 }
 
-fn parse_game_options(args: &[String]) -> Result<(audio::AudioConfig, bool, u8), String> {
+fn parse_game_options(
+    args: &[String],
+) -> Result<(audio::AudioConfig, bool, u8, WindowMode), String> {
     let mut profile = None;
     let mut pulse_latency_ms = None;
     let mut latency_debug = false;
+    let mut window_mode = WindowMode::Windowed;
     let mut run_ahead_frames = std::env::var("NES_RUN_AHEAD_FRAMES")
         .ok()
         .map(|value| {
@@ -404,6 +475,10 @@ fn parse_game_options(args: &[String]) -> Result<(audio::AudioConfig, bool, u8),
             );
         } else if arg == "--latency-debug" {
             latency_debug = true;
+        } else if arg == "--fullscreen" {
+            window_mode = WindowMode::Fullscreen;
+        } else if arg == "--windowed-fullscreen" || arg == "--borderless" {
+            window_mode = WindowMode::WindowedFullscreen;
         } else if let Some(value) = arg.strip_prefix("--run-ahead=") {
             run_ahead_frames = value
                 .parse::<u8>()
@@ -435,7 +510,7 @@ fn parse_game_options(args: &[String]) -> Result<(audio::AudioConfig, bool, u8),
     if run_ahead_frames > 1 {
         return Err("run-ahead currently supports only 0 or 1 frame".into());
     }
-    Ok((config, latency_debug, run_ahead_frames))
+    Ok((config, latency_debug, run_ahead_frames, window_mode))
 }
 
 fn main() {
@@ -465,20 +540,25 @@ fn main() {
         }
         Some("tiles") => run_tiles(args.get(2).map(|s| s.as_str()).unwrap_or("nestest.nes")),
         Some(rom_path) => match parse_game_options(&args[2..]) {
-            Ok((audio_config, latency_debug, run_ahead_frames)) => {
-                run_game(rom_path, audio_config, latency_debug, run_ahead_frames)
-            }
+            Ok((audio_config, latency_debug, run_ahead_frames, window_mode)) => run_game(
+                rom_path,
+                audio_config,
+                latency_debug,
+                run_ahead_frames,
+                window_mode,
+            ),
             Err(err) => {
                 eprintln!("game options: {err}");
                 std::process::exit(2);
             }
         },
         None => match parse_game_options(&[]) {
-            Ok((audio_config, latency_debug, run_ahead_frames)) => run_game(
+            Ok((audio_config, latency_debug, run_ahead_frames, window_mode)) => run_game(
                 "games/pacman.nes",
                 audio_config,
                 latency_debug,
                 run_ahead_frames,
+                window_mode,
             ),
             Err(err) => {
                 eprintln!("audio configuration: {err}");
@@ -502,16 +582,63 @@ mod frontend_tests {
             "1".to_string(),
             "--latency-debug".to_string(),
         ];
-        let (config, debug, run_ahead) = parse_game_options(&args).unwrap();
+        let (config, debug, run_ahead, window_mode) = parse_game_options(&args).unwrap();
         assert_eq!(config.profile, audio::AudioProfile::LowLatency);
         assert_eq!(config.pulse_latency_ms, 25);
         assert!(debug);
         assert_eq!(run_ahead, 1);
+        assert_eq!(window_mode, WindowMode::Windowed);
     }
 
     #[test]
     fn game_options_reject_more_than_one_run_ahead_frame() {
         let args = vec!["--run-ahead=2".to_string()];
         assert!(parse_game_options(&args).is_err());
+    }
+
+    #[test]
+    fn game_options_accept_fullscreen() {
+        let args = vec!["--fullscreen".to_string()];
+        let (_, _, _, window_mode) = parse_game_options(&args).unwrap();
+        assert_eq!(window_mode, WindowMode::Fullscreen);
+    }
+
+    #[test]
+    fn game_options_accept_windowed_fullscreen_and_its_alias() {
+        for flag in ["--windowed-fullscreen", "--borderless"] {
+            let args = vec![flag.to_string()];
+            let (_, _, _, window_mode) = parse_game_options(&args).unwrap();
+            assert_eq!(window_mode, WindowMode::WindowedFullscreen);
+        }
+    }
+
+    #[test]
+    fn letterbox_pillarboxes_a_16_by_9_display() {
+        // 1920x1080: height limits the scale (4.5x), bars split the leftover
+        // width evenly.
+        let rect = letterbox_rect(1920, 1080);
+        assert_eq!(rect.x, 384.0);
+        assert_eq!(rect.y, 0.0);
+        assert_eq!(rect.w, 1152.0);
+        assert_eq!(rect.h, 1080.0);
+    }
+
+    #[test]
+    fn letterbox_fills_the_exact_3x_window() {
+        let rect = letterbox_rect(768, 720);
+        assert_eq!(rect.x, 0.0);
+        assert_eq!(rect.y, 0.0);
+        assert_eq!(rect.w, 768.0);
+        assert_eq!(rect.h, 720.0);
+    }
+
+    #[test]
+    fn letterbox_bars_top_and_bottom_on_a_tall_display() {
+        // Portrait 1080x1920: width limits the scale, bars go above/below.
+        let rect = letterbox_rect(1080, 1920);
+        assert_eq!(rect.x, 0.0);
+        assert_eq!(rect.w, 1080.0);
+        assert_eq!(rect.h, 1012.5);
+        assert_eq!(rect.y, (1920.0 - 1012.5) / 2.0);
     }
 }
