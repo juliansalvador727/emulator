@@ -133,6 +133,12 @@ pub trait Mem {
 
 impl Mem for CPU<'_> {
     fn mem_read(&mut self, addr: u16) -> u8 {
+        // A pending DMC DMA halts the CPU on a read cycle (RDY low), re-reading
+        // this address before the real read -- the DMC-DMA-during-read behavior.
+        // Only real execution reads trigger it; trace/test inspection does not.
+        if self.executing {
+            self.bus.dmc_halt_before_read(addr);
+        }
         let value = self.bus.mem_read(addr);
         self.bus_cycle();
         value

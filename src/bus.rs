@@ -22,6 +22,10 @@ pub struct Bus<'call> {
     // Page selected by the last $4014 write, consumed on the next tick so the
     // 513/514-cycle stall begins at the following CPU-cycle boundary.
     oam_dma_page: Option<u8>,
+    // Cycles a DMC sample fetch has been waiting without a read cycle to steal.
+    // Reset once serviced; the safety net in `tick` services it if the CPU runs
+    // a stretch of non-read cycles so the fetch is never dropped.
+    dmc_pending_ticks: u8,
     gameloop_callback: Box<dyn FnMut(&NesPPU, &mut NesAPU, &mut Joypad) + 'call>,
     audio_chunk_samples: Option<usize>,
     audio_callback: Box<dyn FnMut(Vec<f32>) + 'call>,
@@ -39,6 +43,7 @@ pub struct BusSnapshot {
     // Page selected by the last $4014 write, consumed on the next tick so the
     // 513/514-cycle stall begins at the following CPU-cycle boundary.
     oam_dma_page: Option<u8>,
+    dmc_pending_ticks: u8,
     audio_delivery_enabled: bool,
     host_frame_ready: bool,
     joypad1: Joypad,
@@ -75,6 +80,7 @@ impl<'a> Bus<'a> {
             apu: NesAPU::new(),
             cycles: 0,
             oam_dma_page: None,
+            dmc_pending_ticks: 0,
             gameloop_callback: Box::from(gameloop_callback),
             audio_chunk_samples: (audio_chunk_samples != usize::MAX)
                 .then_some(audio_chunk_samples),
@@ -113,19 +119,18 @@ impl<'a> Bus<'a> {
             self.run_oam_dma(page, &mut frame_ready);
         }
 
-        // DMC sample fetch outside of an OAM DMA: when the APU's memory reader
-        // wants a byte, the bus reads it and stalls the CPU. Hardware stalls
-        // 1-4 cycles depending on alignment (https://www.nesdev.org/wiki/DMA);
-        // we use the common case of 4 and keep the PPU and APU running through
-        // it. Servicing once per CPU instruction (rather than the moment the
-        // sample buffer empties) is at most a few cycles late.
-        while let Some(addr) = self.apu.dmc_dma_request() {
-            let value = self.mem_read(addr);
-            self.apu.dmc_dma_load(value);
-            self.cycles += 4;
-            self.apu.tick(4);
-            self.ppu.tick(12);
-            frame_ready |= self.ppu.take_frame_ready();
+        // A DMC sample fetch outside an OAM DMA is serviced when the CPU next
+        // performs a read cycle (`dmc_halt_before_read`), so the RDY halt can
+        // re-read the CPU's own address -- the DMC-DMA-during-read behavior.
+        // As a safety net for a rare run of non-read cycles, service a pending
+        // fetch here without a re-read once it has been waiting.
+        if self.apu.dmc_dma_request().is_some() {
+            self.dmc_pending_ticks = self.dmc_pending_ticks.saturating_add(1);
+            if self.dmc_pending_ticks >= 3 {
+                self.run_dmc_dma(None, &mut frame_ready);
+            }
+        } else {
+            self.dmc_pending_ticks = 0;
         }
 
         self.deliver_audio_chunks();
@@ -197,6 +202,44 @@ impl<'a> Bus<'a> {
         }
     }
 
+    // Service a pending DMC sample fetch: RDY halts the CPU for four cycles.
+    // When the halt lands on a read cycle, `re_read` is the address the CPU was
+    // reading and it is re-read on each of the three halt cycles before the DMC
+    // get. Re-reading a side-effecting register ($2007/$2002/$4016) several
+    // times is the DMC-DMA-during-read behavior real hardware exhibits; for
+    // ordinary memory the extra reads are harmless.
+    fn run_dmc_dma(&mut self, re_read: Option<u16>, frame_ready: &mut bool) {
+        let Some(dmc_addr) = self.apu.dmc_dma_request() else {
+            return;
+        };
+        self.dmc_pending_ticks = 0;
+        for _ in 0..3 {
+            if let Some(addr) = re_read {
+                let _ = self.mem_read(addr);
+            }
+            self.dma_cpu_cycle(frame_ready);
+        }
+        let value = self.mem_read(dmc_addr); // get cycle
+        self.apu.dmc_dma_load(value);
+        self.dma_cpu_cycle(frame_ready);
+    }
+
+    // Called at the start of a CPU read cycle. If a DMC sample fetch is pending,
+    // the CPU is halted and `addr` re-read before the DMC get; the instruction's
+    // real read of `addr` then proceeds, so a side-effecting register ends up
+    // read several times.
+    pub fn dmc_halt_before_read(&mut self, addr: u16) {
+        if self.apu.dmc_dma_request().is_none() {
+            return;
+        }
+        let mut frame_ready = false;
+        self.run_dmc_dma(Some(addr), &mut frame_ready);
+        if frame_ready {
+            self.host_frame_ready = true;
+            (self.gameloop_callback)(&self.ppu, &mut self.apu, &mut self.joypad1);
+        }
+    }
+
     pub fn take_host_frame_ready(&mut self) -> bool {
         std::mem::take(&mut self.host_frame_ready)
     }
@@ -228,6 +271,7 @@ impl<'a> Bus<'a> {
             apu: self.apu.clone(),
             cycles: self.cycles,
             oam_dma_page: self.oam_dma_page,
+            dmc_pending_ticks: self.dmc_pending_ticks,
             audio_delivery_enabled: self.audio_delivery_enabled,
             host_frame_ready: self.host_frame_ready,
             joypad1: self.joypad1.clone(),
@@ -241,6 +285,7 @@ impl<'a> Bus<'a> {
         self.apu = snapshot.apu;
         self.cycles = snapshot.cycles;
         self.oam_dma_page = snapshot.oam_dma_page;
+        self.dmc_pending_ticks = snapshot.dmc_pending_ticks;
         self.audio_delivery_enabled = snapshot.audio_delivery_enabled;
         self.host_frame_ready = snapshot.host_frame_ready;
         self.joypad1 = snapshot.joypad1;
@@ -409,8 +454,53 @@ mod test {
         bus.mem_write(0x4012, 0x00); // sample address $C000
         bus.mem_write(0x4013, 0x00); // length 1 byte
         bus.mem_write(0x4015, 0x10); // enable DMC
-        bus.tick(1); // services the fetch immediately
+        // The fetch is serviced on the next CPU read cycle; with no CPU driving
+        // reads here, the tick safety net services it after a few cycles.
+        for _ in 0..4 {
+            bus.tick(1);
+        }
         assert_eq!(bus.mem_read(0x4015) & 0x10, 0); // 0 bytes remaining
+    }
+
+    #[test]
+    fn dmc_dma_during_a_2007_read_repeats_the_read() {
+        // With a DMC sample fetch pending, a CPU read cycle is halted (RDY low)
+        // and the read address is re-read on each halt cycle before the real
+        // read. For a side-effecting register like $2007 that means several
+        // extra reads, each advancing the PPU address, ahead of the value the
+        // CPU finally latches. A read with no DMC pending advances once.
+        fn read_2007_after_priming(with_dmc: bool) -> (u8, usize) {
+            let mut bus = test_bus();
+            // Fill nametable $2000.. with distinct, sequential bytes.
+            bus.mem_write(0x2006, 0x20);
+            bus.mem_write(0x2006, 0x00);
+            for i in 0..8u8 {
+                bus.mem_write(0x2007, 0x40 + i);
+            }
+            if with_dmc {
+                bus.mem_write(0x4012, 0x00); // sample address $C000
+                bus.mem_write(0x4013, 0x00); // length 1 byte
+                bus.mem_write(0x4015, 0x10); // enable DMC -> fetch pending
+                assert!(bus.apu.dmc_dma_request().is_some());
+            }
+            // Point at $2000 and prime the buffered read.
+            bus.mem_write(0x2006, 0x20);
+            bus.mem_write(0x2006, 0x00);
+            let _ = bus.mem_read(0x2007);
+            // Simulate one CPU read cycle of $2007.
+            let cycles_before = bus.cycles;
+            bus.dmc_halt_before_read(0x2007);
+            let value = bus.mem_read(0x2007);
+            (value, bus.cycles - cycles_before)
+        }
+
+        let (plain, plain_cycles) = read_2007_after_priming(false);
+        let (stolen, stolen_cycles) = read_2007_after_priming(true);
+        // Three extra $2007 reads during the four-cycle DMC halt advance the
+        // buffered value three positions past the un-stolen read.
+        assert_eq!(stolen, plain.wrapping_add(3));
+        assert_eq!(plain_cycles, 0); // no halt when nothing is pending
+        assert_eq!(stolen_cycles, 4); // four-cycle DMC steal
     }
 
     #[test]

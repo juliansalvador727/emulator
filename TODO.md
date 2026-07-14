@@ -153,9 +153,21 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
   that reason.
 - [x] Add integration tests for parity, elapsed PPU dots, APU progression, and
   DMA interaction (`bus.rs`: page copy with OAMADDR wrap, PPU/APU advancement
-  across the whole stall, and a DMC steal during OAM DMA). DMA timing ROM
-  validation: `sprdma_and_dmc_dma`/`_512` and `dmc_dma_during_read4/*` require
-  the cycle-accurate CPU bus timing above and remain deferred with it.
+  across the whole stall, and a DMC steal during OAM DMA).
+- [~] Slice 4 (DMC-DMA-during-read): a non-OAM DMC fetch is now serviced on the
+  CPU's next read cycle (`Bus::dmc_halt_before_read`, called from
+  `CPU::mem_read`) instead of blindly after the access, so the RDY halt re-reads
+  the CPU's address before the real read -- a side-effecting register
+  ($2007/$4016) is read several times, the documented DMC-DMA-during-read
+  behavior (unit test `dmc_dma_during_a_2007_read_repeats_the_read`). Regression
+  free (nestest, all prior ROMs, 235 unit tests, and audio/visual baselines with
+  0 dropped/underflow samples). The blargg acceptance ROMs still do NOT pass and
+  are gated on cycle-exact DMC timing, not the CPU: `sprdma_and_dmc_dma`/`_512`
+  need exact per-alignment DMA cycle counts, and `dmc_dma_during_read4/*` hang in
+  `sync_dmc.s`, which depends on a cycle-exact DMC timer/IRQ/`$4015` -- the "APU
+  correctness" item below. The re-read count is a fixed 4-cycle approximation
+  until that lands. `4-irq_and_dma` additionally needs per-cycle IRQ sampling
+  through the DMA stall.
 
 ## P1 — CPU compatibility and timing
 
