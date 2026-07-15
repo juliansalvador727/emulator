@@ -178,11 +178,14 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
   as a load and requests later bytes as reloads when the output unit consumes
   its buffer; disabling cancels either request, and restarting with a buffered
   byte correctly defers the reload. Two focused tests cover these transitions.
-  The next integration step must reconcile the core's one-slot-deferred RDY
-  side effects with the bus-cycle schedule before replacing the accepted fixed
-  four-cycle standalone sequence: moving repeats directly onto the apparent
-  held slot shifted the read-ROM collision oracle by one iteration without
-  changing either sprite-DMA collision table.
+  The core's one-slot-deferred RDY boundary is now explicit: scheduling returns
+  elapsed interrupt samples plus a `DmcHeldRead` token for the following modeled
+  core read, carrying the load/reload kind and the get/put phase at the schedule
+  point through snapshots. A trace of `dma_4016_read` confirmed that this next
+  slot is the one which must hold `$4016`; moving repeats onto the schedule-point
+  read shifts the ROM collision oracle by one iteration. The remaining step is
+  to use that token metadata for phase eligibility and a conditional 3/4-cycle
+  standalone sequence. Both sprite-DMA collision tables remain unchanged.
 - Correction: `dmc_dma_during_read4/*` do NOT hang in `sync_dmc.s` (earlier claim
   disproven). They run to completion and report over console/serial with an
   internal CRC and no `$6000` signature, so the harness saw a timeout rather than

@@ -41,6 +41,32 @@ impl InterruptBatch {
     }
 }
 
+/// The core read slot RDY will hold after a DMC schedule point is observed.
+///
+/// The current CPU model discovers DMA between its explicit bus accesses. The
+/// elapsed DMA cycles are accounted immediately, while this token carries the
+/// externally visible no-access reads to the following modeled core read.
+/// Keeping the request kind and phase here makes that one-slot boundary
+/// explicit for the load/reload phase scheduler instead of hiding it in a CPU
+/// boolean.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DmcHeldRead {
+    repeated_reads: u8,
+    request_kind: DmcDmaRequestKind,
+    scheduled_on_get: bool,
+}
+
+impl DmcHeldRead {
+    pub(crate) fn repeated_reads(self) -> u8 {
+        self.repeated_reads
+    }
+}
+
+pub(crate) struct DmcHaltResult {
+    pub(crate) interrupt_samples: InterruptBatch,
+    pub(crate) held_read: DmcHeldRead,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OamDmaPhase {
     Halt,
@@ -346,12 +372,17 @@ impl<'a> Bus<'a> {
     // repeated read for the core's next read slot. RDY is sampled between core
     // bus slots, so the address presented by the next slot is the one held
     // throughout the halt.
-    pub fn dmc_halt_before_next_read(&mut self) -> Option<InterruptBatch> {
+    pub(crate) fn schedule_dmc_halt(&mut self) -> Option<DmcHaltResult> {
         if self.apu.dmc_dma_request_kind().is_none() {
             return None;
         }
         self.dmc_pending_kind
             .get_or_insert_with(|| self.apu.dmc_dma_request_kind().unwrap());
+        let held_read = DmcHeldRead {
+            repeated_reads: 3,
+            request_kind: self.dmc_pending_kind.unwrap(),
+            scheduled_on_get: self.dma_get_cycle,
+        };
         let mut frame_ready = false;
         let mut interrupt_samples = InterruptBatch::default();
         self.run_dmc_dma(&mut frame_ready, &mut interrupt_samples);
@@ -359,14 +390,27 @@ impl<'a> Bus<'a> {
             self.host_frame_ready = true;
             (self.gameloop_callback)(&self.ppu, &mut self.apu, &mut self.joypad1);
         }
-        Some(interrupt_samples)
+        Some(DmcHaltResult {
+            interrupt_samples,
+            held_read,
+        })
     }
 
     // Drive the CPU's held read address on the three non-get DMA cycles. The
     // elapsed cycles were accounted for when the DMA was serviced; this method
     // applies only the externally visible register-read side effects.
-    pub fn repeat_dmc_halted_read(&mut self, addr: u16) {
-        for i in 0..3 {
+    pub(crate) fn repeat_dmc_halted_read(&mut self, addr: u16, held_read: DmcHeldRead) {
+        debug_assert!(
+            held_read.repeated_reads == 3,
+            "unexpected {:?} DMC repeat count on {} phase",
+            held_read.request_kind,
+            if held_read.scheduled_on_get {
+                "get"
+            } else {
+                "put"
+            }
+        );
+        for i in 0..held_read.repeated_reads() {
             self.dmc_reread_holds_oe = i > 0;
             let _ = self.mem_read(addr);
             self.dmc_reread_holds_oe = false;
@@ -624,8 +668,10 @@ mod test {
             // The pending fetch is serviced at the preceding read-slot
             // boundary; RDY then holds this $4016 slot for its repeats.
             if with_dmc {
-                assert!(bus.dmc_halt_before_next_read().is_some());
-                bus.repeat_dmc_halted_read(0x4016);
+                let halt = bus.schedule_dmc_halt().unwrap();
+                assert_eq!(halt.held_read.request_kind, DmcDmaRequestKind::Load);
+                assert!(!halt.held_read.scheduled_on_get);
+                bus.repeat_dmc_halted_read(0x4016, halt.held_read);
             }
             let _ = bus.mem_read(0x4016);
             // Count reads until the register runs past button 8 and returns 1s.
@@ -670,8 +716,8 @@ mod test {
             // RDY hold this $2007 slot throughout the halt.
             let cycles_before = bus.cycles;
             if with_dmc {
-                assert!(bus.dmc_halt_before_next_read().is_some());
-                bus.repeat_dmc_halted_read(0x2007);
+                let halt = bus.schedule_dmc_halt().unwrap();
+                bus.repeat_dmc_halted_read(0x2007, halt.held_read);
             }
             let value = bus.mem_read(0x2007);
             (value, bus.cycles - cycles_before)

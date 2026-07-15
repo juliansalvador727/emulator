@@ -7,7 +7,7 @@ e.g. read data from 0x8000 into A reg:
 LDA $8000      <=>    ad 00 80
 */
 
-use crate::bus::{Bus, BusSnapshot, InterruptBatch};
+use crate::bus::{Bus, BusSnapshot, DmcHeldRead, InterruptBatch};
 use crate::opcodes;
 use std::collections::HashMap;
 
@@ -90,8 +90,10 @@ pub struct CPU<'a> {
     // instruction-boundary recognition uses that point instead of `_delayed`.
     // This is the taken-branch IRQ-delay quirk `branch_delays_irq` checks.
     branch_poll: Option<(bool, bool)>,
-    // RDY takes effect on the core read slot after the DMA schedule point.
-    dmc_repeats_next_read: bool,
+    // RDY takes effect on the modeled core read after the DMA schedule point.
+    // The token records which request/phase owns that slot instead of leaving
+    // the one-slot deferral implicit in a boolean.
+    dmc_held_read: Option<DmcHeldRead>,
     // When true, executing BRK ($00) returns from the run loop instead of
     // taking the interrupt. This core uses BRK as the halt sentinel for
     // nestest automation and the small `load_and_run` unit-test programs; test
@@ -111,7 +113,7 @@ pub struct CpuSnapshot {
     nmi_pending_delayed: bool,
     irq_line: bool,
     irq_line_delayed: bool,
-    dmc_repeats_next_read: bool,
+    dmc_held_read: Option<DmcHeldRead>,
     bus: BusSnapshot,
 }
 
@@ -140,13 +142,12 @@ impl Mem for CPU<'_> {
         // now, then apply its held/repeated address to the next CPU read slot.
         // Inspection reads neither tick nor participate in DMA.
         if self.executing {
-            if self.dmc_repeats_next_read {
-                self.bus.repeat_dmc_halted_read(addr);
-                self.dmc_repeats_next_read = false;
+            if let Some(held_read) = self.dmc_held_read.take() {
+                self.bus.repeat_dmc_halted_read(addr, held_read);
             }
-            if let Some(samples) = self.bus.dmc_halt_before_next_read() {
-                self.latch_halted_interrupts(samples);
-                self.dmc_repeats_next_read = true;
+            if let Some(halt) = self.bus.schedule_dmc_halt() {
+                self.latch_halted_interrupts(halt.interrupt_samples);
+                self.dmc_held_read = Some(halt.held_read);
             }
         }
         let value = self.bus.mem_read(addr);
@@ -182,7 +183,7 @@ impl<'a> CPU<'a> {
             irq_line: false,
             irq_line_delayed: false,
             branch_poll: None,
-            dmc_repeats_next_read: false,
+            dmc_held_read: None,
             halt_on_brk: true,
         }
     }
@@ -277,7 +278,7 @@ impl<'a> CPU<'a> {
             nmi_pending_delayed: self.nmi_pending_delayed,
             irq_line: self.irq_line,
             irq_line_delayed: self.irq_line_delayed,
-            dmc_repeats_next_read: self.dmc_repeats_next_read,
+            dmc_held_read: self.dmc_held_read,
             bus: self.bus.snapshot(),
         }
     }
@@ -294,7 +295,7 @@ impl<'a> CPU<'a> {
         self.nmi_pending_delayed = snapshot.nmi_pending_delayed;
         self.irq_line = snapshot.irq_line;
         self.irq_line_delayed = snapshot.irq_line_delayed;
-        self.dmc_repeats_next_read = snapshot.dmc_repeats_next_read;
+        self.dmc_held_read = snapshot.dmc_held_read;
         self.bus.restore(snapshot.bus);
     }
 
@@ -864,7 +865,7 @@ impl<'a> CPU<'a> {
         self.register_y = 0;
         self.stack_pointer = STACK_RESET;
         self.status = CpuFlags::from_bits_truncate(0b100100);
-        self.dmc_repeats_next_read = false;
+        self.dmc_held_read = None;
 
         self.program_counter = self.mem_read_u16(0xFFFC);
     }
@@ -1553,9 +1554,9 @@ mod test {
 
             cpu.executing = true;
             let _ = cpu.mem_read(0x0000);
-            assert_eq!(cpu.dmc_repeats_next_read, with_dmc);
+            assert_eq!(cpu.dmc_held_read.is_some(), with_dmc);
             let _ = cpu.mem_read(0x4016);
-            assert!(!cpu.dmc_repeats_next_read);
+            assert!(cpu.dmc_held_read.is_none());
             cpu.executing = false;
 
             let mut shifts = 1;
