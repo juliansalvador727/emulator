@@ -6,9 +6,9 @@ model, native Windows build). The Rust emulator at the repository root is the
 active project; the older C emulator under `NES/` is retained as a reference
 and has a separate, lower-priority backlog at the end of this file.
 
-Current verified baseline (2026-07-14):
+Current verified baseline (2026-07-15):
 
-- 234 passing Rust tests.
+- 237 passing Rust tests.
 - All 256 6502 opcodes (official and undocumented); `nestest` matches the
   reference for all 8,991 instruction lines. `instr_test-v5` (16/16),
   `instr_timing` (2/2), and `instr_misc` (4/4) pass.
@@ -239,9 +239,17 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
   blocked on is good. Remaining `apu_reset` 4017_written/4017_timing failures are
   power-on frame-counter *phase*, tracked under the reset/power-cycle item, not
   here.
-- [ ] Validate DMC fetch stalls, IRQ assertion/acknowledgement, address wrapping,
-  looping, and DMA arbitration against test ROMs. Measured against
-  `dmc_dma_during_read4` (see the correction above for how to read these):
+- [~] Validate DMC fetch stalls, IRQ assertion/acknowledgement, address wrapping,
+  looping, and DMA arbitration against test ROMs. Fetch stalls and the
+  DMA-during-read behavior are done: all three `dmc_dma_during_read4` DMA ROMs
+  (`dma_2007_write`, `dma_2007_read`, `dma_4016_read`) now match their compiled
+  CRC oracles. IRQ/wrapping/looping are covered by `apu_test` 8/8 plus the
+  `apu/dmc.rs` unit tests. What is left under this bullet is **DMA arbitration**:
+  `sprdma_and_dmc_dma`/`_512` still fail, and `service_dmc_during_oam` is still a
+  fixed 2-cycle steal with no per-alignment cycle counts. That ROM ships no source
+  or reference values, so it can only be tuned blind against its CRC.
+  Measured against `dmc_dma_during_read4` (see the correction above for how to
+  read these):
   - [x] `$4016` extra-shift count: FIXED (62a00ae). Hardware steals exactly **one**
     shift per halt (`08`->`07`); we stole three. The repeats are real, but /OE
     stays asserted across them so the 4021 only clocks once (`Joypad::peek`).
