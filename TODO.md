@@ -18,7 +18,13 @@ Current verified baseline (2026-07-15):
 - Power-on and front-panel reset are separate operations with a seven-cycle
   reset-vector sequence. Both `cpu_reset` ROMs and all six `apu_reset` ROMs
   pass; `apu_reset/4017_timing` reports the expected 10-clock delay.
-- NROM, MMC1, UxROM, CNROM, MMC3, AxROM, and GxROM/GNROM.
+- NROM, MMC1, UxROM, CNROM, standard MMC3, AxROM, and GxROM/GNROM, with
+  explicit reset-state coverage. MMC1 includes SUROM/SXROM banking and
+  consecutive-write suppression; MMC3 includes PRG-RAM protection, six-bit
+  PRG bank registers, and four-screen nametable RAM.
+- Cartridge memory is typed as ROM, volatile RAM, nonvolatile RAM, or absent.
+  Battery-backed PRG/CHR RAM uses atomic `.sav` replacement and supports the
+  configurable `NES_SAVE_DIR` location.
 - Dot-driven background and sprite rendering with mapper-visible PPU fetches.
 - P1 PPU register and memory behavior complete. OAM DMA is modeled as real
   alternating get/put cycles with OAMADDR wrapping, and DMC DMA arbitrates with
@@ -400,13 +406,11 @@ audio never reaches SDL.
 
 ## P1 — Harden existing mappers and cartridge memory
 
-- [ ] MMC3:
+- [x] Standard MMC3/iNES mapper 4:
   - [x] implement `$A001` PRG-RAM enable and write protection;
   - [x] mask R6/R7 to the MMC3's six PRG bank bits and cover mode/mirroring
     edge cases;
-  - [x] finish four-screen nametable storage/behavior;
-  - [ ] support relevant board/revision differences after NES 2.0 submappers
-    exist.
+  - [x] finish four-screen nametable storage/behavior.
 - [x] MMC1:
   - [x] ignore consecutive serial-data writes on adjacent CPU cycles without
     suppressing bit-7 reset writes;
@@ -425,6 +429,8 @@ audio never reaches SDL.
 
 - [ ] Parse NES 2.0 headers, mapper extensions, submappers, exponent/multiplier
   ROM sizes, PRG/CHR RAM and NVRAM sizes, console type, and region timing.
+- [ ] Use NES 2.0 submappers to select MMC3 board/revision differences instead
+  of applying them to standard iNES mapper 4.
 - [ ] Improve iNES validation for malformed/truncated files and ambiguous
   archaic headers while retaining trainer support.
 - [x] Use iNES battery and RAM metadata to configure mapper memory and
@@ -456,7 +462,6 @@ audio never reaches SDL.
 - [ ] Add versioned save states only after reset semantics and mapper state are
   explicit; include CPU, PPU pipeline, APU, DMA, controllers, RAM, mapper, and
   timing phase.
-- [x] Add configurable battery-save locations and clear error reporting.
 - [ ] Consider NSF/NSFe playback and Game Genie only if they become product
   goals; neither should block core console accuracy.
 
