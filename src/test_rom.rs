@@ -109,11 +109,14 @@ pub fn run(path: &str, max_instructions: u64) -> Result<(), String> {
     }
 
     let status = result.ok_or_else(|| {
+        let pc = cpu.program_counter;
         if protocol_started {
-            format!("timed out after {instructions} instructions while test was running")
+            format!(
+                "timed out after {instructions} instructions while test was running (PC=${pc:04X})"
+            )
         } else {
             format!(
-                "timed out after {instructions} instructions without seeing the blargg signature"
+                "timed out after {instructions} instructions without seeing the blargg signature (PC=${pc:04X})"
             )
         }
     })?;

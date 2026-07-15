@@ -28,7 +28,7 @@ documentation and test ROMs are the sources of truth for hardware behaviour.
 - Native Windows cross-build from WSL, wired as the default `cargo run` target
 - Headless performance probes and deterministic visual regression tests
 
-The test suite currently contains 224 passing tests. The prioritized remaining
+The test suite currently contains 245 passing tests. The prioritized remaining
 work is tracked in [`TODO.md`](TODO.md).
 
 ## Requirements

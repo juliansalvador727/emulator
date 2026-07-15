@@ -8,7 +8,7 @@ and has a separate, lower-priority backlog at the end of this file.
 
 Current verified baseline (2026-07-15):
 
-- 244 passing Rust tests.
+- 245 passing Rust tests.
 - All 256 6502 opcodes (official and undocumented); `nestest` matches the
   reference for all 8,991 instruction lines. `instr_test-v5` (16/16),
   `instr_timing` (2/2), and `instr_misc` (4/4) pass.
@@ -191,11 +191,14 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
   `print_char_` in these ROMs. Beware: the shipped `.nes` files disagree with the
   header comments in `source/` -- the `check_crc` constant in the binary is the
   only oracle. `dma_2007_write` genuinely **passes**.
-- [ ] `dmc_dma_during_read4/double_2007_read` and `read_write_2007` produce no
-  output at all (they hang before their first print). Neither uses DMC DMA -- they
-  test PPU `$2007` dummy-read quirks (`sta $2007,x` dummy-reads before writing;
-  `lda $20F7,x` with X=$10 page-crosses into a double read). This is a PPU bug,
-  not an APU one.
+- [x] Finish the two non-DMC `$2007` dummy-access cases. The earlier "no output"
+  diagnosis was a wrong print hook: their CHR-RAM font shifts `print_char_` from
+  `$E679` to `$E479`. `read_write_2007` already produced its exact two expected
+  lines and `Passed`. `double_2007_read` exposed the real remaining PPU quirk:
+  back-to-back CPU-cycle reads reuse the CPU-facing output latch while the
+  second VRAM fetch wins the delayed-buffer update. It now produces the accepted
+  `22 44 55 66 77` variant and CRC `$85CFD627`; a focused unit test covers the
+  latch/refill behavior.
 
 ## P1 — CPU compatibility and timing
 
