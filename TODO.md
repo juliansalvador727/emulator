@@ -154,16 +154,15 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
 - [x] Add integration tests for parity, elapsed PPU dots, APU progression, and
   DMA interaction (`bus.rs`: page copy with OAMADDR wrap, PPU/APU advancement
   across the whole stall, and a DMC steal during OAM DMA).
-- [~] Slice 4 (DMC-DMA-during-read): a non-OAM DMC fetch is now serviced on the
-  CPU's next read cycle (`Bus::dmc_halt_before_read`, called from
-  `CPU::mem_read`) instead of blindly after the access, so the RDY halt re-reads
-  the CPU's address before the real read -- a side-effecting register
-  ($2007/$4016) is read several times, the documented DMC-DMA-during-read
-  behavior (unit test `dmc_dma_during_a_2007_read_repeats_the_read`). Regression
-  free (nestest, all prior ROMs, 235 unit tests, and audio/visual baselines with
-  0 dropped/underflow samples). The blargg acceptance ROMs still do NOT pass and
-  are gated on cycle-exact DMC timing, not the CPU: `sprdma_and_dmc_dma`/`_512`
-  need exact per-alignment DMA cycle counts. The re-read count is a fixed 4-cycle
+- [~] Slice 4 (DMC-DMA-during-read): a non-OAM DMC fetch is serviced at a CPU
+  read-slot boundary (`Bus::dmc_halt_before_next_read`, called from
+  `CPU::mem_read`), and RDY holds the following core read slot -- a
+  side-effecting register ($2007/$4016) is read several times, the documented
+  DMC-DMA-during-read behavior (unit test
+  `dmc_dma_during_a_2007_read_repeats_the_read`).
+  `dmc_dma_during_read4/dma_4016_read` and `dma_2007_read` now pass their compiled
+  CRC oracles. `sprdma_and_dmc_dma`/`_512` still need exact per-alignment DMA
+  cycle counts. The re-read count is a fixed 4-cycle
   approximation until that lands. `4-irq_and_dma` additionally needs per-cycle
   IRQ sampling through the DMA stall.
 - Correction: `dmc_dma_during_read4/*` do NOT hang in `sync_dmc.s` (earlier claim
@@ -250,22 +249,18 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
     re-read count exactly (1->`07`, 2->`06`, 3->`05`) while `dma_2007_read` needs
     2-3 re-reads for its accepted `33 44`/`44 55` -- so no single re-read count
     satisfies both, and the extra shifts, not the extra reads, were the error.
-  - [ ] The DMA still fires **one cycle late**: each iteration shifts the DMA one
-    clock, and both `dma_2007_read` and `dma_4016_read` put our anomaly on
-    iteration 4 (delay 3354) where hardware has iteration 3 (delay 3353).
-    Magnitudes are now correct; only the position is wrong. This is the last thing
-    between us and both ROMs passing.
-  - `dma_2007_read` already produces an accepted variant (`44 55` = three extra
-    reads); only its position is wrong.
+  - [x] Correct the one-cycle-late halt position. DMA service remains on its
+    scheduled cycle, while the CPU carries the RDY-held repeats into its next
+    core read slot. `dma_4016_read` now emits `08 08 07 08 08` (CRC $F0AB808C),
+    and `dma_2007_read` emits the accepted `44 55` variant on iteration 3
+    (CRC $5E3DF9C4).
   - Dead ends, do NOT retry: (a) deriving the stall count from `self.cycles`
     parity -- hangs `dma_2007_write`; a 2-cycle stall hangs generally, and a
     4-cycle stall removes the anomaly entirely. (b) Giving the DMC timer a phase
     lead over the other APU units -- swept leads 0/1/2 with **no effect at all**,
     because `sync_dmc.s` re-synchronizes the ROM to the DMC timer and cancels any
-    global phase offset. The residual cycle is therefore NOT the timer phase: it
-    is in the servicing path, i.e. which CPU read cycle the halt is inserted
-    before. Fixing it properly means modeling RDY per-cycle in the CPU instead of
-    calling `dmc_halt_before_read` at the top of `CPU::mem_read`.
+    global phase offset. The residual cycle was therefore in the servicing path,
+    specifically which CPU core read slot receives the RDY-held repeats.
 - [ ] Validate channel mixer levels, nonlinear mixing, filters, sample-rate
   conversion, and long-run clock drift against known references. `apu_mixer` 4/4
   (square/triangle/noise/dmc) pass; long-run clock drift still unmeasured.

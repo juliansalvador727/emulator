@@ -123,15 +123,15 @@ impl<'a> Bus<'a> {
             self.run_oam_dma(page, &mut frame_ready);
         }
 
-        // A DMC sample fetch outside an OAM DMA is serviced when the CPU next
-        // performs a read cycle (`dmc_halt_before_read`), so the RDY halt can
-        // re-read the CPU's own address -- the DMC-DMA-during-read behavior.
+        // A DMC sample fetch outside an OAM DMA is serviced at a CPU read-slot
+        // boundary (`dmc_halt_before_next_read`), so RDY can hold the following
+        // read slot's address -- the DMC-DMA-during-read behavior.
         // As a safety net for a rare run of non-read cycles, service a pending
         // fetch here without a re-read once it has been waiting.
         if self.apu.dmc_dma_request().is_some() {
             self.dmc_pending_ticks = self.dmc_pending_ticks.saturating_add(1);
             if self.dmc_pending_ticks >= 3 {
-                self.run_dmc_dma(None, &mut frame_ready);
+                self.run_dmc_dma(&mut frame_ready);
             }
         } else {
             self.dmc_pending_ticks = 0;
@@ -207,12 +207,10 @@ impl<'a> Bus<'a> {
     }
 
     // Service a pending DMC sample fetch: RDY halts the CPU for four cycles.
-    // When the halt lands on a read cycle, `re_read` is the address the CPU was
-    // reading and it is re-read on each of the three halt cycles before the DMC
-    // get. Re-reading a side-effecting register ($2007/$2002/$4016) several
-    // times is the DMC-DMA-during-read behavior real hardware exhibits; for
-    // ordinary memory the extra reads are harmless.
-    fn run_dmc_dma(&mut self, re_read: Option<u16>, frame_ready: &mut bool) {
+    // The core applies the externally visible repeats of its held read address
+    // separately, at the following read slot; this routine advances the three
+    // non-get cycles and the DMC get itself.
+    fn run_dmc_dma(&mut self, frame_ready: &mut bool) {
         let Some(dmc_addr) = self.apu.dmc_dma_request() else {
             return;
         };
@@ -221,17 +219,10 @@ impl<'a> Bus<'a> {
         // to the get/put phase; we always re-read three times, which is the
         // variant `dma_2007_read` accepts. Deriving the count from `self.cycles`
         // parity is NOT the fix and hangs `dma_2007_write` (tried, reverted): the
-        // fetch is triggered from the handshake in `Bus::tick` rather than from
-        // the DMC timer, so the halt lands one cycle late and the parity here is
-        // not the hardware's get/put phase. Fixing that phase is what remains.
-        for i in 0..3 {
-            if let Some(addr) = re_read {
-                // Only the first repeat clocks $4016; /OE stays asserted for the
-                // rest of the halt. See Joypad::peek.
-                self.dmc_reread_holds_oe = i > 0;
-                let _ = self.mem_read(addr);
-                self.dmc_reread_holds_oe = false;
-            }
+        // fixed count remains the accepted approximation until get/put phase is
+        // modeled independently. The CPU core applies these three externally
+        // visible repeats to the correct read slot.
+        for _ in 0..3 {
             self.dma_cpu_cycle(frame_ready);
         }
         let value = self.mem_read(dmc_addr); // get cycle
@@ -239,19 +230,31 @@ impl<'a> Bus<'a> {
         self.dma_cpu_cycle(frame_ready);
     }
 
-    // Called at the start of a CPU read cycle. If a DMC sample fetch is pending,
-    // the CPU is halted and `addr` re-read before the DMC get; the instruction's
-    // real read of `addr` then proceeds, so a side-effecting register ends up
-    // read several times.
-    pub fn dmc_halt_before_read(&mut self, addr: u16) {
+    // Start the pending DMA at its scheduled cycle, but leave the CPU-side
+    // repeated read for the core's next read slot. RDY is sampled between core
+    // bus slots, so the address presented by the next slot is the one held
+    // throughout the halt.
+    pub fn dmc_halt_before_next_read(&mut self) -> bool {
         if self.apu.dmc_dma_request().is_none() {
-            return;
+            return false;
         }
         let mut frame_ready = false;
-        self.run_dmc_dma(Some(addr), &mut frame_ready);
+        self.run_dmc_dma(&mut frame_ready);
         if frame_ready {
             self.host_frame_ready = true;
             (self.gameloop_callback)(&self.ppu, &mut self.apu, &mut self.joypad1);
+        }
+        true
+    }
+
+    // Drive the CPU's held read address on the three non-get DMA cycles. The
+    // elapsed cycles were accounted for when the DMA was serviced; this method
+    // applies only the externally visible register-read side effects.
+    pub fn repeat_dmc_halted_read(&mut self, addr: u16) {
+        for i in 0..3 {
+            self.dmc_reread_holds_oe = i > 0;
+            let _ = self.mem_read(addr);
+            self.dmc_reread_holds_oe = false;
         }
     }
 
@@ -501,8 +504,12 @@ mod test {
                 bus.mem_write(0x4015, 0x10); // enable DMC -> fetch pending
                 assert!(bus.apu.dmc_dma_request().is_some());
             }
-            // One CPU read cycle of $4016, halted when a fetch is pending.
-            bus.dmc_halt_before_read(0x4016);
+            // The pending fetch is serviced at the preceding read-slot
+            // boundary; RDY then holds this $4016 slot for its repeats.
+            if with_dmc {
+                assert!(bus.dmc_halt_before_next_read());
+                bus.repeat_dmc_halted_read(0x4016);
+            }
             let _ = bus.mem_read(0x4016);
             // Count reads until the register runs past button 8 and returns 1s.
             let mut shifts = 1;
@@ -542,9 +549,13 @@ mod test {
             bus.mem_write(0x2006, 0x20);
             bus.mem_write(0x2006, 0x00);
             let _ = bus.mem_read(0x2007);
-            // Simulate one CPU read cycle of $2007.
+            // Service the DMA at the preceding read-slot boundary, then let
+            // RDY hold this $2007 slot throughout the halt.
             let cycles_before = bus.cycles;
-            bus.dmc_halt_before_read(0x2007);
+            if with_dmc {
+                assert!(bus.dmc_halt_before_next_read());
+                bus.repeat_dmc_halted_read(0x2007);
+            }
             let value = bus.mem_read(0x2007);
             (value, bus.cycles - cycles_before)
         }
