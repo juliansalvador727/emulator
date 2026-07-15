@@ -13,7 +13,7 @@ const RAM_MIRRORS_END: u16 = 0x1FFF;
 // const PPU_REGISTERS: u16 = 0x2000; unused
 const PPU_REGISTERS_MIRRORS_END: u16 = 0x3FFF;
 
-/// Interrupt lines as observed at the end of one physical CPU cycle.
+/// Interrupt lines as sampled during one physical CPU cycle.
 ///
 /// A single core cycle can contain hundreds of additional cycles while DMA
 /// owns the bus. This compact batch preserves edges and the first/final line
@@ -240,20 +240,25 @@ impl<'a> Bus<'a> {
     }
 
     // One physical CPU cycle. The PPU and APU advance, host-frame state is
-    // retained, and interrupt lines are sampled before the following cycle.
+    // retained, and interrupt lines are sampled at their hardware boundaries.
     #[inline]
     fn clock_cpu_cycle(
         &mut self,
         frame_ready: &mut bool,
         interrupt_samples: &mut InterruptBatch,
     ) {
+        // The CPU samples the IRQ input before the APU advances for this
+        // physical cycle. A frame IRQ raised by `apu.tick` is therefore
+        // visible to the CPU on the following cycle, while $4015 can observe
+        // and clear the newly raised flag immediately.
+        let irq_line = self.poll_irq_status();
         self.cycles += 1;
         self.apu.tick(1);
         self.ppu.tick(3);
         *frame_ready |= self.ppu.take_frame_ready();
         interrupt_samples.push(
             self.ppu.poll_nmi_interrupt().is_some(),
-            self.poll_irq_status(),
+            irq_line,
         );
         self.observe_dmc_request();
         self.dma_get_cycle = !self.dma_get_cycle;
@@ -704,6 +709,27 @@ mod test {
         assert!(bus.poll_irq_status());
         assert_eq!(bus.mem_read(0x4015) & 0x40, 0x40);
         assert!(!bus.poll_irq_status());
+    }
+
+    #[test]
+    fn frame_irq_flag_precedes_the_cpu_irq_sample_by_one_cycle() {
+        let mut bus = test_bus();
+
+        for _ in 0..2_982 {
+            bus.tick(10);
+        }
+        bus.tick(7);
+        assert!(!bus.poll_irq_status());
+
+        // This APU clock raises the frame IRQ flag, so $4015 can see it at
+        // once. The CPU's IRQ input was sampled before that APU clock and
+        // does not observe the asserted line until its next physical cycle.
+        let assertion_cycle = bus.tick(1);
+        assert!(!assertion_cycle.irq_first);
+        assert!(bus.poll_irq_status());
+
+        let following_cycle = bus.tick(1);
+        assert!(following_cycle.irq_first);
     }
 
     #[test]

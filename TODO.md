@@ -172,9 +172,11 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
   poll pipeline; a focused unit test covers an APU IRQ asserting during OAM
   DMA. Both `sprdma_and_dmc_dma` ROMs now pass all 16 exact cycle counts,
   including the `$4014` collision and the post-OAM `STA $0100`/`RTS` window.
-  `4-irq_and_dma` remains one clock late at each
-  instruction-boundary transition (actual CRC `$60DD7EBF`, expected
-  `$43571959`). The DMC memory reader now labels the initial empty-buffer fetch
+  The CPU samples the APU IRQ input before the APU advances for a physical
+  cycle, while the newly raised frame flag remains immediately visible through
+  `$4015`; this resolves the final interrupt-boundary offset and
+  `4-irq_and_dma` now passes its `$43571959` CRC oracle. The DMC memory reader
+  now labels the initial empty-buffer fetch
   as a load and requests later bytes as reloads when the output unit consumes
   its buffer; disabling cancels either request, and restarting with a buffered
   byte correctly defers the reload. Two focused tests cover these transitions.
@@ -231,12 +233,10 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
   BRK/IRQ vector, RTI's immediate I-flag effect, and the branch-specific poll
   point (end of cycle 2). `cpu_interrupts_v2`: `1-cli_latency` and
   `2-nmi_and_brk` now PASS (were failing); no regressions (nestest, instr_*,
-  ppu_vbl_nmi, visual baselines all green). The three still failing are gated on
-  work outside the interrupt core: `3-nmi_and_irq` needs sub-PPU-dot NMI sync
-  resolution (the PPU advances 3 dots per CPU-cycle tick, so NMI edge timing is
-  quantized); `5-branch_delays_irq` uses `sync_apu`/`CUSTOM_IRQ` and needs exact
-  APU frame-counter IRQ timing (the separate "APU correctness" item below);
-  `4-irq_and_dma` needs per-cycle IRQ sampling during DMA (slice 4).
+  ppu_vbl_nmi, visual baselines all green). `3-nmi_and_irq` and
+  `4-irq_and_dma` now pass as well. The remaining `5-branch_delays_irq` case
+  uses `sync_apu`/`CUSTOM_IRQ` and needs exact APU frame-counter IRQ timing (the
+  separate "APU correctness" item below).
   Slice 3 (done, no code needed): all 7 `vbl_nmi_timing` sub-tests
   (`1.frame_basics`..`7.nmi_timing`) now pass with NO compensating PPU offset --
   the per-cycle CPU timing places each register access on its true cycle, and
