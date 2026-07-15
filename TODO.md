@@ -243,17 +243,29 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
 - [ ] Validate DMC fetch stalls, IRQ assertion/acknowledgement, address wrapping,
   looping, and DMA arbitration against test ROMs. Measured against
   `dmc_dma_during_read4` (see the correction above for how to read these):
-  - The DMA fires **one cycle late**. Each iteration shifts the DMA one clock, and
-    in both `dma_2007_read` and `dma_4016_read` our anomalous line lands on
-    iteration 4 where hardware puts it on iteration 3. Root cause: the fetch is
-    triggered from the `Bus::tick` handshake (plus the `dmc_pending_ticks` safety
-    net) rather than from the DMC timer itself -- the cycle-driven reader below.
-  - `$4016` re-read count is wrong: hardware shows exactly **one** extra shift
-    (`08`->`07`), we show three (`08`->`05`). The shift register advances on the
-    read strobe edge, so repeated reads inside one halt should only clock it once,
-    even though `$2007` legitimately sees 2-3 extra reads.
+  - [x] `$4016` extra-shift count: FIXED (62a00ae). Hardware steals exactly **one**
+    shift per halt (`08`->`07`); we stole three. The repeats are real, but /OE
+    stays asserted across them so the 4021 only clocks once (`Joypad::peek`).
+    Proven by sweeping the shape: at three stalls the `$4016` count tracked the
+    re-read count exactly (1->`07`, 2->`06`, 3->`05`) while `dma_2007_read` needs
+    2-3 re-reads for its accepted `33 44`/`44 55` -- so no single re-read count
+    satisfies both, and the extra shifts, not the extra reads, were the error.
+  - [ ] The DMA still fires **one cycle late**: each iteration shifts the DMA one
+    clock, and both `dma_2007_read` and `dma_4016_read` put our anomaly on
+    iteration 4 (delay 3354) where hardware has iteration 3 (delay 3353).
+    Magnitudes are now correct; only the position is wrong. This is the last thing
+    between us and both ROMs passing.
   - `dma_2007_read` already produces an accepted variant (`44 55` = three extra
     reads); only its position is wrong.
+  - Dead ends, do NOT retry: (a) deriving the stall count from `self.cycles`
+    parity -- hangs `dma_2007_write`; a 2-cycle stall hangs generally, and a
+    4-cycle stall removes the anomaly entirely. (b) Giving the DMC timer a phase
+    lead over the other APU units -- swept leads 0/1/2 with **no effect at all**,
+    because `sync_dmc.s` re-synchronizes the ROM to the DMC timer and cancels any
+    global phase offset. The residual cycle is therefore NOT the timer phase: it
+    is in the servicing path, i.e. which CPU read cycle the halt is inserted
+    before. Fixing it properly means modeling RDY per-cycle in the CPU instead of
+    calling `dmc_halt_before_read` at the top of `CPU::mem_read`.
 - [ ] Validate channel mixer levels, nonlinear mixing, filters, sample-rate
   conversion, and long-run clock drift against known references. `apu_mixer` 4/4
   (square/triangle/noise/dmc) pass; long-run clock drift still unmeasured.
