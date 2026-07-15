@@ -6,9 +6,9 @@ model, native Windows build). The Rust emulator at the repository root is the
 active project; the older C emulator under `NES/` is retained as a reference
 and has a separate, lower-priority backlog at the end of this file.
 
-Current verified baseline (2026-07-14):
+Current verified baseline (2026-07-15):
 
-- 234 passing Rust tests.
+- 237 passing Rust tests.
 - All 256 6502 opcodes (official and undocumented); `nestest` matches the
   reference for all 8,991 instruction lines. `instr_test-v5` (16/16),
   `instr_timing` (2/2), and `instr_misc` (4/4) pass.
@@ -153,9 +153,30 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
   that reason.
 - [x] Add integration tests for parity, elapsed PPU dots, APU progression, and
   DMA interaction (`bus.rs`: page copy with OAMADDR wrap, PPU/APU advancement
-  across the whole stall, and a DMC steal during OAM DMA). DMA timing ROM
-  validation: `sprdma_and_dmc_dma`/`_512` and `dmc_dma_during_read4/*` require
-  the cycle-accurate CPU bus timing above and remain deferred with it.
+  across the whole stall, and a DMC steal during OAM DMA).
+- [~] Slice 4 (DMC-DMA-during-read): a non-OAM DMC fetch is serviced at a CPU
+  read-slot boundary (`Bus::dmc_halt_before_next_read`, called from
+  `CPU::mem_read`), and RDY holds the following core read slot -- a
+  side-effecting register ($2007/$4016) is read several times, the documented
+  DMC-DMA-during-read behavior (unit test
+  `dmc_dma_during_a_2007_read_repeats_the_read`).
+  `dmc_dma_during_read4/dma_4016_read` and `dma_2007_read` now pass their compiled
+  CRC oracles. `sprdma_and_dmc_dma`/`_512` still need exact per-alignment DMA
+  cycle counts. The re-read count is a fixed 4-cycle
+  approximation until that lands. `4-irq_and_dma` additionally needs per-cycle
+  IRQ sampling through the DMA stall.
+- Correction: `dmc_dma_during_read4/*` do NOT hang in `sync_dmc.s` (earlier claim
+  disproven). They run to completion and report over console/serial with an
+  internal CRC and no `$6000` signature, so the harness saw a timeout rather than
+  a result. `PRINT_HOOK=<print_char_ addr>` dumps the byte stream; `$e679` is
+  `print_char_` in these ROMs. Beware: the shipped `.nes` files disagree with the
+  header comments in `source/` -- the `check_crc` constant in the binary is the
+  only oracle. `dma_2007_write` genuinely **passes**.
+- [ ] `dmc_dma_during_read4/double_2007_read` and `read_write_2007` produce no
+  output at all (they hang before their first print). Neither uses DMC DMA -- they
+  test PPU `$2007` dummy-read quirks (`sta $2007,x` dummy-reads before writing;
+  `lda $20F7,x` with X=$10 page-crosses into a double read). This is a PPU bug,
+  not an APU one.
 
 ## P1 — CPU compatibility and timing
 
@@ -211,12 +232,46 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
 
 ## P1 — APU correctness
 
-- [ ] Validate `$4017` write parity/delay and frame-counter sequencing with APU
-  test ROMs.
-- [ ] Validate DMC fetch stalls, IRQ assertion/acknowledgement, address wrapping,
-  looping, and DMA arbitration against test ROMs.
+- [x] Validate `$4017` write parity/delay and frame-counter sequencing with APU
+  test ROMs. `apu_test` 8/8, `blargg_apu_2005.07.30` 11/11 (includes the `$4017`
+  parity/delay and frame-counter sequencing singles). `cpu_interrupts_v2/
+  5-branch_delays_irq` now passes too, so the frame-counter IRQ timing it was
+  blocked on is good. Remaining `apu_reset` 4017_written/4017_timing failures are
+  power-on frame-counter *phase*, tracked under the reset/power-cycle item, not
+  here.
+- [~] Validate DMC fetch stalls, IRQ assertion/acknowledgement, address wrapping,
+  looping, and DMA arbitration against test ROMs. Fetch stalls and the
+  DMA-during-read behavior are done: all three `dmc_dma_during_read4` DMA ROMs
+  (`dma_2007_write`, `dma_2007_read`, `dma_4016_read`) now match their compiled
+  CRC oracles. IRQ/wrapping/looping are covered by `apu_test` 8/8 plus the
+  `apu/dmc.rs` unit tests. What is left under this bullet is **DMA arbitration**:
+  `sprdma_and_dmc_dma`/`_512` still fail, and `service_dmc_during_oam` is still a
+  fixed 2-cycle steal with no per-alignment cycle counts. That ROM ships no source
+  or reference values, so it can only be tuned blind against its CRC.
+  Measured against `dmc_dma_during_read4` (see the correction above for how to
+  read these):
+  - [x] `$4016` extra-shift count: FIXED (62a00ae). Hardware steals exactly **one**
+    shift per halt (`08`->`07`); we stole three. The repeats are real, but /OE
+    stays asserted across them so the 4021 only clocks once (`Joypad::peek`).
+    Proven by sweeping the shape: at three stalls the `$4016` count tracked the
+    re-read count exactly (1->`07`, 2->`06`, 3->`05`) while `dma_2007_read` needs
+    2-3 re-reads for its accepted `33 44`/`44 55` -- so no single re-read count
+    satisfies both, and the extra shifts, not the extra reads, were the error.
+  - [x] Correct the one-cycle-late halt position. DMA service remains on its
+    scheduled cycle, while the CPU carries the RDY-held repeats into its next
+    core read slot. `dma_4016_read` now emits `08 08 07 08 08` (CRC $F0AB808C),
+    and `dma_2007_read` emits the accepted `44 55` variant on iteration 3
+    (CRC $5E3DF9C4).
+  - Dead ends, do NOT retry: (a) deriving the stall count from `self.cycles`
+    parity -- hangs `dma_2007_write`; a 2-cycle stall hangs generally, and a
+    4-cycle stall removes the anomaly entirely. (b) Giving the DMC timer a phase
+    lead over the other APU units -- swept leads 0/1/2 with **no effect at all**,
+    because `sync_dmc.s` re-synchronizes the ROM to the DMC timer and cancels any
+    global phase offset. The residual cycle was therefore in the servicing path,
+    specifically which CPU core read slot receives the RDY-held repeats.
 - [ ] Validate channel mixer levels, nonlinear mixing, filters, sample-rate
-  conversion, and long-run clock drift against known references.
+  conversion, and long-run clock drift against known references. `apu_mixer` 4/4
+  (square/triangle/noise/dmc) pass; long-run clock drift still unmeasured.
 - [ ] Add PAL and Dendy APU timing tables when region support is introduced.
 - [ ] Keep probe reporting for queue depth, drops, underflows, device reopens,
   and sample drift green during timing changes.

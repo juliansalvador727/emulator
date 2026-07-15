@@ -90,6 +90,9 @@ pub struct CPU<'a> {
     // instruction-boundary recognition uses that point instead of `_delayed`.
     // This is the taken-branch IRQ-delay quirk `branch_delays_irq` checks.
     branch_poll: Option<(bool, bool)>,
+    // DMA cycles are serviced as soon as scheduled, while RDY applies their
+    // repeated CPU read to the following core bus slot.
+    dmc_repeats_next_read: bool,
     // When true, executing BRK ($00) returns from the run loop instead of
     // taking the interrupt. This core uses BRK as the halt sentinel for
     // nestest automation and the small `load_and_run` unit-test programs; test
@@ -109,6 +112,7 @@ pub struct CpuSnapshot {
     nmi_pending_delayed: bool,
     irq_line: bool,
     irq_line_delayed: bool,
+    dmc_repeats_next_read: bool,
     bus: BusSnapshot,
 }
 
@@ -133,6 +137,18 @@ pub trait Mem {
 
 impl Mem for CPU<'_> {
     fn mem_read(&mut self, addr: u16) -> u8 {
+        // RDY is sampled between core bus slots. Service a scheduled DMC DMA
+        // now, then apply its held/repeated address to the next CPU read slot.
+        // Inspection reads neither tick nor participate in DMA.
+        if self.executing {
+            if self.dmc_repeats_next_read {
+                self.bus.repeat_dmc_halted_read(addr);
+                self.dmc_repeats_next_read = false;
+            }
+            if self.bus.dmc_halt_before_next_read() {
+                self.dmc_repeats_next_read = true;
+            }
+        }
         let value = self.bus.mem_read(addr);
         self.bus_cycle();
         value
@@ -166,6 +182,7 @@ impl<'a> CPU<'a> {
             irq_line: false,
             irq_line_delayed: false,
             branch_poll: None,
+            dmc_repeats_next_read: false,
             halt_on_brk: true,
         }
     }
@@ -238,6 +255,7 @@ impl<'a> CPU<'a> {
             nmi_pending_delayed: self.nmi_pending_delayed,
             irq_line: self.irq_line,
             irq_line_delayed: self.irq_line_delayed,
+            dmc_repeats_next_read: self.dmc_repeats_next_read,
             bus: self.bus.snapshot(),
         }
     }
@@ -254,6 +272,7 @@ impl<'a> CPU<'a> {
         self.nmi_pending_delayed = snapshot.nmi_pending_delayed;
         self.irq_line = snapshot.irq_line;
         self.irq_line_delayed = snapshot.irq_line_delayed;
+        self.dmc_repeats_next_read = snapshot.dmc_repeats_next_read;
         self.bus.restore(snapshot.bus);
     }
 
@@ -823,6 +842,7 @@ impl<'a> CPU<'a> {
         self.register_y = 0;
         self.stack_pointer = STACK_RESET;
         self.status = CpuFlags::from_bits_truncate(0b100100);
+        self.dmc_repeats_next_read = false;
 
         self.program_counter = self.mem_read_u16(0xFFFC);
     }
@@ -1492,6 +1512,39 @@ impl<'a> CPU<'a> {
 mod test {
     use super::*;
     use crate::cartridge::test;
+
+    #[test]
+    fn dmc_rdy_repeats_the_following_core_read_slot() {
+        fn controller_shifts(with_dmc: bool) -> u8 {
+            let bus = Bus::new(test::test_rom(vec![]), |_, _, _| {});
+            let mut cpu = CPU::new(bus);
+            cpu.bus
+                .joypad_mut()
+                .set_button_pressed_status(crate::joypad::JoypadButton::BUTTON_A, true);
+            cpu.bus.mem_write(0x4016, 1);
+            cpu.bus.mem_write(0x4016, 0);
+            if with_dmc {
+                cpu.bus.mem_write(0x4012, 0);
+                cpu.bus.mem_write(0x4013, 0);
+                cpu.bus.mem_write(0x4015, 0x10);
+            }
+
+            cpu.executing = true;
+            let _ = cpu.mem_read(0x0000); // boundary that services the DMA
+            assert_eq!(cpu.dmc_repeats_next_read, with_dmc);
+            let _ = cpu.mem_read(0x4016); // following slot receives the repeats
+            assert!(!cpu.dmc_repeats_next_read);
+            cpu.executing = false;
+
+            let mut shifts = 1;
+            while cpu.bus.mem_read(0x4016) != 1 {
+                shifts += 1;
+            }
+            shifts
+        }
+
+        assert_eq!(controller_shifts(true), controller_shifts(false) - 1);
+    }
 
     #[test]
     fn test_0xa9_lda_immediate_load_data() {
