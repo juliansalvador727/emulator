@@ -143,20 +143,16 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
   byte per get/put pair through `NesPPU::oam_dma_write` (post-incrementing
   OAMADDR, discarded during rendering) instead of copying it atomically at the
   `$4014` write.
-- [x] Define and test DMC DMA/OAM DMA arbitration for the common (non-
-  corrupting) alignment: `Bus::service_dmc_during_oam` gives a pending DMC
-  fetch priority on a get cycle, adding a halt/alignment cycle plus the DMC get
-  and delaying — never dropping — the OAM data. The rarer sub-cycle case where
-  the steal corrupts an OAM byte, and true instruction-boundary effects, depend
-  on a mid-instruction cycle-accurate CPU and are tracked under "CPU
-  compatibility and timing" below; `sprdma_and_dmc_dma` still reports $0F for
-  that reason.
+- [x] Define and test DMC DMA/OAM DMA arbitration across start, middle, and end
+  alignments. DMC halt/dummy/alignment cycles overlap OAM work, the DMC get has
+  priority, and OAM realigns without dropping bytes. The penultimate and final
+  OAM puts produce their documented one- and three-cycle tails.
 - [x] Add integration tests for parity, elapsed PPU dots, APU progression, and
   DMA interaction (`bus.rs`: page copy with OAMADDR wrap, PPU/APU advancement
   across the whole stall, and a DMC steal during OAM DMA).
-- [~] Slice 4 (DMC-DMA-during-read): a non-OAM DMC fetch is serviced at a CPU
+- [x] Slice 4 (DMC-DMA-during-read): a non-OAM DMC fetch is serviced at a CPU
   read-slot boundary (`Bus::schedule_dmc_halt`, called from
-  `CPU::mem_read`), and RDY holds the following core read slot -- a
+  `CPU::mem_read`), and RDY holds that attempted read slot -- a
   side-effecting register ($2007/$4016) is read several times, the documented
   DMC-DMA-during-read behavior (unit test
   `dmc_dma_during_a_2007_read_repeats_the_read`).
@@ -174,21 +170,18 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
   of being inferred from global CPU-cycle parity. Interrupt lines are observed
   on every physical DMA cycle without advancing the halted 6502's instruction-
   poll pipeline; a focused unit test covers an APU IRQ asserting during OAM
-  DMA. Remaining validation gaps: `sprdma_and_dmc_dma`/`_512` still need their
-  OAM collision/end-window cycle tables resolved, and `4-irq_and_dma` remains
-  one clock late at each
+  DMA. Both `sprdma_and_dmc_dma` ROMs now pass all 16 exact cycle counts,
+  including the `$4014` collision and the post-OAM `STA $0100`/`RTS` window.
+  `4-irq_and_dma` remains one clock late at each
   instruction-boundary transition (actual CRC `$60DD7EBF`, expected
   `$43571959`). The DMC memory reader now labels the initial empty-buffer fetch
   as a load and requests later bytes as reloads when the output unit consumes
   its buffer; disabling cancels either request, and restarting with a buffered
   byte correctly defers the reload. Two focused tests cover these transitions.
-  The core's one-slot-deferred RDY boundary is now explicit: scheduling returns
-  elapsed interrupt samples plus a `DmcHeldRead` token for the following modeled
-  core read, carrying the load/reload kind and the get/put phase at the schedule
-  point through snapshots. A trace of `dma_4016_read` confirmed that this next
-  slot is the one which must hold `$4016`; moving repeats onto the schedule-point
-  read shifts the ROM collision oracle by one iteration. The token metadata now
-  drives phase eligibility and the conditional standalone sequence.
+  Scheduling returns elapsed interrupt samples plus a `DmcHeldRead` token for
+  the current attempted read, carrying the load/reload kind and get/put phase.
+  CPU writes reject the halt and retain retry state; this is required when a
+  reload reaches the `$4014` or `$0100` write at the OAM end window.
 - Correction: `dmc_dma_during_read4/*` do NOT hang in `sync_dmc.s` (earlier claim
   disproven). They run to completion and report over console/serial with an
   internal CRC and no `$6000` signature, so the harness saw a timeout rather than
@@ -263,15 +256,13 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
   blocked on is good. Remaining `apu_reset` 4017_written/4017_timing failures are
   power-on frame-counter *phase*, tracked under the reset/power-cycle item, not
   here.
-- [~] Validate DMC fetch stalls, IRQ assertion/acknowledgement, address wrapping,
+- [x] Validate DMC fetch stalls, IRQ assertion/acknowledgement, address wrapping,
   looping, and DMA arbitration against test ROMs. Fetch stalls and the
   DMA-during-read behavior are done: all three `dmc_dma_during_read4` DMA ROMs
   (`dma_2007_write`, `dma_2007_read`, `dma_4016_read`) now match their compiled
   CRC oracles. IRQ/wrapping/looping are covered by `apu_test` 8/8 plus the
-  `apu/dmc.rs` unit tests. What is left under this bullet is **DMA arbitration**:
-  `sprdma_and_dmc_dma`/`_512` still fail, and `service_dmc_during_oam` is still a
-  fixed 2-cycle steal with no per-alignment cycle counts. That ROM ships no source
-  or reference values, so it can only be tuned blind against its CRC.
+  `apu/dmc.rs` unit tests. DMA arbitration is covered by both
+  `sprdma_and_dmc_dma` ROMs, which pass their complete 16-alignment tables.
   Measured against `dmc_dma_during_read4` (see the correction above for how to
   read these):
   - [x] `$4016` extra-shift count: FIXED (62a00ae). Hardware steals exactly **one**
@@ -281,9 +272,9 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
     re-read count exactly (1->`07`, 2->`06`, 3->`05`) while `dma_2007_read` needs
     2-3 re-reads for its accepted `33 44`/`44 55` -- so no single re-read count
     satisfies both, and the extra shifts, not the extra reads, were the error.
-  - [x] Correct the one-cycle-late halt position. DMA service remains on its
-    scheduled cycle, while the CPU carries the RDY-held repeats into its next
-    core read slot. `dma_4016_read` now emits `08 08 07 08 08` (CRC $F0AB808C),
+  - [x] Correct the halt position. DMA service and RDY-held repeats apply to the
+    current attempted core read; writes reject the halt and retry on the next
+    cycle. `dma_4016_read` emits `08 08 07 08 08` (CRC $F0AB808C),
     and `dma_2007_read` emits the accepted `44 55` variant on iteration 3
     (CRC $5E3DF9C4).
   - Dead ends, do NOT retry: (a) deriving the stall count from `self.cycles`
@@ -291,8 +282,7 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
     4-cycle stall removes the anomaly entirely. (b) Giving the DMC timer a phase
     lead over the other APU units -- swept leads 0/1/2 with **no effect at all**,
     because `sync_dmc.s` re-synchronizes the ROM to the DMC timer and cancels any
-    global phase offset. The residual cycle was therefore in the servicing path,
-    specifically which CPU core read slot receives the RDY-held repeats.
+    global phase offset. The residual cycle was therefore in the servicing path.
 - [ ] Validate channel mixer levels, nonlinear mixing, filters, sample-rate
   conversion, and long-run clock drift against known references. `apu_mixer` 4/4
   (square/triangle/noise/dmc) pass; long-run clock drift still unmeasured.

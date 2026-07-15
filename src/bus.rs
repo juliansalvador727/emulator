@@ -41,14 +41,11 @@ impl InterruptBatch {
     }
 }
 
-/// The core read slot RDY will hold after a DMC schedule point is observed.
+/// The core read slot held by RDY while a DMC transfer owns the bus.
 ///
-/// The current CPU model discovers DMA between its explicit bus accesses. The
-/// elapsed DMA cycles are accounted immediately, while this token carries the
-/// externally visible no-access reads to the following modeled core read.
-/// Keeping the request kind and phase here makes that one-slot boundary
-/// explicit for the load/reload phase scheduler instead of hiding it in a CPU
-/// boolean.
+/// Elapsed DMA cycles are accounted immediately; this token carries the
+/// request shape needed to apply the externally visible no-access reads to the
+/// same CPU address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DmcHeldRead {
     repeated_reads: u8,
@@ -71,8 +68,8 @@ fn standalone_dmc_repeated_reads(
     match kind {
         DmcDmaRequestKind::Load if scheduled_on_get => 2,
         DmcDmaRequestKind::Load => 3,
-        DmcDmaRequestKind::Reload if scheduled_on_get => 3,
-        DmcDmaRequestKind::Reload => 2,
+        DmcDmaRequestKind::Reload if scheduled_on_get => 2,
+        DmcDmaRequestKind::Reload => 3,
     }
 }
 
@@ -285,20 +282,16 @@ impl<'a> Bus<'a> {
         self.dmc_pending_ticks >= 3
     }
 
-    // Standalone scheduling is observed one modeled core-read slot before the
-    // token's held read. Because of that deferral, the calibrated load point is
-    // the modeled put half and the normal reload point is get; a failed write
-    // makes the following read eligible regardless of phase.
+    // Loads attempt to halt on get and reloads on put. A failed write makes
+    // the following read eligible regardless of phase.
     #[inline]
     fn standalone_dmc_eligible(&self) -> bool {
         if self.dmc_write_delays > 0 {
             return self.dmc_pending_kind.is_some();
         }
         match self.dmc_pending_kind {
-            Some(DmcDmaRequestKind::Load) => self.dmc_load_ready() && !self.dma_get_cycle,
-            Some(DmcDmaRequestKind::Reload) => {
-                self.dmc_pending_ticks >= 2 && self.dma_get_cycle
-            }
+            Some(DmcDmaRequestKind::Load) => self.dmc_load_ready() && self.dma_get_cycle,
+            Some(DmcDmaRequestKind::Reload) => !self.dma_get_cycle,
             None => false,
         }
     }
@@ -436,10 +429,8 @@ impl<'a> Bus<'a> {
         self.clock_cpu_cycle(frame_ready, interrupt_samples);
     }
 
-    // Start the pending DMA at its scheduled cycle, but leave the CPU-side
-    // repeated read for the core's next read slot. RDY is sampled between core
-    // bus slots, so the address presented by the next slot is the one held
-    // throughout the halt.
+    // Start the pending DMA on the CPU read slot being attempted. The caller
+    // applies the returned token's no-access reads to that same held address.
     pub(crate) fn schedule_dmc_halt(&mut self) -> Option<DmcHaltResult> {
         if self.dmc_pending_kind.is_none() {
             if let Some(kind) = self.apu.dmc_dma_request_kind() {
@@ -723,7 +714,7 @@ mod test {
         bus.mem_write(0x4012, 0x00); // sample address $C000
         bus.mem_write(0x4013, 0x00); // length 1 byte
         bus.mem_write(0x4015, 0x10); // enable DMC
-        for _ in 0..4 {
+        for _ in 0..3 {
             let _ = bus.tick(1);
         }
         assert!(bus.schedule_dmc_halt().is_some());
@@ -742,11 +733,11 @@ mod test {
         );
         assert_eq!(
             standalone_dmc_repeated_reads(DmcDmaRequestKind::Reload, true),
-            3
+            2
         );
         assert_eq!(
             standalone_dmc_repeated_reads(DmcDmaRequestKind::Reload, false),
-            2
+            3
         );
     }
 
@@ -756,15 +747,15 @@ mod test {
         bus.mem_write(0x4012, 0x00);
         bus.mem_write(0x4013, 0x00);
         bus.mem_write(0x4015, 0x10);
-        bus.tick(4); // mature load request on the modeled put schedule phase
+        bus.tick(3); // mature load request on its get schedule phase
         assert!(bus.standalone_dmc_eligible());
 
         bus.note_dmc_cpu_write();
-        bus.tick(1); // failed halt/write advances to get
+        bus.tick(1); // failed halt/write advances to put
         let halt = bus.schedule_dmc_halt().unwrap();
         assert_eq!(halt.held_read.write_delays, 1);
-        assert!(halt.held_read.scheduled_on_get);
-        assert_eq!(halt.held_read.repeated_reads, 2); // 3-cycle DMA
+        assert!(!halt.held_read.scheduled_on_get);
+        assert_eq!(halt.held_read.repeated_reads, 3); // 4-cycle DMA
     }
 
     #[test]
@@ -773,7 +764,7 @@ mod test {
         bus.mem_write(0x4012, 0x00);
         bus.mem_write(0x4013, 0x00);
         bus.mem_write(0x4015, 0x10);
-        bus.tick(4);
+        bus.tick(3);
         bus.note_dmc_cpu_write();
         bus.tick(1);
         let snapshot = bus.snapshot();
@@ -783,13 +774,13 @@ mod test {
 
         let halt = bus.schedule_dmc_halt().unwrap();
         assert_eq!(halt.held_read.write_delays, 1);
-        assert!(halt.held_read.scheduled_on_get);
-        assert_eq!(halt.held_read.repeated_reads, 2);
+        assert!(!halt.held_read.scheduled_on_get);
+        assert_eq!(halt.held_read.repeated_reads, 3);
     }
 
     #[test]
     fn dmc_dma_during_a_4016_read_steals_exactly_one_shift() {
-        // This aligned load repeats $4016 three times, but /OE stays asserted
+        // This aligned load repeats $4016 twice, but /OE stays asserted
         // across the repeats so the controller's shift register only clocks
         // once. Together with the CPU's own read that is two clocks, not four:
         // the single-bit loss behind the DMC controller-corruption bug.
@@ -805,14 +796,13 @@ mod test {
                 bus.mem_write(0x4015, 0x10); // enable DMC -> fetch pending
                 assert!(bus.apu.dmc_dma_request().is_some());
             }
-            // The pending fetch is serviced at the preceding read-slot
-            // boundary; RDY then holds this $4016 slot for its repeats.
+            // RDY holds this $4016 slot for the pending fetch's repeats.
             if with_dmc {
-                bus.tick(4);
+                bus.tick(3);
                 let halt = bus.schedule_dmc_halt().unwrap();
                 assert_eq!(halt.held_read.request_kind, DmcDmaRequestKind::Load);
-                assert!(!halt.held_read.scheduled_on_get);
-                assert_eq!(halt.held_read.repeated_reads, 3);
+                assert!(halt.held_read.scheduled_on_get);
+                assert_eq!(halt.held_read.repeated_reads, 2);
                 bus.repeat_dmc_halted_read(0x4016, halt.held_read);
             }
             let _ = bus.mem_read(0x4016);
@@ -854,10 +844,9 @@ mod test {
             bus.mem_write(0x2006, 0x20);
             bus.mem_write(0x2006, 0x00);
             let _ = bus.mem_read(0x2007);
-            // Service the DMA at the preceding read-slot boundary, then let
-            // RDY hold this $2007 slot throughout the halt.
+            // Let RDY hold this $2007 slot throughout the halt.
             if with_dmc {
-                bus.tick(4);
+                bus.tick(3);
             }
             let cycles_before = bus.cycles;
             if with_dmc {
@@ -870,9 +859,9 @@ mod test {
 
         let (plain, plain_cycles) = read_2007_after_priming(false);
         let (stolen, stolen_cycles) = read_2007_after_priming(true);
-        assert_eq!(stolen, plain.wrapping_add(3));
+        assert_eq!(stolen, plain.wrapping_add(2));
         assert_eq!(plain_cycles, 0); // no halt when nothing is pending
-        assert_eq!(stolen_cycles, 4);
+        assert_eq!(stolen_cycles, 3);
     }
 
     #[test]

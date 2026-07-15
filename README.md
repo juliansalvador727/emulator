@@ -237,8 +237,8 @@ cargo lin -- tiles /path/to/game.nes
 
 - Rendering-time `$2004/$2007` restrictions and exact PPUMASK transition timing
   remain incomplete.
-- OAM DMA has its 513/514-cycle stall, but not alternating bus cycles or complete
-  DMC-DMA arbitration.
+- OAM DMA uses alternating get/put bus cycles with complete DMC-DMA arbitration,
+  including start, middle, and end-window collisions.
 - Unofficial 6502 opcodes, NES 2.0, PAL/Dendy timing, battery saves, save
   states, and a second controller remain to be implemented.
 
