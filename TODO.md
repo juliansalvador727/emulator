@@ -163,11 +163,21 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
   free (nestest, all prior ROMs, 235 unit tests, and audio/visual baselines with
   0 dropped/underflow samples). The blargg acceptance ROMs still do NOT pass and
   are gated on cycle-exact DMC timing, not the CPU: `sprdma_and_dmc_dma`/`_512`
-  need exact per-alignment DMA cycle counts, and `dmc_dma_during_read4/*` hang in
-  `sync_dmc.s`, which depends on a cycle-exact DMC timer/IRQ/`$4015` -- the "APU
-  correctness" item below. The re-read count is a fixed 4-cycle approximation
-  until that lands. `4-irq_and_dma` additionally needs per-cycle IRQ sampling
-  through the DMA stall.
+  need exact per-alignment DMA cycle counts. The re-read count is a fixed 4-cycle
+  approximation until that lands. `4-irq_and_dma` additionally needs per-cycle
+  IRQ sampling through the DMA stall.
+- Correction: `dmc_dma_during_read4/*` do NOT hang in `sync_dmc.s` (earlier claim
+  disproven). They run to completion and report over console/serial with an
+  internal CRC and no `$6000` signature, so the harness saw a timeout rather than
+  a result. `PRINT_HOOK=<print_char_ addr>` dumps the byte stream; `$e679` is
+  `print_char_` in these ROMs. Beware: the shipped `.nes` files disagree with the
+  header comments in `source/` -- the `check_crc` constant in the binary is the
+  only oracle. `dma_2007_write` genuinely **passes**.
+- [ ] `dmc_dma_during_read4/double_2007_read` and `read_write_2007` produce no
+  output at all (they hang before their first print). Neither uses DMC DMA -- they
+  test PPU `$2007` dummy-read quirks (`sta $2007,x` dummy-reads before writing;
+  `lda $20F7,x` with X=$10 page-crosses into a double read). This is a PPU bug,
+  not an APU one.
 
 ## P1 — CPU compatibility and timing
 
@@ -223,12 +233,30 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
 
 ## P1 — APU correctness
 
-- [ ] Validate `$4017` write parity/delay and frame-counter sequencing with APU
-  test ROMs.
+- [x] Validate `$4017` write parity/delay and frame-counter sequencing with APU
+  test ROMs. `apu_test` 8/8, `blargg_apu_2005.07.30` 11/11 (includes the `$4017`
+  parity/delay and frame-counter sequencing singles). `cpu_interrupts_v2/
+  5-branch_delays_irq` now passes too, so the frame-counter IRQ timing it was
+  blocked on is good. Remaining `apu_reset` 4017_written/4017_timing failures are
+  power-on frame-counter *phase*, tracked under the reset/power-cycle item, not
+  here.
 - [ ] Validate DMC fetch stalls, IRQ assertion/acknowledgement, address wrapping,
-  looping, and DMA arbitration against test ROMs.
+  looping, and DMA arbitration against test ROMs. Measured against
+  `dmc_dma_during_read4` (see the correction above for how to read these):
+  - The DMA fires **one cycle late**. Each iteration shifts the DMA one clock, and
+    in both `dma_2007_read` and `dma_4016_read` our anomalous line lands on
+    iteration 4 where hardware puts it on iteration 3. Root cause: the fetch is
+    triggered from the `Bus::tick` handshake (plus the `dmc_pending_ticks` safety
+    net) rather than from the DMC timer itself -- the cycle-driven reader below.
+  - `$4016` re-read count is wrong: hardware shows exactly **one** extra shift
+    (`08`->`07`), we show three (`08`->`05`). The shift register advances on the
+    read strobe edge, so repeated reads inside one halt should only clock it once,
+    even though `$2007` legitimately sees 2-3 extra reads.
+  - `dma_2007_read` already produces an accepted variant (`44 55` = three extra
+    reads); only its position is wrong.
 - [ ] Validate channel mixer levels, nonlinear mixing, filters, sample-rate
-  conversion, and long-run clock drift against known references.
+  conversion, and long-run clock drift against known references. `apu_mixer` 4/4
+  (square/triangle/noise/dmc) pass; long-run clock drift still unmeasured.
 - [ ] Add PAL and Dendy APU timing tables when region support is introduced.
 - [ ] Keep probe reporting for queue depth, drops, underflows, device reopens,
   and sample drift green during timing changes.
