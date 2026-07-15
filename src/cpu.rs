@@ -84,11 +84,9 @@ pub struct CPU<'a> {
     nmi_pending_delayed: bool,
     irq_line: bool,
     irq_line_delayed: bool,
-    // Branch instructions poll interrupts at a fixed point -- the end of their
-    // second cycle (the offset fetch) -- rather than at the generic penultimate
-    // cycle. When a branch executes it latches its (nmi, irq) poll here so the
-    // instruction-boundary recognition uses that point instead of `_delayed`.
-    // This is the taken-branch IRQ-delay quirk `branch_delays_irq` checks.
+    // Branches poll before their second cycle (the offset fetch); page-crossing
+    // branches poll again before their fourth-cycle high-byte fixup. The
+    // combined result is latched here for instruction-boundary recognition.
     branch_poll: Option<(bool, bool)>,
     // When true, executing BRK ($00) returns from the run loop instead of
     // taking the interrupt. This core uses BRK as the halt sentinel for
@@ -852,14 +850,48 @@ impl<'a> CPU<'a> {
         self.update_zero_and_negative_flags(self.register_y);
     }
 
-    pub fn reset(&mut self) {
+    /// Enter the reset vector from a fresh power-on state.
+    pub fn power_on(&mut self) {
         self.register_a = 0;
         self.register_x = 0;
         self.register_y = 0;
-        self.stack_pointer = STACK_RESET;
         self.status = CpuFlags::from_bits_truncate(0b100100);
+        // The reset microcode performs three stack reads and decrements an
+        // internal power-on value of $00 to the externally observed $FD.
+        self.stack_pointer = 0;
+        self.enter_reset_vector();
+    }
 
-        self.program_counter = self.mem_read_u16(0xFFFC);
+    /// Apply the front-panel reset signal. A/X/Y and RAM survive; I is set and
+    /// the stack pointer loses three without writing stack memory.
+    pub fn reset(&mut self) {
+        self.status.insert(CpuFlags::INTERRUPT_DISABLE);
+        self.bus.reset();
+        self.enter_reset_vector();
+    }
+
+    fn enter_reset_vector(&mut self) {
+        self.nmi_pending = false;
+        self.nmi_pending_delayed = false;
+        self.irq_line = false;
+        self.irq_line_delayed = false;
+        self.branch_poll = None;
+        self.executing = true;
+        self.instr_accesses = 0;
+
+        // Seven-cycle reset sequence: two discarded instruction reads, three
+        // discarded stack reads (with decrements but no writes), then the
+        // vector low and high bytes.
+        let _ = self.mem_read(self.program_counter);
+        let _ = self.mem_read(self.program_counter);
+        for _ in 0..3 {
+            let _ = self.mem_read(STACK as u16 + self.stack_pointer as u16);
+            self.stack_pointer = self.stack_pointer.wrapping_sub(1);
+        }
+        let lo = self.mem_read(0xfffc) as u16;
+        let hi = self.mem_read(0xfffd) as u16;
+        self.program_counter = (hi << 8) | lo;
+        self.executing = false;
     }
 
     fn set_carry_flag(&mut self) {
@@ -969,21 +1001,32 @@ impl<'a> CPU<'a> {
     }
 
     fn branch(&mut self, condition: bool) {
-        // The offset is fetched on cycle 2 whether or not the branch is taken;
-        // interrupts are polled at the end of that cycle for every branch. That
-        // makes a not-taken branch poll on its last cycle and a taken
-        // page-crossing branch poll two cycles before its end -- neither of
-        // which is the generic penultimate-cycle poll.
+        // Branches poll immediately before the operand fetch. Taken branches
+        // do not poll on their third cycle; page-crossing branches poll once
+        // more before the high-byte fixup cycle.
         let old_pc = self.program_counter.wrapping_add(1);
-        let jump: i8 = self.mem_read(self.program_counter) as i8;
         self.branch_poll = Some((self.nmi_pending, self.irq_line));
+        let jump: i8 = self.mem_read(self.program_counter) as i8;
 
         if condition {
             let jump_addr = old_pc.wrapping_add(jump as u16);
             self.program_counter = jump_addr;
             self.additional_cycles += 1;
-            if (old_pc & 0xff00) != (jump_addr & 0xff00) {
+            let page_crossed = (old_pc & 0xff00) != (jump_addr & 0xff00);
+
+            // Cycle 3 reads with the old high byte and the new low byte. It is
+            // a discarded access, but it must land on the bus before the
+            // optional page-cross poll/fixup cycle.
+            let provisional = (old_pc & 0xff00) | (jump_addr & 0x00ff);
+            let _ = self.mem_read(provisional);
+
+            if page_crossed {
                 self.additional_cycles += 1;
+                if let Some((nmi, irq)) = self.branch_poll.as_mut() {
+                    *nmi |= self.nmi_pending;
+                    *irq |= self.irq_line;
+                }
+                let _ = self.mem_read(jump_addr);
             }
         }
     }
@@ -1664,6 +1707,51 @@ mod test {
         assert_eq!(cpu.stack_pointer, STACK_RESET - 3);
         assert_eq!(cpu.program_counter, 0x0001);
         assert!(cpu.status.contains(CpuFlags::INTERRUPT_DISABLE));
+    }
+
+    #[test]
+    fn power_on_runs_seven_read_cycles_and_exposes_documented_registers() {
+        let bus = Bus::new(test::test_rom(vec![]), |_, _, _| {});
+        let mut cpu = CPU::new(bus);
+        cpu.mem_write(0x0100, 0x12);
+        cpu.mem_write(0x01ff, 0x34);
+        cpu.mem_write(0x01fe, 0x56);
+
+        cpu.power_on();
+
+        assert_eq!((cpu.register_a, cpu.register_x, cpu.register_y), (0, 0, 0));
+        assert_eq!(cpu.status.bits(), 0x24);
+        assert_eq!(cpu.stack_pointer, STACK_RESET);
+        assert_eq!(cpu.bus.cpu_cycles(), 7);
+        assert_eq!(cpu.mem_read(0x0100), 0x12);
+        assert_eq!(cpu.mem_read(0x01ff), 0x34);
+        assert_eq!(cpu.mem_read(0x01fe), 0x56);
+    }
+
+    #[test]
+    fn reset_preserves_registers_and_ram_but_sets_i_and_decrements_stack() {
+        let bus = Bus::new(test::test_rom(vec![]), |_, _, _| {});
+        let mut cpu = CPU::new(bus);
+        cpu.register_a = 0x34;
+        cpu.register_x = 0x56;
+        cpu.register_y = 0x78;
+        cpu.status = CpuFlags::from_bits_truncate(0xf3);
+        cpu.stack_pointer = 0x12;
+        cpu.mem_write(0x0112, 0x9a);
+        cpu.mem_write(0x0111, 0xbc);
+        cpu.mem_write(0x0110, 0xde);
+        cpu.mem_write(0x0042, 0xa5);
+
+        cpu.reset();
+
+        assert_eq!((cpu.register_a, cpu.register_x, cpu.register_y), (0x34, 0x56, 0x78));
+        assert!(cpu.status.contains(CpuFlags::INTERRUPT_DISABLE));
+        assert_eq!(cpu.stack_pointer, 0x0f);
+        assert_eq!(cpu.bus.cpu_cycles(), 7);
+        assert_eq!(cpu.mem_read(0x0112), 0x9a);
+        assert_eq!(cpu.mem_read(0x0111), 0xbc);
+        assert_eq!(cpu.mem_read(0x0110), 0xde);
+        assert_eq!(cpu.mem_read(0x0042), 0xa5);
     }
 
     #[test]

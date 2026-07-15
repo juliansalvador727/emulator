@@ -497,6 +497,19 @@ impl<'a> Bus<'a> {
         std::mem::take(&mut self.host_frame_ready)
     }
 
+    /// Reset the console-side devices while retaining CPU RAM, cartridge RAM,
+    /// and other state that survives the front-panel reset switch.
+    pub fn reset(&mut self) {
+        self.apu.reset();
+        self.ppu.reset();
+        self.oam_dma_page = None;
+        self.dmc_pending_ticks = 0;
+        self.dmc_pending_kind = None;
+        self.dmc_write_delays = 0;
+        self.dmc_reread_holds_oe = false;
+        self.host_frame_ready = false;
+    }
+
     pub fn ppu(&self) -> &NesPPU {
         &self.ppu
     }

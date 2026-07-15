@@ -38,6 +38,7 @@ pub struct FrameCounter {
     // A $4017 write only takes effect 3-4 CPU cycles later; see write().
     reset_delay: u8,
     pending_five_step: bool,
+    last_write: u8,
 }
 
 impl FrameCounter {
@@ -49,6 +50,7 @@ impl FrameCounter {
             frame_irq: false,
             reset_delay: 0,
             pending_five_step: false,
+            last_write: 0,
         }
     }
 
@@ -59,6 +61,7 @@ impl FrameCounter {
     // write lands on is approximate - the same order of jitter real
     // hardware exhibits.
     pub fn write(&mut self, data: u8, on_apu_cycle: bool) {
+        self.last_write = data;
         self.pending_five_step = data & 0x80 != 0;
         self.irq_inhibit = data & 0x40 != 0;
         // Setting the inhibit flag clears any pending frame interrupt.
@@ -66,6 +69,19 @@ impl FrameCounter {
             self.frame_irq = false;
         }
         self.reset_delay = if on_apu_cycle { 3 } else { 4 };
+    }
+
+    // Reset re-applies the last value written to $4017. Unlike a CPU write,
+    // the reset signal establishes the sequencer state directly; the CPU's
+    // seven reset-entry cycles provide the observed delay before reset-vector
+    // code begins executing.
+    pub fn reset(&mut self) {
+        self.cycle = 0;
+        self.five_step = self.last_write & 0x80 != 0;
+        self.irq_inhibit = self.last_write & 0x40 != 0;
+        self.frame_irq = false;
+        self.reset_delay = 0;
+        self.pending_five_step = self.five_step;
     }
 
     // Advance one CPU cycle.
@@ -248,5 +264,22 @@ mod test {
         // The next quarter clock arrives a full STEP1 later, not at 7457-5000.
         let events = run(&mut fc, STEP1);
         assert_eq!(events, vec![(STEP1, FrameEvent::Quarter)]);
+    }
+
+    #[test]
+    fn reset_rewrites_last_mode_and_clears_irq() {
+        let mut fc = FrameCounter::new();
+        fc.write(0x80, true);
+        run(&mut fc, 3);
+        run(&mut fc, 10_000);
+        fc.frame_irq = true;
+
+        fc.reset();
+
+        assert!(fc.five_step);
+        assert!(!fc.irq_inhibit);
+        assert!(!fc.frame_irq);
+        assert_eq!(fc.cycle, 0);
+        assert_eq!(fc.reset_delay, 0);
     }
 }

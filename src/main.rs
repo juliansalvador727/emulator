@@ -204,7 +204,7 @@ fn run_game(
 
     let mut cpu = CPU::new(bus);
     cpu.bus.apu.set_sample_rate(sample_rate);
-    cpu.reset();
+    cpu.power_on();
     cpu.run_until_frame_ready();
     let mut run_ahead_frame: Option<render::frame::Frame> = None;
 
@@ -389,7 +389,7 @@ fn run_nestest() {
 
     let bus = Bus::new(rom, |_, _, _| {});
     let mut cpu = CPU::new(bus);
-    cpu.reset();
+    cpu.power_on();
     cpu.program_counter = 0xC000;
 
     cpu.run_with_callback(move |cpu| {

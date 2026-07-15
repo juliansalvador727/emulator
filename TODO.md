@@ -8,10 +8,16 @@ and has a separate, lower-priority backlog at the end of this file.
 
 Current verified baseline (2026-07-15):
 
-- 245 passing Rust tests.
+- 248 passing Rust tests.
 - All 256 6502 opcodes (official and undocumented); `nestest` matches the
   reference for all 8,991 instruction lines. `instr_test-v5` (16/16),
   `instr_timing` (2/2), and `instr_misc` (4/4) pass.
+- CPU interrupt timing is bus-cycle modeled. All five `cpu_interrupts_v2`
+  singles and the composite pass, including the complete 528-alignment
+  IRQ/DMA table and branch-specific interrupt polling cases.
+- Power-on and front-panel reset are separate operations with a seven-cycle
+  reset-vector sequence. Both `cpu_reset` ROMs and all six `apu_reset` ROMs
+  pass; `apu_reset/4017_timing` reports the expected 10-clock delay.
 - NROM, MMC1, UxROM, CNROM, MMC3, AxROM, and GxROM/GNROM.
 - Dot-driven background and sprite rendering with mapper-visible PPU fetches.
 - P1 PPU register and memory behavior complete. OAM DMA is modeled as real
@@ -234,10 +240,14 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
   latches `_delayed` line states), a unified 7-cycle `service_interrupt` for
   BRK/IRQ/NMI with a late (PCL-push) vector decision so a pending NMI hijacks a
   BRK/IRQ vector, RTI's immediate I-flag effect, and the branch-specific poll
-  point (end of cycle 2). All five `cpu_interrupts_v2` ROMs now pass, including
-  `4-irq_and_dma` across its complete 528-alignment IRQ/DMA boundary table and
-  `5-branch_delays_irq` after the exact APU frame-counter IRQ timing work. There
-  are no regressions in nestest, instr_*, ppu_vbl_nmi, or the visual baselines.
+  points (before the offset fetch and, on a page crossing, before the high-byte
+  fixup). All five `cpu_interrupts_v2` ROMs pass, including `4-irq_and_dma`
+  across its complete 528-alignment IRQ/DMA boundary table and
+  `5-branch_delays_irq`. Taken branches now issue their real provisional-address
+  and page-fixup bus reads. The runner also ignores legacy `$00F8` completion
+  while a blargg `$6000` protocol is active, so temporary IRQ wait loops cannot
+  terminate a test early. There are no regressions in nestest, instr_*,
+  ppu_vbl_nmi, or the visual baselines.
   Slice 3 (done, no code needed): all 7 `vbl_nmi_timing` sub-tests
   (`1.frame_basics`..`7.nmi_timing`) now pass with NO compensating PPU offset --
   the per-cycle CPU timing places each register access on its true cycle, and
@@ -248,19 +258,23 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
   halted DMA cycles preserve per-cycle interrupt samples without advancing the
   instruction poll pipeline. The focused unit tests, all three DMC-during-read
   DMA ROMs, both sprite/DMC ROMs, and `4-irq_and_dma` pass.
-- [ ] Implement accurate reset and power-cycle state separately; do not treat
-  application startup, reset, and save-state restore as the same operation.
-  (Still one `reset()`; power-on vs. reset RAM/APU/PPU differences are unmodeled.)
+- [x] Implement accurate reset and power-cycle state separately. `CPU::power_on`
+  establishes A/X/Y/P and runs the real seven-cycle reset-vector bus sequence;
+  `CPU::reset` preserves A/X/Y and RAM, sets I, decrements S three times through
+  read-only stack cycles, and resets the APU/PPU in place. APU reset clears
+  `$4015`/IRQs and reapplies the last `$4017` mode while preserving channel
+  registers; PPU reset preserves external memories and address state while
+  clearing its resettable control/latch state. The headless runner now honors
+  blargg status `$81` at the ROM's reset wait loop. Both `cpu_reset` ROMs and all
+  six `apu_reset` ROMs pass; `4017_timing` measures a 10-clock power/reset delay.
 
 ## P1 — APU correctness
 
 - [x] Validate `$4017` write parity/delay and frame-counter sequencing with APU
   test ROMs. `apu_test` 8/8, `blargg_apu_2005.07.30` 11/11 (includes the `$4017`
-  parity/delay and frame-counter sequencing singles). `cpu_interrupts_v2/
-  5-branch_delays_irq` now passes too, so the frame-counter IRQ timing it was
-  blocked on is good. Remaining `apu_reset` 4017_written/4017_timing failures are
-  power-on frame-counter *phase*, tracked under the reset/power-cycle item, not
-  here.
+  parity/delay and frame-counter sequencing singles). All six `apu_reset` ROMs
+  now pass after the power-on/reset split. `cpu_interrupts_v2/5-branch_delays_irq`
+  also passes with the corrected branch interrupt poll points and bus reads.
 - [x] Validate DMC fetch stalls, IRQ assertion/acknowledgement, address wrapping,
   looping, and DMA arbitration against test ROMs. Fetch stalls and the
   DMA-during-read behavior are done: all three `dmc_dma_during_read4` DMA ROMs

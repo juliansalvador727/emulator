@@ -455,7 +455,7 @@ pub fn run_probe(rom_path: &str, script: &str, max_frames: u32) -> Result<(), St
     let mut cpu = CPU::new(bus);
     cpu.bus.apu.set_sample_rate(audio::SAMPLE_RATE);
     cpu.bus.apu.trace_writes = env_flag("PROBE_TRACE_WRITES");
-    cpu.reset();
+    cpu.power_on();
     cpu.run_until(|_| done.get());
 
     let elapsed = started.elapsed().as_secs_f64();

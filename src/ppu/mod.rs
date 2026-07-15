@@ -173,6 +173,24 @@ impl NesPPU {
         &self.frame
     }
 
+    /// Apply console reset while preserving external PPU memories and the
+    /// current VRAM/OAM address state that hardware does not power-cycle.
+    pub fn reset(&mut self) {
+        self.ctrl = ControlRegister::new();
+        self.mask = MaskRegister::new();
+        self.rendering_enabled = false;
+        self.pending_rendering_enabled = false;
+        self.rendering_change_at = None;
+        self.loopy.reset_latch();
+        self.internal_data_buf = 0;
+        self.last_data_read_at = None;
+        self.suppress_vblank = false;
+        self.nmi_interrupt = None;
+        self.nmi_interrupt_at = 0;
+        self.odd_frame = false;
+        self.odd_skip_armed = false;
+    }
+
     /// Consume the host presentation event raised at the start of vblank.
     /// The CPU has not serviced the corresponding NMI yet, so a frontend can
     /// sample controller input here and make it visible to the game's vblank

@@ -10,7 +10,12 @@ documentation and test ROMs are the sources of truth for hardware behaviour.
 
 ## Current support
 
-- All official 6502 opcodes, CPU interrupts, and `nestest` trace validation
+- All 256 official and undocumented 6502 opcodes, with the complete 8,991-line
+  `nestest` trace matching its reference
+- Bus-cycle CPU interrupt timing, including CLI/SEI/PLP latency, branch-specific
+  IRQ polling, seven-cycle interrupt entry, and NMI vector hijacking
+- Separate power-on and front-panel reset behavior: seven reset-vector cycles,
+  preserved A/X/Y and RAM on soft reset, and in-place APU/PPU reset
 - Dot-driven PPU rendering with fetch-timed loopy scrolling, sprite evaluation,
   sprite-0 hit timing, vblank/NMI races, and odd-frame skipping
 - Background and sprite rendering, including 8×16 sprites, priority, clipping,
@@ -28,8 +33,9 @@ documentation and test ROMs are the sources of truth for hardware behaviour.
 - Native Windows cross-build from WSL, wired as the default `cargo run` target
 - Headless performance probes and deterministic visual regression tests
 
-The test suite currently contains 245 passing tests. The prioritized remaining
-work is tracked in [`TODO.md`](TODO.md).
+The Rust suite contains 248 passing tests. All five `cpu_interrupts_v2` ROMs,
+both `cpu_reset` ROMs, all six `apu_reset` ROMs, and the eight `apu_test` singles
+also pass. The prioritized remaining work is tracked in [`TODO.md`](TODO.md).
 
 ## Requirements
 

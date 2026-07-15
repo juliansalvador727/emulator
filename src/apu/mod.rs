@@ -90,6 +90,14 @@ impl NesAPU {
         self.lp14k = LowPassFilter::new(14000.0, sample_rate as f32);
     }
 
+    /// Apply the 2A03 reset signal without recreating the APU. Channel
+    /// registers and timer phases survive, while the reset-visible $4015 and
+    /// $4017 effects are applied in place.
+    pub fn reset(&mut self) {
+        self.write_status(0);
+        self.frame_counter.reset();
+    }
+
     pub fn write_register(&mut self, addr: u16, data: u8) {
         if self.trace_writes {
             eprintln!("APUW {:04x}={:02x}", addr, data);

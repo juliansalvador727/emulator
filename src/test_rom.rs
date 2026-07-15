@@ -57,12 +57,13 @@ pub fn run(path: &str, max_instructions: u64) -> Result<(), String> {
     // These ROMs (e.g. the BRK and interrupt suites) execute BRK as a real
     // software interrupt rather than a halt.
     cpu.set_halt_on_brk(false);
-    cpu.reset();
+    cpu.power_on();
 
     let mut instructions = 0_u64;
     let mut protocol_started = false;
     let mut result = None;
     let mut legacy_result = false;
+    let mut resets = 0_u8;
     let print_hook = std::env::var("PRINT_HOOK")
         .ok()
         .and_then(|s| u16::from_str_radix(s.trim_start_matches("0x"), 16).ok());
@@ -97,9 +98,31 @@ pub fn run(path: &str, max_instructions: u64) -> Result<(), String> {
                 | (u16::from(cpu.mem_read(pc.wrapping_add(2))) << 8))
                 == pc
         {
-            result = Some(cpu.mem_read(0x00f8));
-            legacy_result = true;
-            return true;
+            // Reset-test ROMs publish status $81, finish configuring the state
+            // they want preserved, then enter a JMP-to-self while waiting for
+            // the front-panel reset button. Reset only once that loop is
+            // reached; reacting immediately to the status write would cut off
+            // the ROM's remaining setup instructions.
+            if protocol_started && status == 0x81 {
+                resets = resets.saturating_add(1);
+                if resets > 8 {
+                    return true;
+                }
+                cpu.reset();
+                return false;
+            }
+            // Zero is the unset/running value for the legacy convention and
+            // many timing ROMs intentionally use a temporary JMP-to-self while
+            // waiting for an IRQ. Only stop once the ROM publishes a nonzero
+            // legacy result (1 means pass, larger values mean failure).
+            if !protocol_started {
+                let legacy_status = cpu.mem_read(0x00f8);
+                if legacy_status != 0 {
+                    result = Some(legacy_status);
+                    legacy_result = true;
+                    return true;
+                }
+            }
         }
         instructions >= max_instructions
     });
