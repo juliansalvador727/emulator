@@ -549,6 +549,7 @@ impl<'a> CPU<'a> {
     fn asl(&mut self, mode: &AddressingMode) -> u8 {
         let addr = self.get_write_operand_addressing(mode);
         let mut data = self.mem_read(addr);
+        self.mem_write(addr, data); // RMW dummy write of the unmodified value
         if data >> 7 == 1 {
             self.set_carry_flag();
         } else {
@@ -574,6 +575,7 @@ impl<'a> CPU<'a> {
     fn lsr(&mut self, mode: &AddressingMode) -> u8 {
         let addr = self.get_write_operand_addressing(mode);
         let mut data = self.mem_read(addr);
+        self.mem_write(addr, data);
         if data & 1 == 1 {
             self.set_carry_flag();
         } else {
@@ -588,6 +590,7 @@ impl<'a> CPU<'a> {
     fn rol(&mut self, mode: &AddressingMode) -> u8 {
         let addr = self.get_write_operand_addressing(mode);
         let mut data = self.mem_read(addr);
+        self.mem_write(addr, data);
         let old_carry = self.status.contains(CpuFlags::CARRY);
 
         if data >> 7 == 1 {
@@ -623,6 +626,7 @@ impl<'a> CPU<'a> {
     fn ror(&mut self, mode: &AddressingMode) -> u8 {
         let addr = self.get_write_operand_addressing(mode);
         let mut data = self.mem_read(addr);
+        self.mem_write(addr, data);
         let old_carry = self.status.contains(CpuFlags::CARRY);
 
         if data & 1 == 1 {
@@ -686,7 +690,9 @@ impl<'a> CPU<'a> {
     // DCP: decrement memory, then CMP it against A.
     fn dcp(&mut self, mode: &AddressingMode) {
         let addr = self.get_write_operand_addressing(mode);
-        let data = self.mem_read(addr).wrapping_sub(1);
+        let old = self.mem_read(addr);
+        self.mem_write(addr, old);
+        let data = old.wrapping_sub(1);
         self.mem_write(addr, data);
         self.status.set(CpuFlags::CARRY, data <= self.register_a);
         self.update_zero_and_negative_flags(self.register_a.wrapping_sub(data));
@@ -695,7 +701,9 @@ impl<'a> CPU<'a> {
     // ISB (ISC): increment memory, then SBC it from A.
     fn isb(&mut self, mode: &AddressingMode) {
         let addr = self.get_write_operand_addressing(mode);
-        let data = self.mem_read(addr).wrapping_add(1);
+        let old = self.mem_read(addr);
+        self.mem_write(addr, old);
+        let data = old.wrapping_add(1);
         self.mem_write(addr, data);
         self.add_to_register_a((data as i8).wrapping_neg().wrapping_sub(1) as u8);
     }
@@ -930,6 +938,7 @@ impl<'a> CPU<'a> {
     fn inc(&mut self, mode: &AddressingMode) -> u8 {
         let addr = self.get_write_operand_addressing(mode);
         let mut data = self.mem_read(addr);
+        self.mem_write(addr, data);
         data = data.wrapping_add(1);
         self.mem_write(addr, data);
         self.update_zero_and_negative_flags(data);
@@ -949,6 +958,7 @@ impl<'a> CPU<'a> {
     fn dec(&mut self, mode: &AddressingMode) -> u8 {
         let addr = self.get_write_operand_addressing(mode);
         let mut data = self.mem_read(addr);
+        self.mem_write(addr, data);
         data = data.wrapping_sub(1);
         self.mem_write(addr, data);
         self.update_zero_and_negative_flags(data);

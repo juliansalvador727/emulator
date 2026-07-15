@@ -22,6 +22,7 @@ documentation and test ROMs are the sources of truth for hardware behaviour.
   and the eight-sprites-per-line limit
 - NROM (0), MMC1 (1), UxROM (2), CNROM (3), MMC3 (4), AxROM (7), and GxROM (66)
 - Fetch-driven MMC3 IRQs using qualified PPU A12 edges
+- Battery-backed cartridge RAM with atomic `.sav` replacement
 - Pulse, triangle, noise, and DMC audio with IRQs, DMA, filtering, and SDL3
   playback
 - Automatic recovery from wedged host audio (stall watchdog with staged
@@ -33,7 +34,7 @@ documentation and test ROMs are the sources of truth for hardware behaviour.
 - Native Windows cross-build from WSL, wired as the default `cargo run` target
 - Headless performance probes and deterministic visual regression tests
 
-The Rust suite contains 250 passing tests. All five `cpu_interrupts_v2` ROMs,
+The Rust suite contains 265 passing tests. All five `cpu_interrupts_v2` ROMs,
 both `cpu_reset` ROMs, all six `apu_reset` ROMs, and the eight `apu_test` singles
 also pass. The prioritized remaining work is tracked in [`TODO.md`](TODO.md).
 
@@ -205,6 +206,14 @@ because `WSL_DISTRO_NAME` leaks into Windows processes launched from WSL.
 Escape returns to the [game-selection menu](#game-selection-menu) when the game
 was launched from it, and otherwise quits.
 
+### Battery saves
+
+Battery-backed RAM is loaded when a ROM starts and atomically written when the
+game exits or returns to the menu. By default, `game.nes` uses `game.sav` in the
+same directory. Set `NES_SAVE_DIR` to place saves elsewhere; the directory is
+created on demand. Mapper reset and run-ahead snapshots preserve cartridge RAM
+without writing speculative state to disk.
+
 ## Validation and diagnostics
 
 These run on the native-Linux target via the `cargo lin` alias — that keeps the
@@ -244,8 +253,9 @@ cargo lin -- tiles /path/to/game.nes
   remain incomplete.
 - OAM DMA uses alternating get/put bus cycles with complete DMC-DMA arbitration,
   including start, middle, and end-window collisions.
-- Unofficial 6502 opcodes, NES 2.0, PAL/Dendy timing, battery saves, save
-  states, and a second controller remain to be implemented.
+- NES 2.0, PAL/Dendy timing, save states, and a second controller remain to be
+  implemented. MMC3 board/revision variants remain gated on NES 2.0 submapper
+  metadata.
 
 ## License
 

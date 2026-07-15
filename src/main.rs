@@ -133,9 +133,7 @@ fn run_game(
     let sample_rate = audio::SAMPLE_RATE;
 
     let rom_path = resolve_rom_path(rom_path);
-    let bytes: Vec<u8> = std::fs::read(&rom_path)
-        .unwrap_or_else(|err| panic!("failed to read ROM {}: {}", rom_path.display(), err));
-    let rom = Rom::new(&bytes).unwrap();
+    let rom = Rom::from_file(&rom_path).unwrap_or_else(|err| panic!("{err}"));
 
     // Keyboard -> NES controller button mapping.
     let mut key_map = HashMap::new();
@@ -315,11 +313,21 @@ fn run_game(
 
         for event in event_pump.poll_iter() {
             match event {
-                Event::Quit { .. } => return GameOutcome::Quit,
+                Event::Quit { .. } => {
+                    if let Err(err) = cpu.bus.flush_battery_ram() {
+                        eprintln!("warning: {err}");
+                    }
+                    return GameOutcome::Quit;
+                }
                 Event::KeyDown {
                     keycode: Some(Keycode::Escape),
                     ..
-                } => return GameOutcome::BackToMenu,
+                } => {
+                    if let Err(err) = cpu.bus.flush_battery_ram() {
+                        eprintln!("warning: {err}");
+                    }
+                    return GameOutcome::BackToMenu;
+                }
                 Event::KeyDown {
                     keycode: Some(Keycode::F11),
                     repeat: false,

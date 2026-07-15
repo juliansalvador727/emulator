@@ -43,7 +43,9 @@ struct SpriteUnit {
 pub struct NesPPU {
     pub mapper: SharedMapper,
     pub palette_table: [u8; 32],
-    pub vram: [u8; 2048],
+    // Four-screen cartridges provide an additional 2 KiB of nametable RAM.
+    // Two-screen modes simply address the lower half.
+    pub vram: [u8; 4096],
     pub oam_data: [u8; 256],
 
     loopy: LoopyRegister,
@@ -115,7 +117,7 @@ impl NesPPU {
     pub fn new(mapper: SharedMapper) -> Self {
         NesPPU {
             mapper: mapper,
-            vram: [0; 2048],
+            vram: [0; 4096],
             oam_data: [0; 64 * 4],
             // Power-on palette RAM as NES black ($0F) rather than $00 (a visible
             // gray). Games that only initialize the background palettes leave the
@@ -1092,6 +1094,8 @@ pub mod test {
             chr_rom: vec![0; 0x2000],
             mapper: 4,
             screen_mirroring: Mirroring::Vertical,
+            memory: crate::cartridge::CartridgeMemory::test_defaults(0x8000, 0x2000),
+            save_path: None,
         });
         (NesPPU::new(mapper.clone()), mapper)
     }
@@ -2105,6 +2109,20 @@ pub mod test {
 
         ppu.read_data(); //load into buffer
         assert_eq!(ppu.read_data(), 0x77); //read from B
+    }
+
+    #[test]
+    fn four_screen_vram_keeps_all_nametables_independent() {
+        let mut ppu = NesPPU::new(crate::mapper::test_nrom(vec![0; 0x2000], Mirroring::FourScreen));
+        for (table, value) in [0x20u8, 0x24, 0x28, 0x2c].into_iter().zip(1u8..) {
+            ppu.write_to_ppu_addr(table);
+            ppu.write_to_ppu_addr(0x05);
+            ppu.write_to_data(value);
+        }
+        assert_eq!(ppu.vram[0x005], 1);
+        assert_eq!(ppu.vram[0x405], 2);
+        assert_eq!(ppu.vram[0x805], 3);
+        assert_eq!(ppu.vram[0xc05], 4);
     }
 
     #[test]

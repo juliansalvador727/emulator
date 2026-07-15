@@ -500,6 +500,7 @@ impl<'a> Bus<'a> {
     /// Reset the console-side devices while retaining CPU RAM, cartridge RAM,
     /// and other state that survives the front-panel reset switch.
     pub fn reset(&mut self) {
+        self.mapper.borrow_mut().reset();
         self.apu.reset();
         self.ppu.reset();
         self.oam_dma_page = None;
@@ -508,6 +509,10 @@ impl<'a> Bus<'a> {
         self.dmc_write_delays = 0;
         self.dmc_reread_holds_oe = false;
         self.host_frame_ready = false;
+    }
+
+    pub fn flush_battery_ram(&self) -> Result<(), String> {
+        self.mapper.borrow().flush_persistent_ram()
     }
 
     pub fn ppu(&self) -> &NesPPU {
@@ -679,7 +684,10 @@ impl Mem for Bus<'_> {
 
             // Writes to $6000-$7FFF hit PRG-RAM; writes to $8000-$FFFF are the
             // mapper's bank-switch control registers, not errors.
-            0x6000..=0xFFFF => self.mapper.borrow_mut().cpu_write(addr, data),
+            0x6000..=0xFFFF => self
+                .mapper
+                .borrow_mut()
+                .cpu_write_at(addr, data, self.cycles as u64),
 
             _ => {
                 println!("Ignoring mem write-access at {}", addr);

@@ -10,7 +10,7 @@ pub struct Nrom {
     prg_rom: Vec<u8>,
     chr: Vec<u8>,
     chr_is_ram: bool,
-    prg_ram: [u8; 0x2000],
+    prg_ram: Vec<u8>,
     mirroring: Mirroring,
 }
 
@@ -20,7 +20,7 @@ impl Nrom {
             prg_rom,
             chr,
             chr_is_ram,
-            prg_ram: [0; 0x2000],
+            prg_ram: vec![0; 0x2000],
             mirroring,
         }
     }
@@ -33,14 +33,16 @@ impl Nrom {
         } else {
             rom.chr_rom
         };
-        Nrom::new(rom.prg_rom, chr, chr_is_ram, rom.screen_mirroring)
+        let mut mapper = Nrom::new(rom.prg_rom, chr, chr_is_ram, rom.screen_mirroring);
+        mapper.prg_ram.resize(rom.memory.prg_ram.size, 0);
+        mapper
     }
 }
 
 impl Mapper for Nrom {
     fn cpu_read(&mut self, addr: u16) -> u8 {
         match addr {
-            0x6000..=0x7fff => self.prg_ram[(addr - 0x6000) as usize],
+            0x6000..=0x7fff => self.prg_ram.get((addr - 0x6000) as usize).copied().unwrap_or(0),
             0x8000..=0xffff => {
                 let mut index = addr - 0x8000;
                 // Mirror the 16 KB image across both banks.
@@ -55,7 +57,9 @@ impl Mapper for Nrom {
 
     fn cpu_write(&mut self, addr: u16, data: u8) {
         match addr {
-            0x6000..=0x7fff => self.prg_ram[(addr - 0x6000) as usize] = data,
+            0x6000..=0x7fff => {
+                if let Some(byte) = self.prg_ram.get_mut((addr - 0x6000) as usize) { *byte = data; }
+            }
             // NROM has no bank registers; writes to ROM space are inert.
             _ => {}
         }
@@ -74,4 +78,9 @@ impl Mapper for Nrom {
     fn mirroring(&self) -> Mirroring {
         self.mirroring
     }
+
+    fn prg_ram(&self) -> Option<&[u8]> { (!self.prg_ram.is_empty()).then_some(&self.prg_ram) }
+    fn prg_ram_mut(&mut self) -> Option<&mut [u8]> { (!self.prg_ram.is_empty()).then_some(&mut self.prg_ram) }
+    fn chr_ram(&self) -> Option<&[u8]> { self.chr_is_ram.then_some(&self.chr) }
+    fn chr_ram_mut(&mut self) -> Option<&mut [u8]> { self.chr_is_ram.then_some(&mut self.chr) }
 }

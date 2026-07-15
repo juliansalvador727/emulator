@@ -8,7 +8,7 @@ and has a separate, lower-priority backlog at the end of this file.
 
 Current verified baseline (2026-07-15):
 
-- 250 passing Rust tests.
+- 265 passing Rust tests.
 - All 256 6502 opcodes (official and undocumented); `nestest` matches the
   reference for all 8,991 instruction lines. `instr_test-v5` (16/16),
   `instr_timing` (2/2), and `instr_misc` (4/4) pass.
@@ -402,18 +402,24 @@ audio never reaches SDL.
 
 - [ ] MMC3:
   - [x] implement `$A001` PRG-RAM enable and write protection;
-  - finish four-screen nametable storage/behavior;
-  - support relevant board/revision differences after NES 2.0 submappers exist.
-- [ ] MMC1:
-  - ignore consecutive serial writes on adjacent CPU cycles;
-  - support SUROM/SXROM large-PRG banking when a target ROM requires it;
-  - model PRG-RAM enable/banking for the relevant boards.
-- [ ] Implement battery-backed PRG/CHR RAM persistence with atomic writes and a
+  - [x] mask R6/R7 to the MMC3's six PRG bank bits and cover mode/mirroring
+    edge cases;
+  - [x] finish four-screen nametable storage/behavior;
+  - [ ] support relevant board/revision differences after NES 2.0 submappers
+    exist.
+- [x] MMC1:
+  - [x] ignore consecutive serial-data writes on adjacent CPU cycles without
+    suppressing bit-7 reset writes;
+  - [x] support SUROM/SXROM 512 KiB PRG banking;
+  - [x] model PRG-RAM enable and SOROM/SXROM banking.
+- [x] Implement battery-backed PRG/CHR RAM persistence with atomic writes and a
   configurable save directory.
-- [ ] Distinguish volatile RAM, nonvolatile RAM, ROM, and absent memory from
+- [x] Distinguish volatile RAM, nonvolatile RAM, ROM, and absent memory from
   cartridge metadata rather than assuming one 8 KiB PRG-RAM block.
-- [ ] Add focused unit tests and at least one legal ROM/test-ROM validation case
-  for every mapper behavior change.
+- [x] Add focused mapper reset-state, memory-type, PRG/CHR persistence, MMC1,
+  and MMC3 edge-case unit tests.
+- [ ] Add at least one legal ROM/test-ROM validation case for every mapper
+  behavior change.
 
 ## P1 — Cartridge formats and region metadata
 
@@ -421,7 +427,8 @@ audio never reaches SDL.
   ROM sizes, PRG/CHR RAM and NVRAM sizes, console type, and region timing.
 - [ ] Improve iNES validation for malformed/truncated files and ambiguous
   archaic headers while retaining trainer support.
-- [ ] Use battery and RAM metadata to configure mapper memory and persistence.
+- [x] Use iNES battery and RAM metadata to configure mapper memory and
+  persistence; extend this to split RAM/NVRAM fields with NES 2.0 parsing.
 - [ ] Select NTSC/PAL/Dendy timing from metadata with an explicit user override.
 - [ ] Add parser fixtures for valid and invalid iNES/NES 2.0 combinations.
 
@@ -449,7 +456,7 @@ audio never reaches SDL.
 - [ ] Add versioned save states only after reset semantics and mapper state are
   explicit; include CPU, PPU pipeline, APU, DMA, controllers, RAM, mapper, and
   timing phase.
-- [ ] Add configurable battery-save locations and clear error reporting.
+- [x] Add configurable battery-save locations and clear error reporting.
 - [ ] Consider NSF/NSFe playback and Game Genie only if they become product
   goals; neither should block core console accuracy.
 
