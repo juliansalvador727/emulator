@@ -7,8 +7,14 @@ cargo run --release -- probe <rom> "<button@from-to,...>" <frames>
 ```
 
 The final `PROBE_SUMMARY` records emulated FPS, average/p95/max host frame
-time, generated samples and long-run sample drift. Audio queue fields are
+time, generated samples and long-run sample drift against actual emulated CPU
+cycles. Audio queue fields are
 `4294967295` (`BACKLOG_UNAVAILABLE`) in the default headless mode.
+
+Set `PROBE_MAX_SAMPLE_DRIFT=<samples>` to make the probe fail when absolute
+drift exceeds the given threshold. `PROBE_REQUIRE_HEALTHY_AUDIO=1` additionally
+requires realtime mode, an available queue below its configured high-water
+mark, and zero dropped samples, estimated underflows, or stream reopens.
 
 Set `PROBE_REALTIME=1` to use the windowed frontend's sub-frame SDL audio pump
 and chunk pacer. That mode additionally records queue minimum/maximum/end
@@ -33,8 +39,8 @@ place.
   corresponding baseline and returns a non-zero status on a missing or changed
   image.
 - `PROBE_REPORT=<path.csv>` writes per-frame timing, sample count, frame hash,
-  total/SDL/pending audio depths, OAM DMA count, and visible-time PPU-register-
-  write context.
+  cumulative emulated CPU cycles, total/SDL/pending audio depths, OAM DMA count,
+  and visible-time PPU-register-write context.
 - `PROBE_VERBOSE=1` mirrors a compact per-frame record to stderr.
 - `PROBE_TRACE_WRITES=1` logs APU register writes; it is off by default so it
   cannot perturb profiling.
@@ -44,6 +50,16 @@ Run all reviewed cases with:
 ```sh
 ./probes/run_visual_regressions.sh
 ```
+
+Run the two-minute audio-clock acceptance sweep across NROM, MMC1, and MMC3:
+
+```sh
+./probes/run_audio_validation.sh
+```
+
+It defaults to 7,200 frames per case and enforces at most one sample of drift.
+Override the duration with `AUDIO_VALIDATION_FRAMES`; set `PROBE_REALTIME=1`
+to add the strict host queue/drop/underflow/reopen check on a real audio device.
 
 The runner verifies each ROM's SHA-256 before executing it. The ROM files are
 already part of this repository; if they are removed for licensing reasons,

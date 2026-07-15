@@ -33,7 +33,7 @@ documentation and test ROMs are the sources of truth for hardware behaviour.
 - Native Windows cross-build from WSL, wired as the default `cargo run` target
 - Headless performance probes and deterministic visual regression tests
 
-The Rust suite contains 248 passing tests. All five `cpu_interrupts_v2` ROMs,
+The Rust suite contains 250 passing tests. All five `cpu_interrupts_v2` ROMs,
 both `cpu_reset` ROMs, all six `apu_reset` ROMs, and the eight `apu_test` singles
 also pass. The prioritized remaining work is tracked in [`TODO.md`](TODO.md).
 
@@ -217,8 +217,7 @@ cargo lin -- nestest > mynes.log 2>/dev/null
 diff <(sed 's/ PPU:.*//' nestest.log | head -n "$(wc -l < mynes.log)") mynes.log
 ```
 
-The trace matches all 5,003 official-opcode entries and stops when `nestest`
-reaches its first unofficial opcode.
+The trace matches all 8,991 official and undocumented instruction lines.
 
 Run a headless optimized probe with optional scripted input:
 
@@ -230,7 +229,7 @@ The probe reports frame timing, audio production and drift, frame hashes, DMA
 activity, and visible-time PPU writes. It can also create deterministic BMPs
 and compare them against reviewed baselines. See
 [`probes/README.md`](probes/README.md) for all probe
-options and the visual-regression runner.
+options and the visual/audio regression runners.
 
 Inspect a CHR tile in an SDL window:
 

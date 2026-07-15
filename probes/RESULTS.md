@@ -1,12 +1,12 @@
 # P0/P1 PPU baseline results
 
-Recorded on 2026-07-13 in a Linux release build. These figures are evidence
+Recorded on 2026-07-15 in a Linux release build. These figures are evidence
 for the current baseline, not universal performance promises; rerun the probe
 on the target host before changing PPU timing.
 
 ## Deterministic timing validation
 
-The Rust suite now has 211 passing tests. P0/P1 coverage records exact
+The Rust suite now has 250 passing tests. P0/P1 coverage records exact
 mapper-visible background, prefetch, dummy, and sprite fetch addresses/dots;
 blanked rendering; sprite-zero left-edge and x=255 behavior; vblank/NMI races;
 odd-frame skipping; all background/sprite pattern-table combinations; PPUDATA
@@ -60,16 +60,23 @@ multidirectional-scrolling test pattern without seams or blank regions.
 
 ## Two emulated minutes, headless
 
-Each run covered 7,200 completed frames. All produced 5,283,327 samples with
-only +0.089 sample of cumulative clock drift after the warm-up frame.
+Each run covered 7,200 completed frames. All produced 5,750,464 samples. Drift
+is measured against actual emulated CPU cycles between callbacks, rather than
+inferred from nominal video rate: SMB1 was -0.264 sample, Zelda -0.103, and
+SMB2 +0.031. The integer sample clock itself is exact over two CPU-clock
+minutes; the sub-sample values are the expected boundary phase at the two
+callback endpoints.
 
 | Case | Mapper | Emulated FPS | Avg host frame | p95 | Max |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| SMB1 | 0 / NROM | 1,201 | 0.833 ms | 0.945 ms | 1.785 ms |
-| Zelda | 1 / MMC1 | 1,098 | 0.911 ms | 1.360 ms | 3.467 ms |
-| SMB2 | 4 / MMC3 | 1,022 | 0.979 ms | 1.438 ms | 4.962 ms |
+| SMB1 | 0 / NROM | 189 | 5.290 ms | 7.562 ms | 27.842 ms |
+| Zelda | 1 / MMC1 | 183 | 5.461 ms | 7.287 ms | 12.173 ms |
+| SMB2 | 4 / MMC3 | 179 | 5.600 ms | 7.366 ms | 17.629 ms |
 
 This leaves ample CPU/rendering margin for a 60.0985 FPS presentation target.
+`probes/run_audio_validation.sh` now makes the one-sample drift ceiling a
+repeatable acceptance check instead of leaving these figures as a manual
+observation.
 The nine reviewed BMPs in `baselines/` cover frames 180, 360, and 600 for
 each case and are checked byte-for-byte by `run_visual_regressions.sh`.
 The suite was rerun while closing P0; all nine current images matched, including

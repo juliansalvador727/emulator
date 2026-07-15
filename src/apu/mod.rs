@@ -23,9 +23,36 @@ pub mod triangle;
 
 // NTSC 2A03 CPU clock rate, from
 // https://www.nesdev.org/wiki/Cycle_reference_chart
-const CPU_HZ: f64 = 1_789_773.0;
+pub(crate) const CPU_HZ: u64 = 1_789_773;
 
 const DEFAULT_SAMPLE_RATE: u32 = 48000;
+
+/// Exact rational divider from the emulated CPU clock to the host sample
+/// clock. Integer accumulation prevents long-run drift from floating-point
+/// rounding: after N CPU cycles it has emitted exactly
+/// floor(N * sample_rate / CPU_HZ) samples.
+#[derive(Clone)]
+struct SampleClock {
+    rate: u32,
+    phase: u64,
+}
+
+impl SampleClock {
+    fn new(rate: u32) -> Self {
+        Self { rate, phase: 0 }
+    }
+
+    fn set_rate(&mut self, rate: u32) {
+        self.rate = rate;
+        self.phase = 0;
+    }
+
+    fn advance(&mut self, cpu_cycles: u64) -> u64 {
+        let total = self.phase + cpu_cycles * u64::from(self.rate);
+        self.phase = total % CPU_HZ;
+        total / CPU_HZ
+    }
+}
 
 #[derive(Clone)]
 pub struct NesAPU {
@@ -40,10 +67,8 @@ pub struct NesAPU {
     // depend on APU-cycle (CPU/2) parity.
     cycles: usize,
 
-    // Downsampling: emit one mixed sample every cycles_per_sample CPU cycles,
-    // tracking the fractional remainder so the long-run rate is exact.
-    cycles_per_sample: f64,
-    sample_timer: f64,
+    // Downsampling uses an exact integer CPU-to-sample clock divider.
+    sample_clock: SampleClock,
     samples: Vec<f32>,
     // If nothing drains the buffer (e.g. the nestest path), stop pushing
     // after ~1 second rather than growing without bound.
@@ -68,8 +93,7 @@ impl NesAPU {
             dmc: Dmc::new(),
             frame_counter: FrameCounter::new(),
             cycles: 0,
-            cycles_per_sample: 0.0,
-            sample_timer: 0.0,
+            sample_clock: SampleClock::new(DEFAULT_SAMPLE_RATE),
             samples: Vec::new(),
             max_buffered_samples: 0,
             hp90: HighPassFilter::new(90.0, DEFAULT_SAMPLE_RATE as f32),
@@ -83,7 +107,9 @@ impl NesAPU {
 
     // Call before running if the host audio device didn't open at 48 kHz.
     pub fn set_sample_rate(&mut self, sample_rate: u32) {
-        self.cycles_per_sample = CPU_HZ / sample_rate as f64;
+        assert!(sample_rate > 0, "sample rate must be nonzero");
+        assert!(u64::from(sample_rate) <= CPU_HZ, "sample rate exceeds CPU clock");
+        self.sample_clock.set_rate(sample_rate);
         self.max_buffered_samples = sample_rate as usize;
         self.hp90 = HighPassFilter::new(90.0, sample_rate as f32);
         self.hp440 = HighPassFilter::new(440.0, sample_rate as f32);
@@ -221,9 +247,7 @@ impl NesAPU {
             self.pulse2.tick_timer();
         }
 
-        self.sample_timer += 1.0;
-        if self.sample_timer >= self.cycles_per_sample {
-            self.sample_timer -= self.cycles_per_sample;
+        if self.sample_clock.advance(1) != 0 {
             let sample = self.mix();
             if self.samples.len() < self.max_buffered_samples {
                 self.samples.push(sample);
@@ -284,6 +308,10 @@ impl NesAPU {
     /// wait for the next vblank callback.
     pub fn buffered_samples(&self) -> usize {
         self.samples.len()
+    }
+
+    pub(crate) fn cpu_cycles(&self) -> u64 {
+        self.cycles as u64
     }
 
     /// Remove the oldest `count` samples while retaining any newer remainder.
@@ -388,15 +416,31 @@ mod test {
     }
 
     #[test]
-    fn sampling_produces_roughly_sample_rate_per_second() {
+    fn sampling_produces_exact_rate_after_one_cpu_clock_second() {
         let mut apu = NesAPU::new();
-        // One NTSC frame is 29780.5 CPU cycles; tick 60 frames' worth.
-        for _ in 0..1_786_830usize / 255 {
+        for _ in 0..CPU_HZ / 255 {
             apu.tick(255);
         }
+        apu.tick((CPU_HZ % 255) as u8);
         let n = apu.drain_samples().len();
-        // ~1 second of emulated time -> ~48000 samples (+-1%).
-        assert!((47000..49000).contains(&n), "got {} samples", n);
+        assert_eq!(n, DEFAULT_SAMPLE_RATE as usize);
+    }
+
+    #[test]
+    fn integer_sample_clock_has_zero_long_run_drift_and_is_chunk_independent() {
+        let two_minutes = CPU_HZ * 120;
+        let mut whole = SampleClock::new(DEFAULT_SAMPLE_RATE);
+        assert_eq!(
+            whole.advance(two_minutes),
+            u64::from(DEFAULT_SAMPLE_RATE) * 120
+        );
+        assert_eq!(whole.phase, 0);
+
+        let mut chunked = SampleClock::new(DEFAULT_SAMPLE_RATE);
+        let first = chunked.advance(two_minutes / 3);
+        let second = chunked.advance(two_minutes - two_minutes / 3);
+        assert_eq!(first + second, u64::from(DEFAULT_SAMPLE_RATE) * 120);
+        assert_eq!(chunked.phase, 0);
     }
 
     #[test]

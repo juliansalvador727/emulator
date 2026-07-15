@@ -8,7 +8,7 @@ and has a separate, lower-priority backlog at the end of this file.
 
 Current verified baseline (2026-07-15):
 
-- 248 passing Rust tests.
+- 250 passing Rust tests.
 - All 256 6502 opcodes (official and undocumented); `nestest` matches the
   reference for all 8,991 instruction lines. `instr_test-v5` (16/16),
   `instr_timing` (2/2), and `instr_misc` (4/4) pass.
@@ -302,12 +302,21 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
     lead over the other APU units -- swept leads 0/1/2 with **no effect at all**,
     because `sync_dmc.s` re-synchronizes the ROM to the DMC timer and cancels any
     global phase offset. The residual cycle was therefore in the servicing path.
-- [ ] Validate channel mixer levels, nonlinear mixing, filters, sample-rate
+- [x] Validate channel mixer levels, nonlinear mixing, filters, sample-rate
   conversion, and long-run clock drift against known references. `apu_mixer` 4/4
-  (square/triangle/noise/dmc) pass; long-run clock drift still unmeasured.
+  (square/triangle/noise/dmc) pass; the NESdev nonlinear equations and
+  90/440 Hz high-pass plus 14 kHz low-pass chain are covered by focused tests.
+  CPU-to-host conversion now uses an exact integer rational clock: it emits
+  exactly 48,000 samples per 1,789,773 NTSC CPU cycles and 5,760,000 over two
+  minutes, independent of tick batching. The 7,200-frame NROM/MMC1/MMC3 sweep
+  stays within one sample of its actual emulated-cycle oracle.
 - [ ] Add PAL and Dendy APU timing tables when region support is introduced.
-- [ ] Keep probe reporting for queue depth, drops, underflows, device reopens,
-  and sample drift green during timing changes.
+- [x] Keep probe reporting for queue depth, drops, underflows, device reopens,
+  and sample drift green during timing changes. `PROBE_MAX_SAMPLE_DRIFT` makes
+  drift an enforceable threshold; realtime runs can additionally set
+  `PROBE_REQUIRE_HEALTHY_AUDIO=1` to require a bounded available queue and zero
+  drops, underflows, or reopens. `probes/run_audio_validation.sh` checks all
+  three reviewed mapper cases for 7,200 frames by default.
 
 ## P1 — Low-latency host presentation, input, and audio
 

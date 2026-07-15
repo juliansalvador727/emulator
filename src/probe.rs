@@ -6,6 +6,7 @@
 //! and artifact-capture options.
 
 use crate::audio::{self, AudioPump};
+use crate::apu;
 use crate::bus::Bus;
 use crate::cartridge::Rom;
 use crate::cpu::CPU;
@@ -116,6 +117,23 @@ fn env_frames(name: &str) -> Result<BTreeSet<u32>, String> {
         .collect()
 }
 
+fn env_nonnegative_f64(name: &str) -> Result<Option<f64>, String> {
+    parse_nonnegative_f64(name, std::env::var(name).ok())
+}
+
+fn parse_nonnegative_f64(name: &str, value: Option<String>) -> Result<Option<f64>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_| format!("{name} must be a nonnegative number"))?;
+    if !parsed.is_finite() || parsed < 0.0 {
+        return Err(format!("{name} must be a nonnegative number"));
+    }
+    Ok(Some(parsed))
+}
+
 struct Config {
     shot_dir: Option<PathBuf>,
     shot_frames: BTreeSet<u32>,
@@ -126,6 +144,8 @@ struct Config {
     capture_radius: u32,
     realtime: bool,
     verbose: bool,
+    max_sample_drift: Option<f64>,
+    require_healthy_audio: bool,
 }
 
 impl Config {
@@ -160,6 +180,8 @@ impl Config {
                 .unwrap_or(2),
             realtime: env_flag("PROBE_REALTIME"),
             verbose: env_flag("PROBE_VERBOSE"),
+            max_sample_drift: env_nonnegative_f64("PROBE_MAX_SAMPLE_DRIFT")?,
+            require_healthy_audio: env_flag("PROBE_REQUIRE_HEALTHY_AUDIO"),
         })
     }
 }
@@ -170,6 +192,7 @@ struct FrameRow {
     host_ms: f64,
     samples: usize,
     cumulative_samples: u64,
+    cpu_cycles: u64,
     hash: u64,
     audio_backlog: u32,
     audio_queued: u32,
@@ -218,15 +241,16 @@ fn write_report(path: &Path, rows: &[FrameRow]) -> Result<(), String> {
             .map_err(|err| format!("create {}: {err}", parent.display()))?;
     }
     let mut out = String::from(
-        "frame,host_ms,samples,cumulative_samples,frame_hash,audio_backlog_bytes,audio_queued_bytes,audio_pending_bytes,oam_dmas,visible_ppu_writes,last_register,last_scanline,last_dot\n",
+        "frame,host_ms,samples,cumulative_samples,cpu_cycles,frame_hash,audio_backlog_bytes,audio_queued_bytes,audio_pending_bytes,oam_dmas,visible_ppu_writes,last_register,last_scanline,last_dot\n",
     );
     for row in rows {
         out.push_str(&format!(
-            "{},{:.6},{},{},{:016x},{},{},{},{},{},0x{:04x},{},{}\n",
+            "{},{:.6},{},{},{},{:016x},{},{},{},{},{},0x{:04x},{},{}\n",
             row.frame,
             row.host_ms,
             row.samples,
             row.cumulative_samples,
+            row.cpu_cycles,
             row.hash,
             row.audio_backlog,
             row.audio_queued,
@@ -335,6 +359,7 @@ pub fn run_probe(rom_path: &str, script: &str, max_frames: u32) -> Result<(), St
             host_ms,
             samples: frame_samples as usize,
             cumulative_samples,
+            cpu_cycles: apu.cpu_cycles(),
             hash,
             audio_backlog: backlog,
             audio_queued: queued,
@@ -479,8 +504,13 @@ pub fn run_probe(rom_path: &str, script: &str, max_frames: u32) -> Result<(), St
     // while a game is booting. Treat it as warm-up so accumulated pre-NMI
     // audio does not look like queue drift in an otherwise stable run.
     let warmup_samples = state.rows.first().map_or(0, |row| row.samples as u64);
-    let measured_frames = state.rows.len().saturating_sub(1);
-    let expected_samples = measured_frames as f64 * audio::SAMPLE_RATE as f64 / NES_FPS;
+    let measured_cycles = state
+        .rows
+        .last()
+        .zip(state.rows.first())
+        .map_or(0, |(last, first)| last.cpu_cycles - first.cpu_cycles);
+    let expected_samples = measured_cycles as f64 * audio::SAMPLE_RATE as f64
+        / apu::CPU_HZ as f64;
     let sample_drift = actual_samples.saturating_sub(warmup_samples) as f64 - expected_samples;
     let queue_depths: Vec<u32> = state
         .rows
@@ -534,6 +564,34 @@ pub fn run_probe(rom_path: &str, script: &str, max_frames: u32) -> Result<(), St
         reopens,
         state.baseline_failures.len(),
     );
+    if let Some(max_drift) = config.max_sample_drift {
+        if sample_drift.abs() > max_drift {
+            return Err(format!(
+                "audio sample drift {sample_drift:+.3} exceeds {max_drift:.3} samples"
+            ));
+        }
+    }
+    if config.require_healthy_audio {
+        if !config.realtime {
+            return Err("PROBE_REQUIRE_HEALTHY_AUDIO requires PROBE_REALTIME=1".into());
+        }
+        if queue_end == audio::BACKLOG_UNAVAILABLE {
+            return Err("host audio queue was unavailable during validation".into());
+        }
+        let high_water_bytes = audio_config
+            .high_water_samples()
+            .saturating_mul(audio::HOST_SAMPLE_BYTES);
+        if queue_max > high_water_bytes {
+            return Err(format!(
+                "audio backlog exceeded high-water mark: {queue_max} > {high_water_bytes} bytes"
+            ));
+        }
+        if dropped != 0 || underflows != 0 || reopens != 0 {
+            return Err(format!(
+                "host audio health check failed: dropped={dropped} underflows={underflows} reopens={reopens}"
+            ));
+        }
+    }
     if !state.baseline_failures.is_empty() {
         return Err(format!(
             "visual regression failed: {}",
@@ -553,6 +611,16 @@ mod tests {
         assert_eq!(presses.len(), 2);
         assert_eq!((presses[0].from, presses[0].to), (10, 12));
         assert_eq!((presses[1].from, presses[1].to), (20, u32::MAX));
+    }
+
+    #[test]
+    fn validation_threshold_rejects_invalid_numbers() {
+        assert!(parse_nonnegative_f64("drift", Some("nope".into())).is_err());
+        assert!(parse_nonnegative_f64("drift", Some("-1".into())).is_err());
+        assert_eq!(
+            parse_nonnegative_f64("drift", Some("0.5".into())).unwrap(),
+            Some(0.5)
+        );
     }
 
     #[test]
