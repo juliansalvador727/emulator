@@ -5,6 +5,36 @@
 //! means pass; text beginning at $6004 is a NUL-terminated diagnostic. Older
 //! PPU/MMC3 suites end in a `JMP`-to-self and leave result code 1 at $00F8 on
 //! success; that convention is supported as well.
+//!
+//! A third class reports no result this runner can see. It prints to an
+//! on-screen console and a bit-banged serial port, and self-checks with an
+//! internal `check_crc` -- there is no $6000 signature and no $00F8 code, so a
+//! run that completes normally still ends in "timed out ... without seeing the
+//! blargg signature". That is not a hang. `dmc_dma_during_read4` is one of
+//! these.
+//!
+//! To read one, set `PRINT_HOOK` to the hex address of the ROM's `print_char_`
+//! and every byte it prints is dumped to stderr at the end of the run:
+//!
+//! ```text
+//! PRINT_HOOK=e679 <emulator> test-rom dmc_dma_during_read4/dma_4016_read.nes 20000000
+//! ```
+//!
+//! $e679 is `print_char_` in `dmc_dma_during_read4`. In other ROMs, find it by
+//! scanning PRG for `JSR abs; JMP abs`: the shell defines `print_char_` as
+//! `jsr console_print / jmp serial_write`. There is no early exit, so pass an
+//! instruction cap that covers the run.
+//!
+//! Two traps when judging these ROMs:
+//!
+//! - The shipped .nes can disagree with the header comment in its `source/`
+//!   directory; the comments are stale and the `check_crc` constant compiled
+//!   into the binary is the only oracle. `dma_2007_write` genuinely passes while
+//!   printing output its own comment does not document.
+//! - `check_crc` is a standard CRC-32 over the *raw bytes* passed to
+//!   `print_a`/`print_hex`, not over the printed ASCII, and it excludes spaces
+//!   and newlines. So `zlib.crc32(bytes([...]))` against that constant predicts
+//!   pass/fail without running anything.
 
 use crate::bus::Bus;
 use crate::cartridge::Rom;
