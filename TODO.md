@@ -8,7 +8,7 @@ and has a separate, lower-priority backlog at the end of this file.
 
 Current verified baseline (2026-07-15):
 
-- 237 passing Rust tests.
+- 238 passing Rust tests.
 - All 256 6502 opcodes (official and undocumented); `nestest` matches the
   reference for all 8,991 instruction lines. `instr_test-v5` (16/16),
   `instr_timing` (2/2), and `instr_misc` (4/4) pass.
@@ -163,8 +163,18 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
   `dmc_dma_during_read4/dma_4016_read` and `dma_2007_read` now pass their compiled
   CRC oracles. `sprdma_and_dmc_dma`/`_512` still need exact per-alignment DMA
   cycle counts. The re-read count is a fixed 4-cycle
-  approximation until that lands. `4-irq_and_dma` additionally needs per-cycle
-  IRQ sampling through the DMA stall.
+  approximation until that lands. OAM and DMC now share an explicit get/put
+  phase machine: DMC halt/dummy/alignment phases overlap OAM accesses, its get
+  wins a collision, and OAM realigns afterward (including the one- and
+  three-cycle end-of-transfer shapes). The get/put phase is snapshotted instead
+  of being inferred from global CPU-cycle parity. Interrupt lines are observed
+  on every physical DMA cycle without advancing the halted 6502's instruction-
+  poll pipeline; a focused unit test covers an APU IRQ asserting during OAM
+  DMA. Remaining validation gaps: `sprdma_and_dmc_dma`/`_512` still report their
+  pre-existing failing cycle tables because standalone DMC request scheduling
+  is not yet phase-driven, and `4-irq_and_dma` remains one clock late at each
+  instruction-boundary transition (actual CRC `$60DD7EBF`, expected
+  `$43571959`).
 - Correction: `dmc_dma_during_read4/*` do NOT hang in `sync_dmc.s` (earlier claim
   disproven). They run to completion and report over console/serial with an
   internal CRC and no `$6000` signature, so the harness saw a timeout rather than

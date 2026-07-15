@@ -7,7 +7,7 @@ e.g. read data from 0x8000 into A reg:
 LDA $8000      <=>    ad 00 80
 */
 
-use crate::bus::{Bus, BusSnapshot};
+use crate::bus::{Bus, BusSnapshot, InterruptBatch};
 use crate::opcodes;
 use std::collections::HashMap;
 
@@ -90,8 +90,7 @@ pub struct CPU<'a> {
     // instruction-boundary recognition uses that point instead of `_delayed`.
     // This is the taken-branch IRQ-delay quirk `branch_delays_irq` checks.
     branch_poll: Option<(bool, bool)>,
-    // DMA cycles are serviced as soon as scheduled, while RDY applies their
-    // repeated CPU read to the following core bus slot.
+    // RDY takes effect on the core read slot after the DMA schedule point.
     dmc_repeats_next_read: bool,
     // When true, executing BRK ($00) returns from the run loop instead of
     // taking the interrupt. This core uses BRK as the halt sentinel for
@@ -145,7 +144,8 @@ impl Mem for CPU<'_> {
                 self.bus.repeat_dmc_halted_read(addr);
                 self.dmc_repeats_next_read = false;
             }
-            if self.bus.dmc_halt_before_next_read() {
+            if let Some(samples) = self.bus.dmc_halt_before_next_read() {
+                self.latch_halted_interrupts(samples);
                 self.dmc_repeats_next_read = true;
             }
         }
@@ -194,13 +194,35 @@ impl<'a> CPU<'a> {
     // detected (the PPU hands out each vblank edge once) and latched sticky.
     #[inline]
     fn cycle(&mut self) {
-        self.bus.tick(1);
+        let samples = self.bus.tick(1);
+        self.latch_cycle_batch(samples);
+    }
+
+    #[inline]
+    fn latch_cycle_batch(&mut self, samples: InterruptBatch) {
+        if samples.cycles == 0 {
+            return;
+        }
+        // The first sample belongs to the CPU core cycle. Any remaining
+        // samples occurred while RDY held the CPU for DMA: they update the
+        // live lines but do not advance the instruction poll pipeline.
         self.nmi_pending_delayed = self.nmi_pending;
-        if self.bus.poll_nmi_status().is_some() {
+        if samples.nmi_first {
             self.nmi_pending = true;
         }
         self.irq_line_delayed = self.irq_line;
-        self.irq_line = self.bus.poll_irq_status();
+        self.irq_line = samples.irq_first;
+        if samples.cycles > 1 {
+            self.latch_halted_interrupts(samples);
+        }
+    }
+
+    #[inline]
+    fn latch_halted_interrupts(&mut self, samples: InterruptBatch) {
+        if samples.nmi_any {
+            self.nmi_pending = true;
+        }
+        self.irq_line = samples.irq_last;
     }
 
     // Advance the machine one CPU cycle for a bus access performed while an
@@ -1530,9 +1552,9 @@ mod test {
             }
 
             cpu.executing = true;
-            let _ = cpu.mem_read(0x0000); // boundary that services the DMA
+            let _ = cpu.mem_read(0x0000);
             assert_eq!(cpu.dmc_repeats_next_read, with_dmc);
-            let _ = cpu.mem_read(0x4016); // following slot receives the repeats
+            let _ = cpu.mem_read(0x4016);
             assert!(!cpu.dmc_repeats_next_read);
             cpu.executing = false;
 
@@ -1544,6 +1566,31 @@ mod test {
         }
 
         assert_eq!(controller_shifts(true), controller_shifts(false) - 1);
+    }
+
+    #[test]
+    fn irq_samples_advance_through_oam_dma_stall() {
+        let bus = Bus::new(test::test_rom(vec![]), |_, _, _| {});
+        let mut cpu = CPU::new(bus);
+
+        // Put the APU one cycle before its frame IRQ, then let the $4014 bus
+        // cycle enter OAM DMA. The IRQ asserts at the beginning of the stall;
+        // sampling every physical DMA cycle must advance it into both stages
+        // of the CPU's interrupt-recognition pipeline.
+        for _ in 0..29_827 {
+            let _ = cpu.bus.tick(1);
+        }
+        cpu.executing = true;
+        cpu.mem_write(0x4014, 0x00);
+        cpu.executing = false;
+
+        assert!(cpu.irq_line);
+        assert!(!cpu.irq_line_delayed);
+
+        cpu.executing = true;
+        let _ = cpu.mem_read(0x0000);
+        cpu.executing = false;
+        assert!(cpu.irq_line_delayed);
     }
 
     #[test]
