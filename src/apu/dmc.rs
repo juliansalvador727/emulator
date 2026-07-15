@@ -14,6 +14,17 @@ const RATE_TABLE: [u16; 16] = [
     428, 380, 340, 320, 286, 254, 226, 214, 190, 160, 142, 128, 106, 84, 72, 54,
 ];
 
+/// Why the memory reader is asking the DMA unit for a byte.
+///
+/// Initial loads and output-buffer reloads begin on different APU phases on
+/// the 2A03, so the bus must be able to schedule them independently even
+/// though both ultimately fetch from `current_address`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DmcDmaRequestKind {
+    Load,
+    Reload,
+}
+
 #[derive(Clone)]
 pub struct Dmc {
     irq_enabled: bool,
@@ -29,6 +40,7 @@ pub struct Dmc {
     current_address: u16,
     pub bytes_remaining: u16,
     sample_buffer: Option<u8>,
+    dma_request_kind: Option<DmcDmaRequestKind>,
 
     // Output unit
     shift: u8,
@@ -51,6 +63,7 @@ impl Dmc {
             current_address: 0xc000,
             bytes_remaining: 0,
             sample_buffer: None,
+            dma_request_kind: None,
             shift: 0,
             bits_remaining: 8,
             silence: true,
@@ -91,8 +104,12 @@ impl Dmc {
         self.irq_flag = false;
         if !enabled {
             self.bytes_remaining = 0;
+            self.dma_request_kind = None;
         } else if self.bytes_remaining == 0 {
             self.restart_sample();
+            if self.sample_buffer.is_none() {
+                self.dma_request_kind = Some(DmcDmaRequestKind::Load);
+            }
         }
     }
 
@@ -113,9 +130,14 @@ impl Dmc {
         }
     }
 
+    pub(crate) fn dma_request_kind(&self) -> Option<DmcDmaRequestKind> {
+        self.dma_request().and(self.dma_request_kind)
+    }
+
     // Completion of the DMA fetch: fill the buffer, advance the reader, and
     // handle end-of-sample looping / IRQ.
     pub fn dma_load(&mut self, value: u8) {
+        self.dma_request_kind = None;
         self.sample_buffer = Some(value);
         // The address wraps from $FFFF back to $8000.
         self.current_address = if self.current_address == 0xffff {
@@ -163,6 +185,9 @@ impl Dmc {
                 Some(byte) => {
                     self.shift = byte;
                     self.silence = false;
+                    if self.bytes_remaining > 0 && self.dma_request_kind.is_none() {
+                        self.dma_request_kind = Some(DmcDmaRequestKind::Reload);
+                    }
                 }
                 None => self.silence = true,
             }
@@ -187,6 +212,45 @@ mod test {
         d.set_enabled(true);
         assert_eq!(d.bytes_remaining, 17);
         assert_eq!(d.dma_request(), Some(0xc080));
+        assert_eq!(d.dma_request_kind(), Some(DmcDmaRequestKind::Load));
+    }
+
+    #[test]
+    fn consuming_the_sample_buffer_requests_a_reload() {
+        let mut d = Dmc::new();
+        d.write_sample_length(0x01); // 17 bytes
+        d.set_enabled(true);
+        d.dma_load(0xaa);
+        assert_eq!(d.dma_request(), None);
+        assert_eq!(d.dma_request_kind(), None);
+
+        for _ in 0..8 {
+            d.clock_output_unit();
+        }
+
+        assert_eq!(d.dma_request(), Some(0xc001));
+        assert_eq!(d.dma_request_kind(), Some(DmcDmaRequestKind::Reload));
+    }
+
+    #[test]
+    fn restarting_with_a_buffered_byte_defers_the_reload_request() {
+        let mut d = Dmc::new();
+        d.write_sample_length(0x00); // one byte
+        d.set_enabled(true);
+        d.dma_load(0xaa);
+        assert_eq!(d.bytes_remaining, 0);
+
+        d.set_enabled(true);
+        assert_eq!(d.bytes_remaining, 1);
+        assert_eq!(d.dma_request(), None);
+        assert_eq!(d.dma_request_kind(), None);
+
+        for _ in 0..8 {
+            d.clock_output_unit();
+        }
+
+        assert_eq!(d.dma_request(), Some(0xc000));
+        assert_eq!(d.dma_request_kind(), Some(DmcDmaRequestKind::Reload));
     }
 
     #[test]

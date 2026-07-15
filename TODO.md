@@ -8,7 +8,7 @@ and has a separate, lower-priority backlog at the end of this file.
 
 Current verified baseline (2026-07-15):
 
-- 238 passing Rust tests.
+- 240 passing Rust tests.
 - All 256 6502 opcodes (official and undocumented); `nestest` matches the
   reference for all 8,991 instruction lines. `instr_test-v5` (16/16),
   `instr_timing` (2/2), and `instr_misc` (4/4) pass.
@@ -174,7 +174,15 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
   pre-existing failing cycle tables because standalone DMC request scheduling
   is not yet phase-driven, and `4-irq_and_dma` remains one clock late at each
   instruction-boundary transition (actual CRC `$60DD7EBF`, expected
-  `$43571959`).
+  `$43571959`). The DMC memory reader now labels the initial empty-buffer fetch
+  as a load and requests later bytes as reloads when the output unit consumes
+  its buffer; disabling cancels either request, and restarting with a buffered
+  byte correctly defers the reload. Two focused tests cover these transitions.
+  The next integration step must reconcile the core's one-slot-deferred RDY
+  side effects with the bus-cycle schedule before replacing the accepted fixed
+  four-cycle standalone sequence: moving repeats directly onto the apparent
+  held slot shifted the read-ROM collision oracle by one iteration without
+  changing either sprite-DMA collision table.
 - Correction: `dmc_dma_during_read4/*` do NOT hang in `sync_dmc.s` (earlier claim
   disproven). They run to completion and report over console/serial with an
   internal CRC and no `$6000` signature, so the harness saw a timeout rather than

@@ -1,5 +1,6 @@
 use std::rc::Rc;
 
+use crate::apu::dmc::DmcDmaRequestKind;
 use crate::apu::NesAPU;
 use crate::cartridge::Rom;
 use crate::cpu::Mem;
@@ -77,6 +78,9 @@ pub struct Bus<'call> {
     // The fallback in `tick` prevents a request from being dropped across a
     // stretch where the current instruction exposes no modeled read slot.
     dmc_pending_ticks: u8,
+    // Preserve whether the pending fetch is the initial load or an output-
+    // buffer reload so the phase scheduler can treat them independently.
+    dmc_pending_kind: Option<DmcDmaRequestKind>,
     // True while a DMC halt is repeating a $4016 read after the first repeat,
     // holding the controller's /OE asserted so the shift register does not clock.
     dmc_reread_holds_oe: bool,
@@ -99,6 +103,7 @@ pub struct BusSnapshot {
     // 513/514-cycle stall begins at the following CPU-cycle boundary.
     oam_dma_page: Option<u8>,
     dmc_pending_ticks: u8,
+    dmc_pending_kind: Option<DmcDmaRequestKind>,
     audio_delivery_enabled: bool,
     host_frame_ready: bool,
     joypad1: Joypad,
@@ -137,6 +142,7 @@ impl<'a> Bus<'a> {
             dma_get_cycle: false,
             oam_dma_page: None,
             dmc_pending_ticks: 0,
+            dmc_pending_kind: None,
             dmc_reread_holds_oe: false,
             gameloop_callback: Box::from(gameloop_callback),
             audio_chunk_samples: (audio_chunk_samples != usize::MAX)
@@ -177,13 +183,15 @@ impl<'a> Bus<'a> {
             self.run_oam_dma(page, &mut frame_ready, &mut interrupt_samples);
         }
 
-        if self.apu.dmc_dma_request().is_some() {
+        if let Some(kind) = self.apu.dmc_dma_request_kind() {
+            self.dmc_pending_kind.get_or_insert(kind);
             self.dmc_pending_ticks = self.dmc_pending_ticks.saturating_add(1);
             if self.dmc_pending_ticks >= 3 {
                 self.run_dmc_dma(&mut frame_ready, &mut interrupt_samples);
             }
         } else {
             self.dmc_pending_ticks = 0;
+            self.dmc_pending_kind = None;
         }
 
         self.deliver_audio_chunks();
@@ -320,6 +328,7 @@ impl<'a> Bus<'a> {
             return;
         };
         self.dmc_pending_ticks = 0;
+        self.dmc_pending_kind = None;
         // Standalone DMC alignment remains the accepted fixed four-cycle
         // approximation: three externally visible held reads, then the get.
         // OAM overlap uses the explicit phase machine above; making this path
@@ -338,9 +347,11 @@ impl<'a> Bus<'a> {
     // bus slots, so the address presented by the next slot is the one held
     // throughout the halt.
     pub fn dmc_halt_before_next_read(&mut self) -> Option<InterruptBatch> {
-        if self.apu.dmc_dma_request().is_none() {
+        if self.apu.dmc_dma_request_kind().is_none() {
             return None;
         }
+        self.dmc_pending_kind
+            .get_or_insert_with(|| self.apu.dmc_dma_request_kind().unwrap());
         let mut frame_ready = false;
         let mut interrupt_samples = InterruptBatch::default();
         self.run_dmc_dma(&mut frame_ready, &mut interrupt_samples);
@@ -395,6 +406,7 @@ impl<'a> Bus<'a> {
             dma_get_cycle: self.dma_get_cycle,
             oam_dma_page: self.oam_dma_page,
             dmc_pending_ticks: self.dmc_pending_ticks,
+            dmc_pending_kind: self.dmc_pending_kind,
             audio_delivery_enabled: self.audio_delivery_enabled,
             host_frame_ready: self.host_frame_ready,
             joypad1: self.joypad1.clone(),
@@ -410,6 +422,7 @@ impl<'a> Bus<'a> {
         self.dma_get_cycle = snapshot.dma_get_cycle;
         self.oam_dma_page = snapshot.oam_dma_page;
         self.dmc_pending_ticks = snapshot.dmc_pending_ticks;
+        self.dmc_pending_kind = snapshot.dmc_pending_kind;
         self.audio_delivery_enabled = snapshot.audio_delivery_enabled;
         self.host_frame_ready = snapshot.host_frame_ready;
         self.joypad1 = snapshot.joypad1;
