@@ -26,6 +26,9 @@ pub struct Bus<'call> {
     // Reset once serviced; the safety net in `tick` services it if the CPU runs
     // a stretch of non-read cycles so the fetch is never dropped.
     dmc_pending_ticks: u8,
+    // True while a DMC halt is repeating a $4016 read after the first repeat,
+    // holding the controller's /OE asserted so the shift register does not clock.
+    dmc_reread_holds_oe: bool,
     gameloop_callback: Box<dyn FnMut(&NesPPU, &mut NesAPU, &mut Joypad) + 'call>,
     audio_chunk_samples: Option<usize>,
     audio_callback: Box<dyn FnMut(Vec<f32>) + 'call>,
@@ -81,6 +84,7 @@ impl<'a> Bus<'a> {
             cycles: 0,
             oam_dma_page: None,
             dmc_pending_ticks: 0,
+            dmc_reread_holds_oe: false,
             gameloop_callback: Box::from(gameloop_callback),
             audio_chunk_samples: (audio_chunk_samples != usize::MAX)
                 .then_some(audio_chunk_samples),
@@ -214,16 +218,19 @@ impl<'a> Bus<'a> {
         };
         self.dmc_pending_ticks = 0;
         // Hardware re-reads 2-3 times depending on where the halt lands relative
-        // to the get/put phase; we always re-read three times. dmc_2007_read
-        // accepts the three-read variant, but dmc_4016_read shows the cost:
-        // $4016's shift register only advances once across the repeated reads,
-        // so three re-reads eat two bits too many. Deriving the count from
-        // `self.cycles` parity is not the fix - the DMA is driven off the
-        // handshake in Bus::tick rather than the DMC timer, so the halt already
-        // lands a cycle late and the parity here is not the hardware's phase.
-        for _ in 0..3 {
+        // to the get/put phase; we always re-read three times, which is the
+        // variant `dma_2007_read` accepts. Deriving the count from `self.cycles`
+        // parity is NOT the fix and hangs `dma_2007_write` (tried, reverted): the
+        // fetch is triggered from the handshake in `Bus::tick` rather than from
+        // the DMC timer, so the halt lands one cycle late and the parity here is
+        // not the hardware's get/put phase. Fixing that phase is what remains.
+        for i in 0..3 {
             if let Some(addr) = re_read {
+                // Only the first repeat clocks $4016; /OE stays asserted for the
+                // rest of the halt. See Joypad::peek.
+                self.dmc_reread_holds_oe = i > 0;
                 let _ = self.mem_read(addr);
+                self.dmc_reread_holds_oe = false;
             }
             self.dma_cpu_cycle(frame_ready);
         }
@@ -335,7 +342,13 @@ impl Mem for Bus<'_> {
                 self.mem_read(mirror_down_addr)
             }
             0x4015 => self.apu.read_status(),
-            0x4016 => self.joypad1.read(),
+            0x4016 => {
+                if self.dmc_reread_holds_oe {
+                    self.joypad1.peek()
+                } else {
+                    self.joypad1.read()
+                }
+            }
             // $4017 reads controller 2 on real hardware. This emulator only
             // exposes joypad 1, so return an idle value instead of spamming
             // stdout for games that poll both controller ports.
@@ -468,6 +481,40 @@ mod test {
             bus.tick(1);
         }
         assert_eq!(bus.mem_read(0x4015) & 0x10, 0); // 0 bytes remaining
+    }
+
+    #[test]
+    fn dmc_dma_during_a_4016_read_steals_exactly_one_shift() {
+        // The halt repeats the $4016 read three times, but /OE stays asserted
+        // across the repeats so the controller's shift register only clocks
+        // once. Together with the CPU's own read that is two clocks, not four:
+        // the single-bit loss behind the DMC controller-corruption bug.
+        fn read_4016_after_priming(with_dmc: bool) -> u8 {
+            let mut bus = test_bus();
+            bus.joypad1
+                .set_button_pressed_status(crate::joypad::JoypadButton::BUTTON_A, true);
+            bus.mem_write(0x4016, 1); // strobe: reload the shift register
+            bus.mem_write(0x4016, 0);
+            if with_dmc {
+                bus.mem_write(0x4012, 0x00);
+                bus.mem_write(0x4013, 0x00);
+                bus.mem_write(0x4015, 0x10); // enable DMC -> fetch pending
+                assert!(bus.apu.dmc_dma_request().is_some());
+            }
+            // One CPU read cycle of $4016, halted when a fetch is pending.
+            bus.dmc_halt_before_read(0x4016);
+            let _ = bus.mem_read(0x4016);
+            // Count reads until the register runs past button 8 and returns 1s.
+            let mut shifts = 1;
+            while bus.mem_read(0x4016) != 1 {
+                shifts += 1;
+            }
+            shifts
+        }
+        // A: pressed, so the 1 comes from running off the end of the register.
+        let plain = read_4016_after_priming(false);
+        let stolen = read_4016_after_priming(true);
+        assert_eq!(stolen, plain - 1, "the halt should steal exactly one shift");
     }
 
     #[test]
