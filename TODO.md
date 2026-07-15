@@ -8,7 +8,7 @@ and has a separate, lower-priority backlog at the end of this file.
 
 Current verified baseline (2026-07-15):
 
-- 240 passing Rust tests.
+- 243 passing Rust tests.
 - All 256 6502 opcodes (official and undocumented); `nestest` matches the
   reference for all 8,991 instruction lines. `instr_test-v5` (16/16),
   `instr_timing` (2/2), and `instr_misc` (4/4) pass.
@@ -155,24 +155,28 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
   DMA interaction (`bus.rs`: page copy with OAMADDR wrap, PPU/APU advancement
   across the whole stall, and a DMC steal during OAM DMA).
 - [~] Slice 4 (DMC-DMA-during-read): a non-OAM DMC fetch is serviced at a CPU
-  read-slot boundary (`Bus::dmc_halt_before_next_read`, called from
+  read-slot boundary (`Bus::schedule_dmc_halt`, called from
   `CPU::mem_read`), and RDY holds the following core read slot -- a
   side-effecting register ($2007/$4016) is read several times, the documented
   DMC-DMA-during-read behavior (unit test
   `dmc_dma_during_a_2007_read_repeats_the_read`).
   `dmc_dma_during_read4/dma_4016_read` and `dma_2007_read` now pass their compiled
-  CRC oracles. `sprdma_and_dmc_dma`/`_512` still need exact per-alignment DMA
-  cycle counts. The re-read count is a fixed 4-cycle
-  approximation until that lands. OAM and DMC now share an explicit get/put
+  CRC oracles. Standalone scheduling is now phase-driven: request age advances
+  on every physical CPU cycle, loads and reloads mature on their modeled
+  schedule phases, and a CPU write records a failed halt so the request retries
+  on the next cycle. The successful phase selects two or three held reads plus
+  the get (three or four DMA cycles), with scheduler and retry state preserved
+  by snapshots. Focused tests cover all four load/reload phase shapes and write
+  realignment. OAM and DMC share an explicit get/put
   phase machine: DMC halt/dummy/alignment phases overlap OAM accesses, its get
   wins a collision, and OAM realigns afterward (including the one- and
   three-cycle end-of-transfer shapes). The get/put phase is snapshotted instead
   of being inferred from global CPU-cycle parity. Interrupt lines are observed
   on every physical DMA cycle without advancing the halted 6502's instruction-
   poll pipeline; a focused unit test covers an APU IRQ asserting during OAM
-  DMA. Remaining validation gaps: `sprdma_and_dmc_dma`/`_512` still report their
-  pre-existing failing cycle tables because standalone DMC request scheduling
-  is not yet phase-driven, and `4-irq_and_dma` remains one clock late at each
+  DMA. Remaining validation gaps: `sprdma_and_dmc_dma`/`_512` still need their
+  OAM collision/end-window cycle tables resolved, and `4-irq_and_dma` remains
+  one clock late at each
   instruction-boundary transition (actual CRC `$60DD7EBF`, expected
   `$43571959`). The DMC memory reader now labels the initial empty-buffer fetch
   as a load and requests later bytes as reloads when the output unit consumes
@@ -183,9 +187,8 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
   core read, carrying the load/reload kind and the get/put phase at the schedule
   point through snapshots. A trace of `dma_4016_read` confirmed that this next
   slot is the one which must hold `$4016`; moving repeats onto the schedule-point
-  read shifts the ROM collision oracle by one iteration. The remaining step is
-  to use that token metadata for phase eligibility and a conditional 3/4-cycle
-  standalone sequence. Both sprite-DMA collision tables remain unchanged.
+  read shifts the ROM collision oracle by one iteration. The token metadata now
+  drives phase eligibility and the conditional standalone sequence.
 - Correction: `dmc_dma_during_read4/*` do NOT hang in `sync_dmc.s` (earlier claim
   disproven). They run to completion and report over console/serial with an
   internal CRC and no `$6000` signature, so the harness saw a timeout rather than

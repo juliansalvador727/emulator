@@ -156,6 +156,9 @@ impl Mem for CPU<'_> {
     }
 
     fn mem_write(&mut self, addr: u16, data: u8) {
+        if self.executing {
+            self.bus.note_dmc_cpu_write();
+        }
         self.bus.mem_write(addr, data);
         self.bus_cycle();
     }
@@ -1553,7 +1556,9 @@ mod test {
             }
 
             cpu.executing = true;
-            let _ = cpu.mem_read(0x0000);
+            for _ in 0..5 {
+                let _ = cpu.mem_read(0x0000);
+            }
             assert_eq!(cpu.dmc_held_read.is_some(), with_dmc);
             let _ = cpu.mem_read(0x4016);
             assert!(cpu.dmc_held_read.is_none());
