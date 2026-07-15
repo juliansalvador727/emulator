@@ -7,7 +7,7 @@ e.g. read data from 0x8000 into A reg:
 LDA $8000      <=>    ad 00 80
 */
 
-use crate::bus::{Bus, BusSnapshot};
+use crate::bus::{Bus, BusSnapshot, InterruptBatch};
 use crate::opcodes;
 use std::collections::HashMap;
 
@@ -90,9 +90,6 @@ pub struct CPU<'a> {
     // instruction-boundary recognition uses that point instead of `_delayed`.
     // This is the taken-branch IRQ-delay quirk `branch_delays_irq` checks.
     branch_poll: Option<(bool, bool)>,
-    // DMA cycles are serviced as soon as scheduled, while RDY applies their
-    // repeated CPU read to the following core bus slot.
-    dmc_repeats_next_read: bool,
     // When true, executing BRK ($00) returns from the run loop instead of
     // taking the interrupt. This core uses BRK as the halt sentinel for
     // nestest automation and the small `load_and_run` unit-test programs; test
@@ -112,7 +109,6 @@ pub struct CpuSnapshot {
     nmi_pending_delayed: bool,
     irq_line: bool,
     irq_line_delayed: bool,
-    dmc_repeats_next_read: bool,
     bus: BusSnapshot,
 }
 
@@ -137,16 +133,14 @@ pub trait Mem {
 
 impl Mem for CPU<'_> {
     fn mem_read(&mut self, addr: u16) -> u8 {
-        // RDY is sampled between core bus slots. Service a scheduled DMC DMA
-        // now, then apply its held/repeated address to the next CPU read slot.
-        // Inspection reads neither tick nor participate in DMA.
+        // RDY is sampled on the bus slot the CPU is attempting. If a DMC halt
+        // is eligible, hold and repeat this address through the no-access DMA
+        // cycles before allowing the CPU's read to complete. Inspection reads
+        // neither tick nor participate in DMA.
         if self.executing {
-            if self.dmc_repeats_next_read {
-                self.bus.repeat_dmc_halted_read(addr);
-                self.dmc_repeats_next_read = false;
-            }
-            if self.bus.dmc_halt_before_next_read() {
-                self.dmc_repeats_next_read = true;
+            if let Some(halt) = self.bus.schedule_dmc_halt() {
+                self.latch_halted_interrupts(halt.interrupt_samples);
+                self.bus.repeat_dmc_halted_read(addr, halt.held_read);
             }
         }
         let value = self.bus.mem_read(addr);
@@ -155,6 +149,9 @@ impl Mem for CPU<'_> {
     }
 
     fn mem_write(&mut self, addr: u16, data: u8) {
+        if self.executing {
+            self.bus.note_dmc_cpu_write();
+        }
         self.bus.mem_write(addr, data);
         self.bus_cycle();
     }
@@ -182,7 +179,6 @@ impl<'a> CPU<'a> {
             irq_line: false,
             irq_line_delayed: false,
             branch_poll: None,
-            dmc_repeats_next_read: false,
             halt_on_brk: true,
         }
     }
@@ -194,13 +190,35 @@ impl<'a> CPU<'a> {
     // detected (the PPU hands out each vblank edge once) and latched sticky.
     #[inline]
     fn cycle(&mut self) {
-        self.bus.tick(1);
+        let samples = self.bus.tick(1);
+        self.latch_cycle_batch(samples);
+    }
+
+    #[inline]
+    fn latch_cycle_batch(&mut self, samples: InterruptBatch) {
+        if samples.cycles == 0 {
+            return;
+        }
+        // The first sample belongs to the CPU core cycle. Any remaining
+        // samples occurred while RDY held the CPU for DMA: they update the
+        // live lines but do not advance the instruction poll pipeline.
         self.nmi_pending_delayed = self.nmi_pending;
-        if self.bus.poll_nmi_status().is_some() {
+        if samples.nmi_first {
             self.nmi_pending = true;
         }
         self.irq_line_delayed = self.irq_line;
-        self.irq_line = self.bus.poll_irq_status();
+        self.irq_line = samples.irq_first;
+        if samples.cycles > 1 {
+            self.latch_halted_interrupts(samples);
+        }
+    }
+
+    #[inline]
+    fn latch_halted_interrupts(&mut self, samples: InterruptBatch) {
+        if samples.nmi_any {
+            self.nmi_pending = true;
+        }
+        self.irq_line = samples.irq_last;
     }
 
     // Advance the machine one CPU cycle for a bus access performed while an
@@ -255,7 +273,6 @@ impl<'a> CPU<'a> {
             nmi_pending_delayed: self.nmi_pending_delayed,
             irq_line: self.irq_line,
             irq_line_delayed: self.irq_line_delayed,
-            dmc_repeats_next_read: self.dmc_repeats_next_read,
             bus: self.bus.snapshot(),
         }
     }
@@ -272,7 +289,6 @@ impl<'a> CPU<'a> {
         self.nmi_pending_delayed = snapshot.nmi_pending_delayed;
         self.irq_line = snapshot.irq_line;
         self.irq_line_delayed = snapshot.irq_line_delayed;
-        self.dmc_repeats_next_read = snapshot.dmc_repeats_next_read;
         self.bus.restore(snapshot.bus);
     }
 
@@ -842,7 +858,6 @@ impl<'a> CPU<'a> {
         self.register_y = 0;
         self.stack_pointer = STACK_RESET;
         self.status = CpuFlags::from_bits_truncate(0b100100);
-        self.dmc_repeats_next_read = false;
 
         self.program_counter = self.mem_read_u16(0xFFFC);
     }
@@ -1257,7 +1272,17 @@ impl<'a> CPU<'a> {
 
                 /* RTS */
                 0x60 => {
-                    self.program_counter = self.stack_pop_u16() + 1;
+                    // RTS has three observable reads in addition to its two
+                    // stack pulls: the byte after the opcode, the current
+                    // (pre-increment) stack address, and the pulled return
+                    // address before it is incremented. Keeping these in their
+                    // hardware order is essential when DMC DMA reaches the
+                    // first cycles after an OAM transfer.
+                    let _ = self.mem_read(self.program_counter);
+                    let _ = self.mem_read(STACK + self.stack_pointer as u16);
+                    let return_address = self.stack_pop_u16();
+                    let _ = self.mem_read(return_address);
+                    self.program_counter = return_address.wrapping_add(1);
                 }
 
                 /* RTI */
@@ -1514,7 +1539,7 @@ mod test {
     use crate::cartridge::test;
 
     #[test]
-    fn dmc_rdy_repeats_the_following_core_read_slot() {
+    fn dmc_rdy_repeats_the_current_core_read_slot() {
         fn controller_shifts(with_dmc: bool) -> u8 {
             let bus = Bus::new(test::test_rom(vec![]), |_, _, _| {});
             let mut cpu = CPU::new(bus);
@@ -1527,13 +1552,11 @@ mod test {
                 cpu.bus.mem_write(0x4012, 0);
                 cpu.bus.mem_write(0x4013, 0);
                 cpu.bus.mem_write(0x4015, 0x10);
+                cpu.bus.tick(3);
             }
 
             cpu.executing = true;
-            let _ = cpu.mem_read(0x0000); // boundary that services the DMA
-            assert_eq!(cpu.dmc_repeats_next_read, with_dmc);
-            let _ = cpu.mem_read(0x4016); // following slot receives the repeats
-            assert!(!cpu.dmc_repeats_next_read);
+            let _ = cpu.mem_read(0x4016);
             cpu.executing = false;
 
             let mut shifts = 1;
@@ -1544,6 +1567,31 @@ mod test {
         }
 
         assert_eq!(controller_shifts(true), controller_shifts(false) - 1);
+    }
+
+    #[test]
+    fn irq_samples_advance_through_oam_dma_stall() {
+        let bus = Bus::new(test::test_rom(vec![]), |_, _, _| {});
+        let mut cpu = CPU::new(bus);
+
+        // Put the APU one cycle before its frame IRQ, then let the $4014 bus
+        // cycle enter OAM DMA. The IRQ asserts at the beginning of the stall;
+        // sampling every physical DMA cycle must advance it into both stages
+        // of the CPU's interrupt-recognition pipeline.
+        for _ in 0..29_827 {
+            let _ = cpu.bus.tick(1);
+        }
+        cpu.executing = true;
+        cpu.mem_write(0x4014, 0x00);
+        cpu.executing = false;
+
+        assert!(cpu.irq_line);
+        assert!(!cpu.irq_line_delayed);
+
+        cpu.executing = true;
+        let _ = cpu.mem_read(0x0000);
+        cpu.executing = false;
+        assert!(cpu.irq_line_delayed);
     }
 
     #[test]

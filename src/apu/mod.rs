@@ -5,7 +5,7 @@
 // non-linear mixer into one f32 sample and buffered; the game loop drains
 // the buffer into the host audio device once per frame.
 
-use crate::apu::dmc::Dmc;
+use crate::apu::dmc::{Dmc, DmcDmaRequestKind};
 use crate::apu::filter::{HighPassFilter, LowPassFilter};
 use crate::apu::frame_counter::{FrameCounter, FrameEvent};
 use crate::apu::noise::Noise;
@@ -170,6 +170,10 @@ impl NesAPU {
     // DMC memory reader handshake; see Bus::tick.
     pub fn dmc_dma_request(&self) -> Option<u16> {
         self.dmc.dma_request()
+    }
+
+    pub(crate) fn dmc_dma_request_kind(&self) -> Option<DmcDmaRequestKind> {
+        self.dmc.dma_request_kind()
     }
 
     pub fn dmc_dma_load(&mut self, value: u8) {

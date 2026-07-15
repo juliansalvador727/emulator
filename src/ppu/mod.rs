@@ -59,6 +59,12 @@ pub struct NesPPU {
     // OAMADDR.
     oam_data_bus: u8,
     internal_data_buf: u8,
+    // The PPUDATA output latch cannot see a nametable-buffer refill soon
+    // enough for another CPU read on the immediately following CPU cycle.
+    // Keep the prior returned byte so that back-to-back reads still expose it,
+    // even though the second read's own VRAM fetch wins the buffer update.
+    last_data_read_at: Option<u64>,
+    last_data_read_result: u8,
     io_data_bus: u8,
     io_data_bus_refreshed_at: [u64; 8],
 
@@ -127,6 +133,8 @@ impl NesPPU {
             rendering_change_at: None,
             oam_data_bus: 0,
             internal_data_buf: 0,
+            last_data_read_at: None,
+            last_data_read_result: 0,
             io_data_bus: 0,
             io_data_bus_refreshed_at: [0; 8],
             scanline: 0,
@@ -902,9 +910,24 @@ impl NesPPU {
         self.increment_vram_addr();
 
         let result = if addr < 0x3f00 {
-            let result = self.internal_data_buf;
+            // A CPU cycle spans three PPU dots. When two PPUDATA reads occupy
+            // adjacent CPU cycles, the first read's VRAM refill has not reached
+            // the CPU-facing output latch before the second read samples it.
+            // The second fetch still completes, so the intermediate byte is
+            // skipped in the delayed buffer. This is observable with the page-
+            // crossing dummy read in `LDA $20F7,X` (X=$10).
+            let consecutive_cpu_read = self
+                .last_data_read_at
+                .is_some_and(|last| self.total_dots.wrapping_sub(last) == 3);
+            let result = if consecutive_cpu_read {
+                self.last_data_read_result
+            } else {
+                self.internal_data_buf
+            };
             self.internal_data_buf = self.ppu_bus_read(addr);
             self.drive_io_data_bus(result, 0xff);
+            self.last_data_read_at = Some(self.total_dots);
+            self.last_data_read_result = result;
             result
         } else {
             let palette = self.ppu_bus_read(addr);
@@ -920,6 +943,9 @@ impl NesPPU {
             // Palette reads are immediate but still refill the delayed buffer
             // from the mirrored nametable address beneath palette space.
             self.internal_data_buf = self.ppu_bus_read(addr - 0x1000);
+            // Palette RAM has its own immediate CPU-facing path; do not carry
+            // the nametable output-latch collision across it.
+            self.last_data_read_at = None;
             result
         };
         self.notify_ppu_address_bus();
@@ -1704,6 +1730,24 @@ pub mod test {
         ppu.write_to_ppu_addr(0x20);
         ppu.write_to_ppu_addr(0x00);
         assert_eq!(ppu.read_data(), 0x77);
+    }
+
+    #[test]
+    fn adjacent_cpu_cycle_data_reads_reuse_output_latch_but_skip_buffer_refill() {
+        let mut ppu = NesPPU::new_empty_rom();
+        ppu.internal_data_buf = 0x22;
+        ppu.vram[2] = 0x33;
+        ppu.vram[3] = 0x44;
+        ppu.write_to_ppu_addr(0x20);
+        ppu.write_to_ppu_addr(0x02);
+
+        assert_eq!(ppu.read_data(), 0x22);
+        ppu.tick(3); // the next CPU bus cycle
+        assert_eq!(ppu.read_data(), 0x22);
+
+        // The second fetch still won the delayed-buffer update, skipping $33.
+        ppu.tick(4);
+        assert_eq!(ppu.read_data(), 0x44);
     }
 
     #[test]

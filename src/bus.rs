@@ -1,5 +1,6 @@
 use std::rc::Rc;
 
+use crate::apu::dmc::DmcDmaRequestKind;
 use crate::apu::NesAPU;
 use crate::cartridge::Rom;
 use crate::cpu::Mem;
@@ -12,6 +13,89 @@ const RAM_MIRRORS_END: u16 = 0x1FFF;
 // const PPU_REGISTERS: u16 = 0x2000; unused
 const PPU_REGISTERS_MIRRORS_END: u16 = 0x3FFF;
 
+/// Interrupt lines as sampled during one physical CPU cycle.
+///
+/// A single core cycle can contain hundreds of additional cycles while DMA
+/// owns the bus. This compact batch preserves edges and the first/final line
+/// levels without allocating on every emulated CPU cycle. Halted DMA cycles
+/// update live lines but do not advance the 6502's instruction poll pipeline.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InterruptBatch {
+    pub cycles: u16,
+    pub nmi_any: bool,
+    pub nmi_first: bool,
+    pub irq_first: bool,
+    pub irq_last: bool,
+}
+
+impl InterruptBatch {
+    #[inline]
+    fn push(&mut self, nmi_edge: bool, irq_line: bool) {
+        if self.cycles == 0 {
+            self.nmi_first = nmi_edge;
+            self.irq_first = irq_line;
+        }
+        self.nmi_any |= nmi_edge;
+        self.irq_last = irq_line;
+        self.cycles = self.cycles.saturating_add(1);
+    }
+}
+
+/// The core read slot held by RDY while a DMC transfer owns the bus.
+///
+/// Elapsed DMA cycles are accounted immediately; this token carries the
+/// request shape needed to apply the externally visible no-access reads to the
+/// same CPU address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DmcHeldRead {
+    repeated_reads: u8,
+    request_kind: DmcDmaRequestKind,
+    scheduled_on_get: bool,
+    write_delays: u8,
+}
+
+impl DmcHeldRead {
+    pub(crate) fn repeated_reads(self) -> u8 {
+        self.repeated_reads
+    }
+}
+
+#[inline]
+fn standalone_dmc_repeated_reads(
+    kind: DmcDmaRequestKind,
+    scheduled_on_get: bool,
+) -> u8 {
+    match kind {
+        DmcDmaRequestKind::Load if scheduled_on_get => 2,
+        DmcDmaRequestKind::Load => 3,
+        DmcDmaRequestKind::Reload if scheduled_on_get => 2,
+        DmcDmaRequestKind::Reload => 3,
+    }
+}
+
+pub(crate) struct DmcHaltResult {
+    pub(crate) interrupt_samples: InterruptBatch,
+    pub(crate) held_read: DmcHeldRead,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OamDmaPhase {
+    Halt,
+    Align,
+    Get,
+    Put,
+    Done,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DmcDmaPhase {
+    Idle,
+    Halt,
+    Dummy,
+    Align,
+    Get,
+}
+
 pub struct Bus<'call> {
     cpu_vram: [u8; 2048],
     mapper: SharedMapper,
@@ -19,13 +103,24 @@ pub struct Bus<'call> {
     pub apu: NesAPU,
 
     cycles: usize,
+    // DMA reads are allowed only on get cycles; writes occur on put cycles.
+    // This phase is independent state in the hardware (its relationship to
+    // CPU cycle parity is random at power-on), so do not derive it from
+    // `cycles`. We choose one deterministic power-on alignment.
+    dma_get_cycle: bool,
     // Page selected by the last $4014 write, consumed on the next tick so the
     // 513/514-cycle stall begins at the following CPU-cycle boundary.
     oam_dma_page: Option<u8>,
-    // Cycles a DMC sample fetch has been waiting without a read cycle to steal.
-    // Reset once serviced; the safety net in `tick` services it if the CPU runs
-    // a stretch of non-read cycles so the fetch is never dropped.
+    // Physical CPU cycles since the current DMC request was raised. Loads need
+    // the second following APU cycle before they may halt; reloads are eligible
+    // immediately on their required phase.
     dmc_pending_ticks: u8,
+    // Preserve whether the pending fetch is the initial load or an output-
+    // buffer reload so the phase scheduler can treat them independently.
+    dmc_pending_kind: Option<DmcDmaRequestKind>,
+    // Consecutive CPU writes after an eligible halt attempt. DMA retries each
+    // cycle; odd delay parity swaps whether alignment is required.
+    dmc_write_delays: u8,
     // True while a DMC halt is repeating a $4016 read after the first repeat,
     // holding the controller's /OE asserted so the shift register does not clock.
     dmc_reread_holds_oe: bool,
@@ -43,10 +138,13 @@ pub struct BusSnapshot {
     ppu: NesPPU,
     apu: NesAPU,
     cycles: usize,
+    dma_get_cycle: bool,
     // Page selected by the last $4014 write, consumed on the next tick so the
     // 513/514-cycle stall begins at the following CPU-cycle boundary.
     oam_dma_page: Option<u8>,
     dmc_pending_ticks: u8,
+    dmc_pending_kind: Option<DmcDmaRequestKind>,
+    dmc_write_delays: u8,
     audio_delivery_enabled: bool,
     host_frame_ready: bool,
     joypad1: Joypad,
@@ -82,8 +180,11 @@ impl<'a> Bus<'a> {
             ppu: ppu,
             apu: NesAPU::new(),
             cycles: 0,
+            dma_get_cycle: false,
             oam_dma_page: None,
             dmc_pending_ticks: 0,
+            dmc_pending_kind: None,
+            dmc_write_delays: 0,
             dmc_reread_holds_oe: false,
             gameloop_callback: Box::from(gameloop_callback),
             audio_chunk_samples: (audio_chunk_samples != usize::MAX)
@@ -109,32 +210,19 @@ impl<'a> Bus<'a> {
         }
     }
 
-    pub fn tick(&mut self, cycles: u8) {
-        self.cycles += cycles as usize;
-        self.apu.tick(cycles);
-        self.ppu.tick(cycles * 3);
-        let mut frame_ready = self.ppu.take_frame_ready();
+    pub fn tick(&mut self, cycles: u8) -> InterruptBatch {
+        let mut interrupt_samples = InterruptBatch::default();
+        let mut frame_ready = false;
+        for _ in 0..cycles {
+            self.clock_cpu_cycle(&mut frame_ready, &mut interrupt_samples);
+        }
 
         // OAM DMA halts the CPU and copies a page into OAM one byte per pair
         // of CPU cycles. Deferring it to the tick after the $4014 write means
         // the halt begins at the following CPU-cycle boundary, and the modeled
         // get/put cycles keep the PPU and APU running throughout.
         if let Some(page) = self.oam_dma_page.take() {
-            self.run_oam_dma(page, &mut frame_ready);
-        }
-
-        // A DMC sample fetch outside an OAM DMA is serviced at a CPU read-slot
-        // boundary (`dmc_halt_before_next_read`), so RDY can hold the following
-        // read slot's address -- the DMC-DMA-during-read behavior.
-        // As a safety net for a rare run of non-read cycles, service a pending
-        // fetch here without a re-read once it has been waiting.
-        if self.apu.dmc_dma_request().is_some() {
-            self.dmc_pending_ticks = self.dmc_pending_ticks.saturating_add(1);
-            if self.dmc_pending_ticks >= 3 {
-                self.run_dmc_dma(&mut frame_ready);
-            }
-        } else {
-            self.dmc_pending_ticks = 0;
+            self.run_oam_dma(page, &mut frame_ready, &mut interrupt_samples);
         }
 
         self.deliver_audio_chunks();
@@ -147,17 +235,90 @@ impl<'a> Bus<'a> {
             self.host_frame_ready = true;
             (self.gameloop_callback)(&self.ppu, &mut self.apu, &mut self.joypad1);
         }
+
+        interrupt_samples
     }
 
-    // One halted CPU cycle: the CPU is stopped for DMA, but the PPU (3 dots)
-    // and APU (1 cycle) keep running. Returns nothing; `frame_ready` collects
-    // any vblank that starts mid-transfer so the host frame is not lost.
+    // One physical CPU cycle. The PPU and APU advance, host-frame state is
+    // retained, and interrupt lines are sampled at their hardware boundaries.
     #[inline]
-    fn dma_cpu_cycle(&mut self, frame_ready: &mut bool) {
+    fn clock_cpu_cycle(
+        &mut self,
+        frame_ready: &mut bool,
+        interrupt_samples: &mut InterruptBatch,
+    ) {
+        // The CPU samples the IRQ input before the APU advances for this
+        // physical cycle. A frame IRQ raised by `apu.tick` is therefore
+        // visible to the CPU on the following cycle, while $4015 can observe
+        // and clear the newly raised flag immediately.
+        let irq_line = self.poll_irq_status();
         self.cycles += 1;
         self.apu.tick(1);
         self.ppu.tick(3);
         *frame_ready |= self.ppu.take_frame_ready();
+        interrupt_samples.push(
+            self.ppu.poll_nmi_interrupt().is_some(),
+            irq_line,
+        );
+        self.observe_dmc_request();
+        self.dma_get_cycle = !self.dma_get_cycle;
+    }
+
+    fn observe_dmc_request(&mut self) {
+        match self.apu.dmc_dma_request_kind() {
+            Some(kind) if self.dmc_pending_kind == Some(kind) => {
+                self.dmc_pending_ticks = self.dmc_pending_ticks.saturating_add(1);
+            }
+            Some(kind) => {
+                self.dmc_pending_kind = Some(kind);
+                self.dmc_pending_ticks = 1;
+                self.dmc_write_delays = 0;
+            }
+            None => {
+                self.dmc_pending_kind = None;
+                self.dmc_pending_ticks = 0;
+                self.dmc_write_delays = 0;
+            }
+        }
+    }
+
+    #[inline]
+    fn dmc_load_ready(&self) -> bool {
+        self.dmc_pending_ticks >= 3
+    }
+
+    // Loads attempt to halt on get and reloads on put. A failed write makes
+    // the following read eligible regardless of phase.
+    #[inline]
+    fn standalone_dmc_eligible(&self) -> bool {
+        if self.dmc_write_delays > 0 {
+            return self.dmc_pending_kind.is_some();
+        }
+        match self.dmc_pending_kind {
+            Some(DmcDmaRequestKind::Load) => self.dmc_load_ready() && self.dma_get_cycle,
+            Some(DmcDmaRequestKind::Reload) => !self.dma_get_cycle,
+            None => false,
+        }
+    }
+
+    /// A scheduled DMC halt cannot stop a CPU write. Once the base schedule is
+    /// eligible, remember each failed write attempt so the next read is halted
+    /// regardless of phase and the alignment parity can be selected exactly.
+    pub(crate) fn note_dmc_cpu_write(&mut self) {
+        if self.dmc_write_delays > 0 || self.standalone_dmc_eligible() {
+            self.dmc_write_delays = self.dmc_write_delays.saturating_add(1);
+        }
+    }
+
+    // During OAM DMA there is no deferred core read, so use the hardware halt
+    // phases directly: delayed loads on get, reloads on put.
+    #[inline]
+    fn oam_dmc_eligible(&self) -> bool {
+        match self.dmc_pending_kind {
+            Some(DmcDmaRequestKind::Load) => self.dmc_load_ready() && self.dma_get_cycle,
+            Some(DmcDmaRequestKind::Reload) => !self.dma_get_cycle,
+            None => false,
+        }
     }
 
     // Perform one OAM DMA. The transfer is 512 alternating get (read) and put
@@ -165,93 +326,167 @@ impl<'a> Bus<'a> {
     // an odd CPU cycle, an alignment cycle. This reproduces the hardware
     // 513/514-cycle stall and places every read and write on its real CPU
     // cycle rather than copying the page atomically.
-    fn run_oam_dma(&mut self, page: u8, frame_ready: &mut bool) {
+    fn run_oam_dma(
+        &mut self,
+        page: u8,
+        frame_ready: &mut bool,
+        interrupt_samples: &mut InterruptBatch,
+    ) {
         self.ppu.note_oam_dma_start();
         let base = (page as u16) << 8;
+        let mut oam_phase = OamDmaPhase::Halt;
+        let mut dmc_phase = DmcDmaPhase::Idle;
+        let mut offset = 0u16;
+        let mut oam_latch = 0u8;
 
-        // Halt cycle, plus an alignment cycle when the DMA begins on an odd
-        // CPU cycle. Evaluated at entry so the stall is 513 cycles on an even
-        // boundary and 514 on an odd one.
-        let alignment = self.cycles & 1;
-        for _ in 0..(1 + alignment) {
-            self.dma_cpu_cycle(frame_ready);
-        }
+        // Both DMA units advance on the same get/put cadence. DMC no-access
+        // phases overlap OAM work; only the DMC get steals the bus. This makes
+        // a middle collision cost two cycles, a collision on the penultimate
+        // OAM put cost one, and one on the final put cost three.
+        while oam_phase != OamDmaPhase::Done || dmc_phase != DmcDmaPhase::Idle {
+            if dmc_phase == DmcDmaPhase::Idle && self.oam_dmc_eligible() {
+                dmc_phase = DmcDmaPhase::Halt;
+            }
 
-        for offset in 0..256u16 {
-            // The DMC memory reader has priority over OAM DMA and steals the
-            // bus on a get cycle before the OAM read is allowed to proceed.
-            self.service_dmc_during_oam(frame_ready);
+            let starting_oam_phase = oam_phase;
+            let starting_dmc_phase = dmc_phase;
+            let dmc_get = dmc_phase == DmcDmaPhase::Get && self.dma_get_cycle;
+            if dmc_get {
+                let addr = self
+                    .apu
+                    .dmc_dma_request()
+                    .expect("active DMC DMA lost its request before the get cycle");
+                let value = self.mem_read(addr);
+                self.apu.dmc_dma_load(value);
+            } else {
+                match oam_phase {
+                    OamDmaPhase::Get if self.dma_get_cycle => {
+                        oam_latch = self.mem_read(base + offset);
+                        oam_phase = OamDmaPhase::Put;
+                    }
+                    OamDmaPhase::Put if !self.dma_get_cycle => {
+                        self.ppu.oam_dma_write(oam_latch);
+                        offset += 1;
+                        oam_phase = if offset == 256 {
+                            OamDmaPhase::Done
+                        } else {
+                            OamDmaPhase::Get
+                        };
+                    }
+                    _ => {}
+                }
+            }
 
-            let value = self.mem_read(base + offset); // get cycle
-            self.dma_cpu_cycle(frame_ready);
-            self.ppu.oam_dma_write(value); // put cycle
-            self.dma_cpu_cycle(frame_ready);
+            self.clock_cpu_cycle(frame_ready, interrupt_samples);
+
+            // Halt and alignment are phase-selection cycles. They transition
+            // according to the phase of the *next* physical CPU cycle.
+            oam_phase = match starting_oam_phase {
+                OamDmaPhase::Halt => {
+                    if self.dma_get_cycle {
+                        OamDmaPhase::Get
+                    } else {
+                        OamDmaPhase::Align
+                    }
+                }
+                OamDmaPhase::Align => OamDmaPhase::Get,
+                _ => oam_phase,
+            };
+            dmc_phase = match starting_dmc_phase {
+                DmcDmaPhase::Idle => DmcDmaPhase::Idle,
+                DmcDmaPhase::Halt => DmcDmaPhase::Dummy,
+                DmcDmaPhase::Dummy => {
+                    if self.dma_get_cycle {
+                        DmcDmaPhase::Get
+                    } else {
+                        DmcDmaPhase::Align
+                    }
+                }
+                DmcDmaPhase::Align => DmcDmaPhase::Get,
+                DmcDmaPhase::Get if dmc_get => DmcDmaPhase::Idle,
+                DmcDmaPhase::Get => DmcDmaPhase::Get,
+            };
         }
     }
 
-    // DMC/OAM DMA arbitration. When the DMC's sample buffer empties during an
-    // OAM DMA the DMC steals the bus: it inserts a halt/alignment cycle and
-    // then reads its byte on a get cycle. That is two CPU cycles of added
-    // stall per fetch on top of the OAM transfer, with the OAM read that would
-    // have happened simply delayed. The rarer sub-cycle case where the steal
-    // lands so as to corrupt an OAM byte depends on the exact CPU bus cycle of
-    // the fetch and is deferred to the cycle-accurate CPU work; OAM data
-    // integrity is preserved here, matching the common aligned behavior.
-    fn service_dmc_during_oam(&mut self, frame_ready: &mut bool) {
-        if let Some(addr) = self.apu.dmc_dma_request() {
-            self.dma_cpu_cycle(frame_ready); // halt/alignment cycle
-            let value = self.mem_read(addr);
-            self.apu.dmc_dma_load(value);
-            self.dma_cpu_cycle(frame_ready); // DMC get cycle
-        }
-    }
-
-    // Service a pending DMC sample fetch: RDY halts the CPU for four cycles.
+    // Service a phase-eligible DMC fetch. The held-slot token determines
+    // whether the sequence has halt+dummy+get or also needs alignment.
     // The core applies the externally visible repeats of its held read address
-    // separately, at the following read slot; this routine advances the three
-    // non-get cycles and the DMC get itself.
-    fn run_dmc_dma(&mut self, frame_ready: &mut bool) {
+    // separately, at the following read slot; this routine advances the two or
+    // three no-access cycles and the DMC get itself.
+    fn run_dmc_dma(
+        &mut self,
+        repeated_reads: u8,
+        frame_ready: &mut bool,
+        interrupt_samples: &mut InterruptBatch,
+    ) {
         let Some(dmc_addr) = self.apu.dmc_dma_request() else {
             return;
         };
         self.dmc_pending_ticks = 0;
-        // Hardware re-reads 2-3 times depending on where the halt lands relative
-        // to the get/put phase; we always re-read three times, which is the
-        // variant `dma_2007_read` accepts. Deriving the count from `self.cycles`
-        // parity is NOT the fix and hangs `dma_2007_write` (tried, reverted): the
-        // fixed count remains the accepted approximation until get/put phase is
-        // modeled independently. The CPU core applies these three externally
-        // visible repeats to the correct read slot.
-        for _ in 0..3 {
-            self.dma_cpu_cycle(frame_ready);
+        self.dmc_pending_kind = None;
+        self.dmc_write_delays = 0;
+        for _ in 0..repeated_reads {
+            self.clock_cpu_cycle(frame_ready, interrupt_samples);
         }
         let value = self.mem_read(dmc_addr); // get cycle
         self.apu.dmc_dma_load(value);
-        self.dma_cpu_cycle(frame_ready);
+        self.clock_cpu_cycle(frame_ready, interrupt_samples);
     }
 
-    // Start the pending DMA at its scheduled cycle, but leave the CPU-side
-    // repeated read for the core's next read slot. RDY is sampled between core
-    // bus slots, so the address presented by the next slot is the one held
-    // throughout the halt.
-    pub fn dmc_halt_before_next_read(&mut self) -> bool {
-        if self.apu.dmc_dma_request().is_none() {
-            return false;
+    // Start the pending DMA on the CPU read slot being attempted. The caller
+    // applies the returned token's no-access reads to that same held address.
+    pub(crate) fn schedule_dmc_halt(&mut self) -> Option<DmcHaltResult> {
+        if self.dmc_pending_kind.is_none() {
+            if let Some(kind) = self.apu.dmc_dma_request_kind() {
+                self.dmc_pending_kind = Some(kind);
+            }
         }
+        if !self.standalone_dmc_eligible() {
+            return None;
+        }
+        let request_kind = self.dmc_pending_kind.unwrap();
+        let repeated_reads =
+            standalone_dmc_repeated_reads(request_kind, self.dma_get_cycle);
+        let held_read = DmcHeldRead {
+            repeated_reads,
+            request_kind,
+            scheduled_on_get: self.dma_get_cycle,
+            write_delays: self.dmc_write_delays,
+        };
         let mut frame_ready = false;
-        self.run_dmc_dma(&mut frame_ready);
+        let mut interrupt_samples = InterruptBatch::default();
+        self.run_dmc_dma(repeated_reads, &mut frame_ready, &mut interrupt_samples);
         if frame_ready {
             self.host_frame_ready = true;
             (self.gameloop_callback)(&self.ppu, &mut self.apu, &mut self.joypad1);
         }
-        true
+        Some(DmcHaltResult {
+            interrupt_samples,
+            held_read,
+        })
     }
 
-    // Drive the CPU's held read address on the three non-get DMA cycles. The
-    // elapsed cycles were accounted for when the DMA was serviced; this method
-    // applies only the externally visible register-read side effects.
-    pub fn repeat_dmc_halted_read(&mut self, addr: u16) {
-        for i in 0..3 {
+    // Drive the CPU's held address on each no-access DMA cycle. Elapsed cycles
+    // were accounted when DMA was serviced; this applies only visible read
+    // side effects.
+    pub(crate) fn repeat_dmc_halted_read(&mut self, addr: u16, held_read: DmcHeldRead) {
+        debug_assert!(
+            held_read.repeated_reads
+                == standalone_dmc_repeated_reads(
+                    held_read.request_kind,
+                    held_read.scheduled_on_get,
+                ),
+            "unexpected {:?} DMC repeat count on {} schedule phase after {} writes",
+            held_read.request_kind,
+            if held_read.scheduled_on_get {
+                "get"
+            } else {
+                "put"
+            },
+            held_read.write_delays
+        );
+        for i in 0..held_read.repeated_reads() {
             self.dmc_reread_holds_oe = i > 0;
             let _ = self.mem_read(addr);
             self.dmc_reread_holds_oe = false;
@@ -288,8 +523,11 @@ impl<'a> Bus<'a> {
             ppu,
             apu: self.apu.clone(),
             cycles: self.cycles,
+            dma_get_cycle: self.dma_get_cycle,
             oam_dma_page: self.oam_dma_page,
             dmc_pending_ticks: self.dmc_pending_ticks,
+            dmc_pending_kind: self.dmc_pending_kind,
+            dmc_write_delays: self.dmc_write_delays,
             audio_delivery_enabled: self.audio_delivery_enabled,
             host_frame_ready: self.host_frame_ready,
             joypad1: self.joypad1.clone(),
@@ -302,8 +540,11 @@ impl<'a> Bus<'a> {
         self.ppu = snapshot.ppu;
         self.apu = snapshot.apu;
         self.cycles = snapshot.cycles;
+        self.dma_get_cycle = snapshot.dma_get_cycle;
         self.oam_dma_page = snapshot.oam_dma_page;
         self.dmc_pending_ticks = snapshot.dmc_pending_ticks;
+        self.dmc_pending_kind = snapshot.dmc_pending_kind;
+        self.dmc_write_delays = snapshot.dmc_write_delays;
         self.audio_delivery_enabled = snapshot.audio_delivery_enabled;
         self.host_frame_ready = snapshot.host_frame_ready;
         self.joypad1 = snapshot.joypad1;
@@ -471,6 +712,27 @@ mod test {
     }
 
     #[test]
+    fn frame_irq_flag_precedes_the_cpu_irq_sample_by_one_cycle() {
+        let mut bus = test_bus();
+
+        for _ in 0..2_982 {
+            bus.tick(10);
+        }
+        bus.tick(7);
+        assert!(!bus.poll_irq_status());
+
+        // This APU clock raises the frame IRQ flag, so $4015 can see it at
+        // once. The CPU's IRQ input was sampled before that APU clock and
+        // does not observe the asserted line until its next physical cycle.
+        let assertion_cycle = bus.tick(1);
+        assert!(!assertion_cycle.irq_first);
+        assert!(bus.poll_irq_status());
+
+        let following_cycle = bus.tick(1);
+        assert!(following_cycle.irq_first);
+    }
+
+    #[test]
     fn dmc_dma_fetches_sample_bytes_from_prg_rom() {
         let mut bus = test_bus();
         // test_rom PRG is all zeroes; what matters here is that enabling
@@ -478,17 +740,73 @@ mod test {
         bus.mem_write(0x4012, 0x00); // sample address $C000
         bus.mem_write(0x4013, 0x00); // length 1 byte
         bus.mem_write(0x4015, 0x10); // enable DMC
-        // The fetch is serviced on the next CPU read cycle; with no CPU driving
-        // reads here, the tick safety net services it after a few cycles.
-        for _ in 0..4 {
-            bus.tick(1);
+        for _ in 0..3 {
+            let _ = bus.tick(1);
         }
+        assert!(bus.schedule_dmc_halt().is_some());
         assert_eq!(bus.mem_read(0x4015) & 0x10, 0); // 0 bytes remaining
     }
 
     #[test]
+    fn standalone_dmc_shapes_follow_request_kind_and_schedule_phase() {
+        assert_eq!(
+            standalone_dmc_repeated_reads(DmcDmaRequestKind::Load, true),
+            2
+        );
+        assert_eq!(
+            standalone_dmc_repeated_reads(DmcDmaRequestKind::Load, false),
+            3
+        );
+        assert_eq!(
+            standalone_dmc_repeated_reads(DmcDmaRequestKind::Reload, true),
+            2
+        );
+        assert_eq!(
+            standalone_dmc_repeated_reads(DmcDmaRequestKind::Reload, false),
+            3
+        );
+    }
+
+    #[test]
+    fn dmc_halt_retries_after_a_cpu_write_and_realigns() {
+        let mut bus = test_bus();
+        bus.mem_write(0x4012, 0x00);
+        bus.mem_write(0x4013, 0x00);
+        bus.mem_write(0x4015, 0x10);
+        bus.tick(3); // mature load request on its get schedule phase
+        assert!(bus.standalone_dmc_eligible());
+
+        bus.note_dmc_cpu_write();
+        bus.tick(1); // failed halt/write advances to put
+        let halt = bus.schedule_dmc_halt().unwrap();
+        assert_eq!(halt.held_read.write_delays, 1);
+        assert!(!halt.held_read.scheduled_on_get);
+        assert_eq!(halt.held_read.repeated_reads, 3); // 4-cycle DMA
+    }
+
+    #[test]
+    fn dmc_retry_state_survives_snapshot_restore() {
+        let mut bus = test_bus();
+        bus.mem_write(0x4012, 0x00);
+        bus.mem_write(0x4013, 0x00);
+        bus.mem_write(0x4015, 0x10);
+        bus.tick(3);
+        bus.note_dmc_cpu_write();
+        bus.tick(1);
+        let snapshot = bus.snapshot();
+
+        bus.tick(2);
+        bus.restore(snapshot);
+
+        let halt = bus.schedule_dmc_halt().unwrap();
+        assert_eq!(halt.held_read.write_delays, 1);
+        assert!(!halt.held_read.scheduled_on_get);
+        assert_eq!(halt.held_read.repeated_reads, 3);
+    }
+
+    #[test]
     fn dmc_dma_during_a_4016_read_steals_exactly_one_shift() {
-        // The halt repeats the $4016 read three times, but /OE stays asserted
+        // This aligned load repeats $4016 twice, but /OE stays asserted
         // across the repeats so the controller's shift register only clocks
         // once. Together with the CPU's own read that is two clocks, not four:
         // the single-bit loss behind the DMC controller-corruption bug.
@@ -504,11 +822,14 @@ mod test {
                 bus.mem_write(0x4015, 0x10); // enable DMC -> fetch pending
                 assert!(bus.apu.dmc_dma_request().is_some());
             }
-            // The pending fetch is serviced at the preceding read-slot
-            // boundary; RDY then holds this $4016 slot for its repeats.
+            // RDY holds this $4016 slot for the pending fetch's repeats.
             if with_dmc {
-                assert!(bus.dmc_halt_before_next_read());
-                bus.repeat_dmc_halted_read(0x4016);
+                bus.tick(3);
+                let halt = bus.schedule_dmc_halt().unwrap();
+                assert_eq!(halt.held_read.request_kind, DmcDmaRequestKind::Load);
+                assert!(halt.held_read.scheduled_on_get);
+                assert_eq!(halt.held_read.repeated_reads, 2);
+                bus.repeat_dmc_halted_read(0x4016, halt.held_read);
             }
             let _ = bus.mem_read(0x4016);
             // Count reads until the register runs past button 8 and returns 1s.
@@ -549,12 +870,14 @@ mod test {
             bus.mem_write(0x2006, 0x20);
             bus.mem_write(0x2006, 0x00);
             let _ = bus.mem_read(0x2007);
-            // Service the DMA at the preceding read-slot boundary, then let
-            // RDY hold this $2007 slot throughout the halt.
+            // Let RDY hold this $2007 slot throughout the halt.
+            if with_dmc {
+                bus.tick(3);
+            }
             let cycles_before = bus.cycles;
             if with_dmc {
-                assert!(bus.dmc_halt_before_next_read());
-                bus.repeat_dmc_halted_read(0x2007);
+                let halt = bus.schedule_dmc_halt().unwrap();
+                bus.repeat_dmc_halted_read(0x2007, halt.held_read);
             }
             let value = bus.mem_read(0x2007);
             (value, bus.cycles - cycles_before)
@@ -562,11 +885,9 @@ mod test {
 
         let (plain, plain_cycles) = read_2007_after_priming(false);
         let (stolen, stolen_cycles) = read_2007_after_priming(true);
-        // Three extra $2007 reads during the four-cycle DMC halt advance the
-        // buffered value three positions past the un-stolen read.
-        assert_eq!(stolen, plain.wrapping_add(3));
+        assert_eq!(stolen, plain.wrapping_add(2));
         assert_eq!(plain_cycles, 0); // no halt when nothing is pending
-        assert_eq!(stolen_cycles, 4); // four-cycle DMC steal
+        assert_eq!(stolen_cycles, 3);
     }
 
     #[test]
