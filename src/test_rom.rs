@@ -42,10 +42,6 @@ pub fn run(path: &str, max_instructions: u64) -> Result<(), String> {
         if let Some(hook) = print_hook {
             if cpu.program_counter == hook {
                 captured.push(cpu.register_a as char);
-                if captured.trim_end().ends_with("Passed") || captured.trim_end().ends_with("Failed")
-                {
-                    return true;
-                }
             }
         }
         let status = cpu.mem_read(STATUS_ADDR);

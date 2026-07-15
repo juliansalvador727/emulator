@@ -213,14 +213,15 @@ impl<'a> Bus<'a> {
             return;
         };
         self.dmc_pending_ticks = 0;
-        // The DMC's get (sample fetch) must land on a "get" cycle. RDY halts the
-        // CPU for a halt + dummy cycle, re-reading its own address, plus one
-        // extra alignment cycle when the get would otherwise fall on a "put"
-        // (odd) cycle. That is the 2-or-3 extra reads real hardware performs on
-        // a DMC-DMA-during-read, rather than a fixed three. The get read is
-        // aligned to an odd global cycle, matching the OAM DMA get alignment.
-        let stalls = if self.cycles % 2 == 0 { 3 } else { 2 };
-        for _ in 0..stalls {
+        // Hardware re-reads 2-3 times depending on where the halt lands relative
+        // to the get/put phase; we always re-read three times. dmc_2007_read
+        // accepts the three-read variant, but dmc_4016_read shows the cost:
+        // $4016's shift register only advances once across the repeated reads,
+        // so three re-reads eat two bits too many. Deriving the count from
+        // `self.cycles` parity is not the fix - the DMA is driven off the
+        // handshake in Bus::tick rather than the DMC timer, so the halt already
+        // lands a cycle late and the parity here is not the hardware's phase.
+        for _ in 0..3 {
             if let Some(addr) = re_read {
                 let _ = self.mem_read(addr);
             }
