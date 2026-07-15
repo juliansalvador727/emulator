@@ -8,7 +8,7 @@ and has a separate, lower-priority backlog at the end of this file.
 
 Current verified baseline (2026-07-15):
 
-- 243 passing Rust tests.
+- 244 passing Rust tests.
 - All 256 6502 opcodes (official and undocumented); `nestest` matches the
   reference for all 8,991 instruction lines. `instr_test-v5` (16/16),
   `instr_timing` (2/2), and `instr_misc` (4/4) pass.
@@ -16,8 +16,8 @@ Current verified baseline (2026-07-15):
 - Dot-driven background and sprite rendering with mapper-visible PPU fetches.
 - P1 PPU register and memory behavior complete. OAM DMA is modeled as real
   alternating get/put cycles with OAMADDR wrapping, and DMC DMA arbitrates with
-  it on get cycles; the remaining sub-cycle DMA fidelity is gated on the
-  cycle-accurate CPU bus-timing work.
+  it on get cycles. Standalone DMC phase scheduling, OAM collision/end-window
+  timing, and per-cycle IRQ sampling during DMA now pass their timing ROMs.
 - Five-channel APU including DMC DMA, filtering, and SDL3 bound-stream playback.
 - Audio stall watchdog with staged recovery; stream open/destroy isolated on a
   helper thread (see the host audio section below for the WSLg failure model).
@@ -215,7 +215,7 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
   matches the reference for all 8,991 instruction lines. Test ROM results
   (blargg `$6000`): `instr_test-v5` 16/16, `instr_timing` 2/2, and
   `instr_misc` 4/4 (including all four dummy-read groups) pass.
-- [~] Audit instruction, interrupt, reset, and DMA timing at bus-cycle
+- [x] Audit instruction, interrupt, and DMA timing at bus-cycle
   granularity. Instruction timing (`instr_timing`), dummy reads (`instr_misc`),
   page-cross penalties, and one-instruction CLI/SEI/PLP interrupt latency (IRQ
   is polled at the instruction boundary using the pre-instruction I flag) are
@@ -231,18 +231,20 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
   latches `_delayed` line states), a unified 7-cycle `service_interrupt` for
   BRK/IRQ/NMI with a late (PCL-push) vector decision so a pending NMI hijacks a
   BRK/IRQ vector, RTI's immediate I-flag effect, and the branch-specific poll
-  point (end of cycle 2). `cpu_interrupts_v2`: `1-cli_latency` and
-  `2-nmi_and_brk` now PASS (were failing); no regressions (nestest, instr_*,
-  ppu_vbl_nmi, visual baselines all green). `3-nmi_and_irq` and
-  `4-irq_and_dma` now pass as well. The remaining `5-branch_delays_irq` case
-  uses `sync_apu`/`CUSTOM_IRQ` and needs exact APU frame-counter IRQ timing (the
-  separate "APU correctness" item below).
+  point (end of cycle 2). All five `cpu_interrupts_v2` ROMs now pass, including
+  `4-irq_and_dma` across its complete 528-alignment IRQ/DMA boundary table and
+  `5-branch_delays_irq` after the exact APU frame-counter IRQ timing work. There
+  are no regressions in nestest, instr_*, ppu_vbl_nmi, or the visual baselines.
   Slice 3 (done, no code needed): all 7 `vbl_nmi_timing` sub-tests
   (`1.frame_basics`..`7.nmi_timing`) now pass with NO compensating PPU offset --
   the per-cycle CPU timing places each register access on its true cycle, and
   the only PPU/CPU sync constants are the legitimate 3/6-dot NMI clock-domain
   delays (`nmi_interrupt_at`). `ppu_vbl_nmi` (10/10) and `oam_read` stay green.
-  Still to do: the DMA sub-cycle cases (slice 4). See the plan file.
+  Slice 4 is complete: standalone DMC DMA uses explicit load/reload phases,
+  OAM/DMC arbitration handles collisions and both transfer-end windows, and
+  halted DMA cycles preserve per-cycle interrupt samples without advancing the
+  instruction poll pipeline. The focused unit tests, all three DMC-during-read
+  DMA ROMs, both sprite/DMC ROMs, and `4-irq_and_dma` pass.
 - [ ] Implement accurate reset and power-cycle state separately; do not treat
   application startup, reset, and save-state restore as the same operation.
   (Still one `reset()`; power-on vs. reset RAM/APU/PPU differences are unmodeled.)
