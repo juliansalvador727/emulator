@@ -89,7 +89,7 @@ at `$6000-$6004`, plus older PPU/MMC3 suites that return a code at `$00F8`,
 without opening SDL video or audio:
 
 ```sh
-cargo run --release -- test-rom test-roms/local/example.nes 50000000
+cargo lin --release -- test-rom test-roms/local/example.nes 50000000
 ```
 
 For a repeatable P0 suite, copy legally obtained test ROMs under
@@ -112,3 +112,13 @@ The runner rejects hash mismatches and writes a tab-separated report containing
 the emulator Git revision, NTSC configuration, case, ROM hash, result, and
 diagnostic. Set `P0_RESULTS` to retain that report at a specific path. Missing,
 mismatched, or failing cases make the command fail.
+
+The focused mapper suite adds the CPU dummy-write prerequisites for MMC1 and
+the passing revision-B MMC3 cases:
+
+```sh
+./test-roms/run_mapper_validation.sh
+```
+
+Both runners use native Linux by default. Override `NES_TEST_TARGET` when a
+different executable target is required.

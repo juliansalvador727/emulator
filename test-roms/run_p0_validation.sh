@@ -9,10 +9,12 @@ if [ ! -f "$manifest" ]; then
     exit 2
 fi
 
-cargo build --release
+target=${NES_TEST_TARGET:-x86_64-unknown-linux-gnu}
+cargo build --release --target "$target"
+emulator="target/$target/release/julian_nes_emulator"
 revision=$(git rev-parse --verify HEAD 2>/dev/null || echo unknown)
 results=${P0_RESULTS:-"${TMPDIR:-/tmp}/nes-p0-results-$$.tsv"}
-configuration=ntsc-default
+configuration="ntsc-default/$target"
 printf 'revision\tconfiguration\tcase\tsha256\tresult\tdetail\n' >"$results"
 case_count=0
 
@@ -23,6 +25,12 @@ while IFS='|' read -r id rom expected_hash max_instructions; do
     case_count=$((case_count + 1))
 
     rom_path=$rom
+    if [ ! -f "$rom_path" ]; then
+        relative_rom=${rom#test-roms/local/}
+        if [ -f "nes-test-roms/$relative_rom" ]; then
+            rom_path="nes-test-roms/$relative_rom"
+        fi
+    fi
     if [ ! -f "$rom_path" ] && [ -n "${NES_TEST_ROMS_ROOT:-}" ]; then
         relative_rom=${rom#test-roms/local/}
         rom_path=${NES_TEST_ROMS_ROOT%/}/$relative_rom
@@ -42,7 +50,7 @@ while IFS='|' read -r id rom expected_hash max_instructions; do
     fi
 
     output=${TMPDIR:-/tmp}/nes-p0-$id-$$.log
-    if target/release/julian_nes_emulator test-rom "$rom_path" "$max_instructions" >"$output" 2>&1; then
+    if "$emulator" test-rom "$rom_path" "$max_instructions" >"$output" 2>&1; then
         result=PASS
     else
         result=FAIL
@@ -52,7 +60,7 @@ while IFS='|' read -r id rom expected_hash max_instructions; do
     rm -f "$output"
 done <"$manifest"
 
-echo "P0 test-ROM results: $results"
+echo "test-ROM results: $results"
 if [ "$case_count" -eq 0 ]; then
     echo "no test ROMs configured in $manifest" >&2
     exit 2
