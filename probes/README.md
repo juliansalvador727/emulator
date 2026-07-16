@@ -51,7 +51,8 @@ Run all reviewed cases with:
 ./probes/run_visual_regressions.sh
 ```
 
-Run the two-minute audio-clock acceptance sweep across NROM, MMC1, and MMC3:
+Run the two-minute audio-clock acceptance sweep across the reviewed NROM,
+MMC1, MMC3, and MMC2 cases:
 
 ```sh
 ./probes/run_audio_validation.sh

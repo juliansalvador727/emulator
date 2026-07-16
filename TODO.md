@@ -6,9 +6,9 @@ model, native Windows build). The Rust emulator at the repository root is the
 active project; the older C emulator under `NES/` is retained as a reference
 and has a separate, lower-priority backlog at the end of this file.
 
-Current verified baseline (2026-07-15):
+Current verified baseline (2026-07-16):
 
-- 265 passing Rust tests.
+- 271 passing Rust tests.
 - All 256 6502 opcodes (official and undocumented); `nestest` matches the
   reference for all 8,991 instruction lines. `instr_test-v5` (16/16),
   `instr_timing` (2/2), and `instr_misc` (4/4) pass.
@@ -18,10 +18,12 @@ Current verified baseline (2026-07-15):
 - Power-on and front-panel reset are separate operations with a seven-cycle
   reset-vector sequence. Both `cpu_reset` ROMs and all six `apu_reset` ROMs
   pass; `apu_reset/4017_timing` reports the expected 10-clock delay.
-- NROM, MMC1, UxROM, CNROM, standard MMC3, AxROM, and GxROM/GNROM, with
-  explicit reset-state coverage. MMC1 includes SUROM/SXROM banking and
-  consecutive-write suppression; MMC3 includes PRG-RAM protection, six-bit
-  PRG bank registers, and four-screen nametable RAM.
+- NROM, MMC1, UxROM, CNROM, standard MMC3, AxROM, MMC2/PxROM, and
+  GxROM/GNROM, with explicit reset-state coverage. MMC1 includes SUROM/SXROM
+  banking and consecutive-write suppression; MMC3 includes PRG-RAM
+  protection, six-bit PRG bank registers, and four-screen nametable RAM. MMC2
+  uses post-read FD/FE CHR latches and runs Mike Tyson's Punch-Out!! into a
+  playable bout.
 - Cartridge memory is typed as ROM, volatile RAM, nonvolatile RAM, or absent.
   Battery-backed PRG/CHR RAM uses atomic `.sav` replacement and supports the
   configurable `NES_SAVE_DIR` location.
@@ -443,6 +445,9 @@ audio never reaches SDL.
 
 ## P2 — Mapper and game-library expansion
 
+- [x] Add mapper 9 (MMC2/PxROM) for Mike Tyson's Punch-Out!!: one switchable
+  and three fixed PRG banks, paired 4 KiB FD/FE CHR banks with post-read latch
+  changes, runtime mirroring, bank wrapping, and front-reset coverage.
 - [ ] Choose new mappers from a documented target game library rather than
   numerical order. Record the motivating ROM/test ROM and expected behavior.
 - [ ] Highest-value current candidates:
@@ -474,6 +479,7 @@ audio never reaches SDL.
   result, emulator revision, and relevant region/configuration.
 - [ ] Expand ROM-level visual baselines when a new mapper or timing-sensitive
   behavior is added; keep copyrighted ROMs out of git when licensing requires.
+  Mapper 9 now has reviewed opponent-card, ring-entry, and in-bout frames.
 - [ ] Add sprite-overflow state and other new timing signals to probe capture
   reports when those features are implemented.
 - [ ] Re-profile NROM, MMC1, and MMC3 after the dot renderer lands; preserve

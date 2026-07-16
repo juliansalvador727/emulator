@@ -603,6 +603,12 @@ impl Mem for Bus<'_> {
                 let mirror_down_addr = addr & 0b00100000_00000111;
                 self.mem_read(mirror_down_addr)
             }
+            // APU channel registers and OAMDMA are write-only. Games such as
+            // Mike Tyson's Punch-Out!! read them while copying register
+            // shadows; until the CPU data-bus latch is modeled, expose the
+            // existing deterministic open-bus fallback without logging every
+            // access.
+            0x4000..=0x4014 => 0,
             0x4015 => self.apu.read_status(),
             0x4016 => {
                 if self.dmc_reread_holds_oe {
@@ -717,6 +723,14 @@ mod test {
     fn joypad2_reads_do_not_fall_through_to_unmapped_io() {
         let mut bus = test_bus();
         assert_eq!(bus.mem_read(0x4017), 0);
+    }
+
+    #[test]
+    fn write_only_apu_and_dma_registers_have_deterministic_read_fallback() {
+        let mut bus = test_bus();
+        for addr in 0x4000..=0x4014 {
+            assert_eq!(bus.mem_read(addr), 0, "register ${addr:04X}");
+        }
     }
 
     #[test]

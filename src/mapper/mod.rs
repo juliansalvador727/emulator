@@ -10,6 +10,7 @@ pub mod axrom;
 pub mod cnrom;
 pub mod gnrom;
 pub mod mmc1;
+pub mod mmc2;
 pub mod mmc3;
 pub mod nrom;
 pub mod uxrom;
@@ -18,6 +19,7 @@ use axrom::Axrom;
 use cnrom::Cnrom;
 use gnrom::Gnrom;
 use mmc1::Mmc1;
+use mmc2::Mmc2;
 use mmc3::Mmc3;
 use nrom::Nrom;
 use uxrom::Uxrom;
@@ -183,6 +185,7 @@ pub fn from_rom(rom: Rom) -> SharedMapper {
         3 => Box::new(Cnrom::from_rom(rom)),
         4 => Box::new(Mmc3::from_rom(rom)),
         7 => Box::new(Axrom::from_rom(rom)),
+        9 => Box::new(Mmc2::from_rom(rom)),
         66 => Box::new(Gnrom::from_rom(rom)),
         other => panic!("Mapper {} is not supported yet", other),
     };

@@ -20,7 +20,8 @@ documentation and test ROMs are the sources of truth for hardware behaviour.
   sprite-0 hit timing, vblank/NMI races, and odd-frame skipping
 - Background and sprite rendering, including 8×16 sprites, priority, clipping,
   and the eight-sprites-per-line limit
-- NROM (0), MMC1 (1), UxROM (2), CNROM (3), MMC3 (4), AxROM (7), and GxROM (66)
+- NROM (0), MMC1 (1), UxROM (2), CNROM (3), MMC3 (4), AxROM (7),
+  MMC2/PxROM (9), and GxROM (66)
 - Fetch-driven MMC3 IRQs using qualified PPU A12 edges
 - Battery-backed cartridge RAM with atomic `.sav` replacement
 - Pulse, triangle, noise, and DMC audio with IRQs, DMA, filtering, and SDL3
@@ -34,7 +35,7 @@ documentation and test ROMs are the sources of truth for hardware behaviour.
 - Native Windows cross-build from WSL, wired as the default `cargo run` target
 - Headless performance probes and deterministic visual regression tests
 
-The Rust suite contains 265 passing tests. All five `cpu_interrupts_v2` ROMs,
+The Rust suite contains 271 passing tests. All five `cpu_interrupts_v2` ROMs,
 both `cpu_reset` ROMs, all six `apu_reset` ROMs, and the eight `apu_test` singles
 also pass. The prioritized remaining work is tracked in [`TODO.md`](TODO.md).
 
