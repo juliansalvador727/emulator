@@ -215,6 +215,7 @@ mod tests {
             prg_rom: vec![0; 0x8000],
             chr_rom: vec![],
             mapper: 0,
+            metadata: crate::cartridge::CartridgeMetadata::test_defaults(),
             screen_mirroring: Mirroring::Vertical,
             memory: CartridgeMemory {
                 prg_rom: MemoryRegion::new(MemoryKind::Rom, 0x8000),

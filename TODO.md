@@ -8,7 +8,7 @@ and has a separate, lower-priority backlog at the end of this file.
 
 Current verified baseline (2026-07-16):
 
-- 271 passing Rust tests.
+- 274 passing Rust tests.
 - All 256 6502 opcodes (official and undocumented); `nestest` matches the
   reference for all 8,991 instruction lines. `instr_test-v5` (16/16),
   `instr_timing` (2/2), and `instr_misc` (4/4) pass.
@@ -26,7 +26,9 @@ Current verified baseline (2026-07-16):
   playable bout.
 - Cartridge memory is typed as ROM, volatile RAM, nonvolatile RAM, or absent.
   Battery-backed PRG/CHR RAM uses atomic `.sav` replacement and supports the
-  configurable `NES_SAVE_DIR` location.
+  configurable `NES_SAVE_DIR` location. NES 2.0 parsing preserves separate
+  volatile/NVRAM sizes, extended mapper/submapper fields, and both ROM-size
+  encodings.
 - Dot-driven background and sprite rendering with mapper-visible PPU fetches.
 - P1 PPU register and memory behavior complete. OAM DMA is modeled as real
   alternating get/put cycles with OAMADDR wrapping, and DMC DMA arbitrates with
@@ -432,16 +434,20 @@ audio never reaches SDL.
 
 ## P1 — Cartridge formats and region metadata
 
-- [ ] Parse NES 2.0 headers, mapper extensions, submappers, exponent/multiplier
-  ROM sizes, PRG/CHR RAM and NVRAM sizes, console type, and region timing.
+- [x] Parse NES 2.0 identification, 12-bit mapper IDs, submappers, linear and
+  exponent/multiplier PRG/CHR ROM sizes, and separate PRG/CHR RAM/NVRAM sizes.
+- [ ] Parse the remaining NES 2.0 console type and region timing metadata.
 - [ ] Use NES 2.0 submappers to select MMC3 board/revision differences instead
   of applying them to standard iNES mapper 4.
-- [ ] Improve iNES validation for malformed/truncated files and ambiguous
-  archaic headers while retaining trainer support.
+- [x] Reject short headers, invalid format markers, truncated trainer/ROM
+  payloads, and host-size arithmetic overflow while retaining trainer support.
+- [ ] Decide compatibility policy for ambiguous archaic/dirty iNES headers.
 - [x] Use iNES battery and RAM metadata to configure mapper memory and
-  persistence; extend this to split RAM/NVRAM fields with NES 2.0 parsing.
+  persistence; preserve split RAM/NVRAM sizes when parsing NES 2.0.
+- [ ] Teach mapper memory and persistence to expose simultaneous NES 2.0
+  volatile RAM and NVRAM as distinct runtime regions.
 - [ ] Select NTSC/PAL/Dendy timing from metadata with an explicit user override.
-- [ ] Add parser fixtures for valid and invalid iNES/NES 2.0 combinations.
+- [x] Add parser fixtures for valid and invalid iNES/NES 2.0 combinations.
 
 ## P2 — Mapper and game-library expansion
 

@@ -96,6 +96,7 @@ mod test {
             prg_rom,
             chr_rom,
             mapper: 66,
+            metadata: crate::cartridge::CartridgeMetadata::test_defaults(),
             screen_mirroring: Mirroring::Vertical,
         }
     }

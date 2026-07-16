@@ -24,6 +24,8 @@ documentation and test ROMs are the sources of truth for hardware behaviour.
   MMC2/PxROM (9), and GxROM (66)
 - Fetch-driven MMC3 IRQs using qualified PPU A12 edges
 - Battery-backed cartridge RAM with atomic `.sav` replacement
+- iNES and NES 2.0 header parsing, including 12-bit mapper IDs, submappers,
+  both ROM-size encodings, and separate RAM/NVRAM size metadata
 - Pulse, triangle, noise, and DMC audio with IRQs, DMA, filtering, and SDL3
   playback
 - Automatic recovery from wedged host audio (stall watchdog with staged
@@ -35,7 +37,7 @@ documentation and test ROMs are the sources of truth for hardware behaviour.
 - Native Windows cross-build from WSL, wired as the default `cargo run` target
 - Headless performance probes and deterministic visual regression tests
 
-The Rust suite contains 271 passing tests. All five `cpu_interrupts_v2` ROMs,
+The Rust suite contains 274 passing tests. All five `cpu_interrupts_v2` ROMs,
 both `cpu_reset` ROMs, all six `apu_reset` ROMs, and the eight `apu_test` singles
 also pass. The prioritized remaining work is tracked in [`TODO.md`](TODO.md).
 
@@ -254,9 +256,9 @@ cargo lin -- tiles /path/to/game.nes
   remain incomplete.
 - OAM DMA uses alternating get/put bus cycles with complete DMC-DMA arbitration,
   including start, middle, and end-window collisions.
-- NES 2.0, PAL/Dendy timing, save states, and a second controller remain to be
-  implemented. MMC3 board/revision variants remain gated on NES 2.0 submapper
-  metadata.
+- NES 2.0 console/region metadata, PAL/Dendy timing, save states, and a second
+  controller remain to be implemented. MMC3 board/revision selection does not
+  yet consume the parsed NES 2.0 submapper metadata.
 
 ## License
 

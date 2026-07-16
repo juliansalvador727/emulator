@@ -1093,6 +1093,7 @@ pub mod test {
             prg_rom: vec![0; 0x8000],
             chr_rom: vec![0; 0x2000],
             mapper: 4,
+            metadata: crate::cartridge::CartridgeMetadata::test_defaults(),
             screen_mirroring: Mirroring::Vertical,
             memory: crate::cartridge::CartridgeMemory::test_defaults(0x8000, 0x2000),
             save_path: None,

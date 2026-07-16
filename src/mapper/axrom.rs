@@ -94,6 +94,7 @@ mod test {
             prg_rom,
             chr_rom: vec![],
             mapper: 7,
+            metadata: crate::cartridge::CartridgeMetadata::test_defaults(),
             screen_mirroring: Mirroring::Horizontal, // ignored by AxROM
         }
     }

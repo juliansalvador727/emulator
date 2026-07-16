@@ -92,6 +92,7 @@ mod test {
             prg_rom,
             chr_rom: vec![],
             mapper: 2,
+            metadata: crate::cartridge::CartridgeMetadata::test_defaults(),
             screen_mirroring: Mirroring::Vertical,
         }
     }
