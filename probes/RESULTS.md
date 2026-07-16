@@ -41,11 +41,12 @@ All 23 configured cases pass, including PPU open-bus behavior, MMC3 counter/manu
 revision-B zero-latch behavior, sprite-hit/overflow timing, vblank/NMI races,
 and exact odd/even frame timing.
 
-The focused `run_mapper_validation.sh` manifest passes 7/7: both
+The focused `run_mapper_validation.sh` manifest passes 8/8: both
 `cpu_dummy_writes` ROMs verify the original-value and modified-value writes on
-adjacent cycles, and MMC3 IRQ tests 1-4 plus revision B verify counter, A12,
-scanline, and zero-latch behavior. Dedicated source-available MMC1 large-ROM
-and PRG-RAM fixtures are still needed.
+adjacent cycles; the repository-authored MMC1 ROM verifies the 512 KiB SUROM
+outer bank, four SXROM PRG-RAM banks, RAM disable, and mapper reset state; and
+MMC3 IRQ tests 1-4 plus revision B verify counter, A12, scanline, and zero-latch
+behavior.
 
 This result was reproduced on revision `6ec8976c8df0b1a708b5d6afe59defa2a5dc5ce6`
 with `NES_TEST_ROMS_ROOT=../nes-test-roms`; the full suite again passed 22/22.

@@ -113,8 +113,10 @@ the emulator Git revision, NTSC configuration, case, ROM hash, result, and
 diagnostic. Set `P0_RESULTS` to retain that report at a specific path. Missing,
 mismatched, or failing cases make the command fail.
 
-The focused mapper suite adds the CPU dummy-write prerequisites for MMC1 and
-the passing revision-B MMC3 cases:
+The focused mapper suite adds the CPU dummy-write prerequisites for MMC1, a
+repository-authored SUROM/SXROM fixture, and the passing revision-B MMC3 cases.
+The MMC1 ROM is generated hermetically from source before the suite runs, so it
+does not require a separately installed assembler or third-party binary:
 
 ```sh
 ./test-roms/run_mapper_validation.sh

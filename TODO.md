@@ -422,10 +422,11 @@ audio never reaches SDL.
   cartridge metadata rather than assuming one 8 KiB PRG-RAM block.
 - [x] Add focused mapper reset-state, memory-type, PRG/CHR persistence, MMC1,
   and MMC3 edge-case unit tests.
-- [ ] Add at least one source-available test-ROM validation case for every
-  mapper behavior change. The pinned mapper manifest currently passes both
-  CPU dummy-write ROMs and MMC3 IRQ tests 1-4 plus revision B; dedicated MMC1
-  large-ROM/PRG-RAM fixtures remain to be sourced or authored.
+- [x] Add source-available test-ROM validation for the mapper behavior changes.
+  The pinned mapper manifest passes both CPU dummy-write ROMs, MMC3 IRQ tests
+  1-4 plus revision B, and the repository-authored MMC1 fixture covering
+  SUROM's 512 KiB outer PRG bit, all four SXROM PRG-RAM banks, RAM disable, and
+  mapper state across a harness-triggered front-panel reset.
 
 ## P1 — Cartridge formats and region metadata
 
