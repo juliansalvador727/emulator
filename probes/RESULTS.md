@@ -6,7 +6,7 @@ on the target host before changing PPU timing.
 
 ## Deterministic timing validation
 
-The Rust suite now has 274 passing tests. P0/P1 coverage records exact
+The Rust suite now has 289 passing tests. P0/P1 coverage records exact
 mapper-visible background, prefetch, dummy, and sprite fetch addresses/dots;
 blanked rendering; sprite-zero left-edge and x=255 behavior; vblank/NMI races;
 odd-frame skipping; all background/sprite pattern-table combinations; PPUDATA

@@ -20,14 +20,14 @@ pub struct Gnrom {
 impl Gnrom {
     pub fn from_rom(rom: Rom) -> Self {
         let chr_is_ram = rom.chr_rom.is_empty();
-        let chr = if chr_is_ram { vec![0; rom.memory.chr.size] } else { rom.chr_rom };
+        let chr = if chr_is_ram { vec![0; rom.memory.chr_ram_size()] } else { rom.chr_rom };
         let num_prg_banks = (rom.prg_rom.len() / 0x8000).max(1);
         let num_chr_banks = (chr.len() / 0x2000).max(1);
         Gnrom {
             prg_rom: rom.prg_rom,
             chr,
             chr_is_ram,
-            prg_ram: vec![0; rom.memory.prg_ram.size],
+            prg_ram: vec![0; rom.memory.prg_ram_size()],
             prg_bank: 0,
             chr_bank: 0,
             num_prg_banks,

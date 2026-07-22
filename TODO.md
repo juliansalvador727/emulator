@@ -8,7 +8,7 @@ and has a separate, lower-priority backlog at the end of this file.
 
 Current verified baseline (2026-07-16):
 
-- 274 passing Rust tests.
+- 289 passing Rust tests.
 - All 256 6502 opcodes (official and undocumented); `nestest` matches the
   reference for all 8,991 instruction lines. `instr_test-v5` (16/16),
   `instr_timing` (2/2), and `instr_misc` (4/4) pass.
@@ -29,6 +29,11 @@ Current verified baseline (2026-07-16):
   configurable `NES_SAVE_DIR` location. NES 2.0 parsing preserves separate
   volatile/NVRAM sizes, extended mapper/submapper fields, and both ROM-size
   encodings.
+- NES 2.0 console/timing metadata selects NTSC, PAL, or Dendy CPU/PPU/APU
+  clocks and raster timing; `--region`/`NES_REGION` provides an explicit
+  override. Volatile RAM and NVRAM remain distinct at runtime and in saves.
+- NES 2.0 mapper-4 submappers select Sharp MMC3, MMC6, hard-wired mirroring,
+  MC-ACC falling-edge IRQ, or NEC old-style IRQ behavior.
 - Dot-driven background and sprite rendering with mapper-visible PPU fetches.
 - P1 PPU register and memory behavior complete. OAM DMA is modeled as real
   alternating get/put cycles with OAMADDR wrapping, and DMC DMA arbitrates with
@@ -320,7 +325,7 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
   exactly 48,000 samples per 1,789,773 NTSC CPU cycles and 5,760,000 over two
   minutes, independent of tick batching. The 7,200-frame NROM/MMC1/MMC3 sweep
   stays within one sample of its actual emulated-cycle oracle.
-- [ ] Add PAL and Dendy APU timing tables when region support is introduced.
+- [x] Add PAL and Dendy APU timing tables when region support is introduced.
 - [x] Keep probe reporting for queue depth, drops, underflows, device reopens,
   and sample drift green during timing changes. `PROBE_MAX_SAMPLE_DRIFT` makes
   drift an enforceable threshold; realtime runs can additionally set
@@ -436,17 +441,17 @@ audio never reaches SDL.
 
 - [x] Parse NES 2.0 identification, 12-bit mapper IDs, submappers, linear and
   exponent/multiplier PRG/CHR ROM sizes, and separate PRG/CHR RAM/NVRAM sizes.
-- [ ] Parse the remaining NES 2.0 console type and region timing metadata.
-- [ ] Use NES 2.0 submappers to select MMC3 board/revision differences instead
+- [x] Parse the remaining NES 2.0 console type and region timing metadata.
+- [x] Use NES 2.0 submappers to select MMC3 board/revision differences instead
   of applying them to standard iNES mapper 4.
 - [x] Reject short headers, invalid format markers, truncated trainer/ROM
   payloads, and host-size arithmetic overflow while retaining trainer support.
 - [ ] Decide compatibility policy for ambiguous archaic/dirty iNES headers.
 - [x] Use iNES battery and RAM metadata to configure mapper memory and
   persistence; preserve split RAM/NVRAM sizes when parsing NES 2.0.
-- [ ] Teach mapper memory and persistence to expose simultaneous NES 2.0
+- [x] Teach mapper memory and persistence to expose simultaneous NES 2.0
   volatile RAM and NVRAM as distinct runtime regions.
-- [ ] Select NTSC/PAL/Dendy timing from metadata with an explicit user override.
+- [x] Select NTSC/PAL/Dendy timing from metadata with an explicit user override.
 - [x] Add parser fixtures for valid and invalid iNES/NES 2.0 combinations.
 
 ## P2 — Mapper and game-library expansion
@@ -469,7 +474,7 @@ audio never reaches SDL.
 
 ## P2 — Regions, input, and emulator features
 
-- [ ] Add PAL and Dendy CPU/PPU/APU timing and runtime region selection.
+- [x] Add PAL and Dendy CPU/PPU/APU timing and runtime region selection.
 - [ ] Add a second standard controller at `$4017`.
 - [ ] Add peripherals only for a target title: Zapper, Four Score, and other
   expansion devices.

@@ -4,7 +4,8 @@ A playable NES emulator written in Rust. It currently combines a complete
 official 6502 instruction set with a dot-driven PPU renderer, mapper-controlled
 banking and IRQs, controller input, and five-channel audio.
 
-The emulator is NTSC-oriented. Video, keyboard input, and bound-stream audio
+NTSC, licensed PAL, and Dendy timing are selected from cartridge metadata and
+can be overridden explicitly. Video, keyboard input, and bound-stream audio
 share one bundled SDL3 runtime with a single, carefully managed lifecycle. NES
 documentation and test ROMs are the sources of truth for hardware behaviour.
 
@@ -20,12 +21,14 @@ documentation and test ROMs are the sources of truth for hardware behaviour.
   sprite-0 hit timing, vblank/NMI races, and odd-frame skipping
 - Background and sprite rendering, including 8×16 sprites, priority, clipping,
   and the eight-sprites-per-line limit
-- NROM (0), MMC1 (1), UxROM (2), CNROM (3), MMC3 (4), AxROM (7),
+- NROM (0), MMC1 (1), UxROM (2), CNROM (3), MMC3/MMC6 (4), AxROM (7),
   MMC2/PxROM (9), and GxROM (66)
 - Fetch-driven MMC3 IRQs using qualified PPU A12 edges
-- Battery-backed cartridge RAM with atomic `.sav` replacement
+- Distinct volatile and battery-backed cartridge RAM with atomic `.sav`
+  replacement, including simultaneous NES 2.0 RAM/NVRAM regions
 - iNES and NES 2.0 header parsing, including 12-bit mapper IDs, submappers,
-  both ROM-size encodings, and separate RAM/NVRAM size metadata
+  console/region metadata, both ROM-size encodings, and separate RAM/NVRAM
+- NTSC, PAL, and Dendy CPU/PPU/APU clocks, raster timing, and host pacing
 - Pulse, triangle, noise, and DMC audio with IRQs, DMA, filtering, and SDL3
   playback
 - Automatic recovery from wedged host audio (stall watchdog with staged
@@ -37,7 +40,7 @@ documentation and test ROMs are the sources of truth for hardware behaviour.
 - Native Windows cross-build from WSL, wired as the default `cargo run` target
 - Headless performance probes and deterministic visual regression tests
 
-The Rust suite contains 274 passing tests. All five `cpu_interrupts_v2` ROMs,
+The Rust suite contains 289 passing tests. All five `cpu_interrupts_v2` ROMs,
 both `cpu_reset` ROMs, all six `apu_reset` ROMs, and the eight `apu_test` singles
 also pass. The prioritized remaining work is tracked in [`TODO.md`](TODO.md).
 
@@ -93,6 +96,14 @@ Run a game by passing its path (default target is Windows via WSL interop; use
 ```bash
 cargo run --release -- games/pacman.nes
 cargo run --release -- /path/to/game.nes
+```
+
+Region timing normally follows the ROM header. Override it with `--region`
+or `NES_REGION` when metadata is missing or incorrect:
+
+```bash
+cargo run --release -- games/game.nes --region pal
+NES_REGION=dendy cargo lin -- games/game.nes
 ```
 
 With no ROM argument, launch opens the [game-selection

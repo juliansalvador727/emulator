@@ -9,6 +9,7 @@ pub mod menu;
 pub mod opcodes;
 pub mod ppu;
 pub mod probe;
+pub mod region;
 pub mod render;
 pub mod test_rom;
 pub mod trace;
@@ -83,6 +84,7 @@ fn run_game(
     latency_debug: bool,
     run_ahead_frames: u8,
     window_mode: WindowMode,
+    region_override: Option<region::Region>,
 ) -> GameOutcome {
     let sdl_context = sdl3::init().unwrap();
     let video_subsystem = sdl_context.video().unwrap();
@@ -92,14 +94,12 @@ fn run_game(
                 .get_primary_display()
                 .and_then(|display| display.get_bounds())
                 .unwrap();
-            let mut builder =
-                video_subsystem.window("NES game", bounds.width(), bounds.height());
+            let mut builder = video_subsystem.window("NES game", bounds.width(), bounds.height());
             builder.borderless().position(bounds.x(), bounds.y());
             builder
         }
         WindowMode::Windowed | WindowMode::Fullscreen => {
-            let mut builder =
-                video_subsystem.window("NES game", NES_WIDTH * 3, NES_HEIGHT * 3);
+            let mut builder = video_subsystem.window("NES game", NES_WIDTH * 3, NES_HEIGHT * 3);
             builder.position_centered();
             if window_mode == WindowMode::Fullscreen {
                 builder.fullscreen();
@@ -134,6 +134,7 @@ fn run_game(
 
     let rom_path = resolve_rom_path(rom_path);
     let rom = Rom::from_file(&rom_path).unwrap_or_else(|err| panic!("{err}"));
+    let region = region_override.unwrap_or_else(|| rom.metadata.timing.default_region());
 
     // Keyboard -> NES controller button mapping.
     let mut key_map = HashMap::new();
@@ -151,7 +152,7 @@ fn run_game(
     // Frame pacing: this scanline model runs at 1/60.0984867 s per frame.
     // Audio-capable runs are paced on the exact 48 kHz sample timeline;
     // queue depth is diagnostic state, not a second clock controller.
-    let frame_duration = std::time::Duration::from_nanos(16_639_354);
+    let frame_duration = std::time::Duration::from_secs_f64(1.0 / region.frames_per_second());
     let mut next_frame = std::time::Instant::now();
 
     // NES_AUDIO_DEBUG=1: log the audio pipeline state once per second to
@@ -185,8 +186,9 @@ fn run_game(
 
     // Host presentation is driven explicitly below so a snapshot can be
     // advanced speculatively without recursively entering an SDL callback.
-    let bus = Bus::new_with_audio(
+    let bus = Bus::new_with_audio_region(
         rom,
+        region,
         |_, _, _| {},
         audio_chunk_samples,
         move |samples| {
@@ -211,7 +213,9 @@ fn run_game(
         let frame = run_ahead_frame
             .as_ref()
             .unwrap_or_else(|| cpu.bus.ppu().frame());
-        texture.update(None, &frame.data, NES_WIDTH as usize * 3).unwrap();
+        texture
+            .update(None, &frame.data, NES_WIDTH as usize * 3)
+            .unwrap();
         let (output_width, output_height) = canvas.output_size().unwrap();
         canvas.set_draw_color(Color::RGB(0, 0, 0));
         canvas.clear();
@@ -451,11 +455,24 @@ fn run_tiles(rom_path: &str) {
 
 fn parse_game_options(
     args: &[String],
-) -> Result<(audio::AudioConfig, bool, u8, WindowMode), String> {
+) -> Result<
+    (
+        audio::AudioConfig,
+        bool,
+        u8,
+        WindowMode,
+        Option<region::Region>,
+    ),
+    String,
+> {
     let mut profile = None;
     let mut pulse_latency_ms = None;
     let mut latency_debug = false;
     let mut window_mode = WindowMode::Windowed;
+    let mut region_override = std::env::var("NES_REGION")
+        .ok()
+        .map(|value| region::Region::parse(&value))
+        .transpose()?;
     let mut run_ahead_frames = std::env::var("NES_RUN_AHEAD_FRAMES")
         .ok()
         .map(|value| {
@@ -498,6 +515,14 @@ fn parse_game_options(
             window_mode = WindowMode::Fullscreen;
         } else if arg == "--windowed-fullscreen" || arg == "--borderless" {
             window_mode = WindowMode::WindowedFullscreen;
+        } else if let Some(value) = arg.strip_prefix("--region=") {
+            region_override = Some(region::Region::parse(value)?);
+        } else if arg == "--region" {
+            i += 1;
+            let value = args
+                .get(i)
+                .ok_or_else(|| "--region needs ntsc, pal, or dendy".to_string())?;
+            region_override = Some(region::Region::parse(value)?);
         } else if let Some(value) = arg.strip_prefix("--run-ahead=") {
             run_ahead_frames = value
                 .parse::<u8>()
@@ -529,7 +554,13 @@ fn parse_game_options(
     if run_ahead_frames > 1 {
         return Err("run-ahead currently supports only 0 or 1 frame".into());
     }
-    Ok((config, latency_debug, run_ahead_frames, window_mode))
+    Ok((
+        config,
+        latency_debug,
+        run_ahead_frames,
+        window_mode,
+        region_override,
+    ))
 }
 
 fn main() {
@@ -559,13 +590,14 @@ fn main() {
         }
         Some("tiles") => run_tiles(args.get(2).map(|s| s.as_str()).unwrap_or("nestest.nes")),
         Some(rom_path) => match parse_game_options(&args[2..]) {
-            Ok((audio_config, latency_debug, run_ahead_frames, window_mode)) => {
+            Ok((audio_config, latency_debug, run_ahead_frames, window_mode, region_override)) => {
                 run_game(
                     rom_path,
                     audio_config,
                     latency_debug,
                     run_ahead_frames,
                     window_mode,
+                    region_override,
                 );
             }
             Err(err) => {
@@ -576,7 +608,7 @@ fn main() {
         // No ROM given: open the selection screen and loop back to it whenever a
         // game is exited with Escape, so the picker is the program's home base.
         None => match parse_game_options(&[]) {
-            Ok((audio_config, latency_debug, run_ahead_frames, window_mode)) => {
+            Ok((audio_config, latency_debug, run_ahead_frames, window_mode, region_override)) => {
                 let roms_dir = Path::new("games");
                 loop {
                     match menu::run_menu(roms_dir) {
@@ -587,6 +619,7 @@ fn main() {
                                 latency_debug,
                                 run_ahead_frames,
                                 window_mode,
+                                region_override,
                             );
                             if outcome == GameOutcome::Quit {
                                 break;
@@ -618,7 +651,7 @@ mod frontend_tests {
             "1".to_string(),
             "--latency-debug".to_string(),
         ];
-        let (config, debug, run_ahead, window_mode) = parse_game_options(&args).unwrap();
+        let (config, debug, run_ahead, window_mode, _) = parse_game_options(&args).unwrap();
         assert_eq!(config.profile, audio::AudioProfile::LowLatency);
         assert_eq!(config.pulse_latency_ms, 25);
         assert!(debug);
@@ -635,7 +668,7 @@ mod frontend_tests {
     #[test]
     fn game_options_accept_fullscreen() {
         let args = vec!["--fullscreen".to_string()];
-        let (_, _, _, window_mode) = parse_game_options(&args).unwrap();
+        let (_, _, _, window_mode, _) = parse_game_options(&args).unwrap();
         assert_eq!(window_mode, WindowMode::Fullscreen);
     }
 
@@ -643,9 +676,17 @@ mod frontend_tests {
     fn game_options_accept_windowed_fullscreen_and_its_alias() {
         for flag in ["--windowed-fullscreen", "--borderless"] {
             let args = vec![flag.to_string()];
-            let (_, _, _, window_mode) = parse_game_options(&args).unwrap();
+            let (_, _, _, window_mode, _) = parse_game_options(&args).unwrap();
             assert_eq!(window_mode, WindowMode::WindowedFullscreen);
         }
+    }
+
+    #[test]
+    fn game_options_accept_region_override() {
+        let args = vec!["--region=dendy".to_string()];
+        let (_, _, _, _, region) = parse_game_options(&args).unwrap();
+        assert_eq!(region, Some(region::Region::Dendy));
+        assert!(parse_game_options(&["--region=secam".to_string()]).is_err());
     }
 
     #[test]

@@ -29,12 +29,12 @@ impl Nrom {
         // No CHR ROM in the header means the cartridge uses 8 KB of CHR-RAM.
         let chr_is_ram = rom.chr_rom.is_empty();
         let chr = if chr_is_ram {
-            vec![0; 0x2000]
+            vec![0; rom.memory.chr_ram_size()]
         } else {
             rom.chr_rom
         };
         let mut mapper = Nrom::new(rom.prg_rom, chr, chr_is_ram, rom.screen_mirroring);
-        mapper.prg_ram.resize(rom.memory.prg_ram.size, 0);
+        mapper.prg_ram.resize(rom.memory.prg_ram_size(), 0);
         mapper
     }
 }

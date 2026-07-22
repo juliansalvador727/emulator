@@ -18,13 +18,13 @@ pub struct Cnrom {
 impl Cnrom {
     pub fn from_rom(rom: Rom) -> Self {
         let chr_is_ram = rom.chr_rom.is_empty();
-        let chr = if chr_is_ram { vec![0; rom.memory.chr.size] } else { rom.chr_rom };
+        let chr = if chr_is_ram { vec![0; rom.memory.chr_ram_size()] } else { rom.chr_rom };
         let num_chr_banks = (chr.len() / 0x2000).max(1);
         Cnrom {
             prg_rom: rom.prg_rom,
             chr,
             chr_is_ram,
-            prg_ram: vec![0; rom.memory.prg_ram.size],
+            prg_ram: vec![0; rom.memory.prg_ram_size()],
             chr_bank: 0,
             num_chr_banks,
             mirroring: rom.screen_mirroring,

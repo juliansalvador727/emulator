@@ -11,6 +11,7 @@ use crate::apu::frame_counter::{FrameCounter, FrameEvent};
 use crate::apu::noise::Noise;
 use crate::apu::pulse::Pulse;
 use crate::apu::triangle::Triangle;
+use crate::region::Region;
 
 pub mod dmc;
 pub mod envelope;
@@ -23,7 +24,8 @@ pub mod triangle;
 
 // NTSC 2A03 CPU clock rate, from
 // https://www.nesdev.org/wiki/Cycle_reference_chart
-pub(crate) const CPU_HZ: u64 = 1_789_773;
+#[cfg(test)]
+const CPU_HZ: u64 = 1_789_773;
 
 const DEFAULT_SAMPLE_RATE: u32 = 48000;
 
@@ -35,11 +37,16 @@ const DEFAULT_SAMPLE_RATE: u32 = 48000;
 struct SampleClock {
     rate: u32,
     phase: u64,
+    cpu_hz: u64,
 }
 
 impl SampleClock {
-    fn new(rate: u32) -> Self {
-        Self { rate, phase: 0 }
+    fn new(rate: u32, cpu_hz: u64) -> Self {
+        Self {
+            rate,
+            phase: 0,
+            cpu_hz,
+        }
     }
 
     fn set_rate(&mut self, rate: u32) {
@@ -49,8 +56,8 @@ impl SampleClock {
 
     fn advance(&mut self, cpu_cycles: u64) -> u64 {
         let total = self.phase + cpu_cycles * u64::from(self.rate);
-        self.phase = total % CPU_HZ;
-        total / CPU_HZ
+        self.phase = total % self.cpu_hz;
+        total / self.cpu_hz
     }
 }
 
@@ -62,6 +69,7 @@ pub struct NesAPU {
     pub noise: Noise,
     pub dmc: Dmc,
     frame_counter: FrameCounter,
+    cpu_hz: u64,
 
     // Total CPU cycles ticked. The pulse timers and the $4017 write delay
     // depend on APU-cycle (CPU/2) parity.
@@ -85,15 +93,21 @@ pub struct NesAPU {
 
 impl NesAPU {
     pub fn new() -> Self {
+        Self::new_with_region(Region::Ntsc)
+    }
+
+    pub fn new_with_region(region: Region) -> Self {
+        let cpu_hz = region.cpu_hz();
         let mut apu = NesAPU {
             pulse1: Pulse::new(true),
             pulse2: Pulse::new(false),
             triangle: Triangle::new(),
-            noise: Noise::new(),
-            dmc: Dmc::new(),
-            frame_counter: FrameCounter::new(),
+            noise: Noise::new_with_region(region),
+            dmc: Dmc::new_with_region(region),
+            frame_counter: FrameCounter::new_with_region(region),
+            cpu_hz,
             cycles: 0,
-            sample_clock: SampleClock::new(DEFAULT_SAMPLE_RATE),
+            sample_clock: SampleClock::new(DEFAULT_SAMPLE_RATE, cpu_hz),
             samples: Vec::new(),
             max_buffered_samples: 0,
             hp90: HighPassFilter::new(90.0, DEFAULT_SAMPLE_RATE as f32),
@@ -108,7 +122,10 @@ impl NesAPU {
     // Call before running if the host audio device didn't open at 48 kHz.
     pub fn set_sample_rate(&mut self, sample_rate: u32) {
         assert!(sample_rate > 0, "sample rate must be nonzero");
-        assert!(u64::from(sample_rate) <= CPU_HZ, "sample rate exceeds CPU clock");
+        assert!(
+            u64::from(sample_rate) <= self.cpu_hz,
+            "sample rate exceeds CPU clock"
+        );
         self.sample_clock.set_rate(sample_rate);
         self.max_buffered_samples = sample_rate as usize;
         self.hp90 = HighPassFilter::new(90.0, sample_rate as f32);
@@ -429,14 +446,14 @@ mod test {
     #[test]
     fn integer_sample_clock_has_zero_long_run_drift_and_is_chunk_independent() {
         let two_minutes = CPU_HZ * 120;
-        let mut whole = SampleClock::new(DEFAULT_SAMPLE_RATE);
+        let mut whole = SampleClock::new(DEFAULT_SAMPLE_RATE, CPU_HZ);
         assert_eq!(
             whole.advance(two_minutes),
             u64::from(DEFAULT_SAMPLE_RATE) * 120
         );
         assert_eq!(whole.phase, 0);
 
-        let mut chunked = SampleClock::new(DEFAULT_SAMPLE_RATE);
+        let mut chunked = SampleClock::new(DEFAULT_SAMPLE_RATE, CPU_HZ);
         let first = chunked.advance(two_minutes / 3);
         let second = chunked.advance(two_minutes - two_minutes / 3);
         assert_eq!(first + second, u64::from(DEFAULT_SAMPLE_RATE) * 120);

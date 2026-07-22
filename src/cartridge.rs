@@ -2,6 +2,7 @@ const NES_TAG: [u8; 4] = [0x4E, 0x45, 0x53, 0x1A];
 const PRG_ROM_PAGE_SIZE: usize = 16384;
 const CHR_ROM_PAGE_SIZE: usize = 8192;
 
+use crate::region::Region;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -30,9 +31,37 @@ pub enum RomFormat {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ConsoleType {
+    NesFamicom,
+    VsSystem { ppu_type: u8, hardware_type: u8 },
+    PlayChoice10,
+    Extended(u8),
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum TimingMode {
+    Ntsc,
+    Pal,
+    Multiple,
+    Dendy,
+}
+
+impl TimingMode {
+    pub const fn default_region(self) -> Region {
+        match self {
+            Self::Pal => Region::Pal,
+            Self::Dendy => Region::Dendy,
+            Self::Ntsc | Self::Multiple => Region::Ntsc,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct CartridgeMetadata {
     pub format: RomFormat,
     pub submapper: u8,
+    pub console_type: ConsoleType,
+    pub timing: TimingMode,
     pub prg_ram_size: usize,
     pub prg_nvram_size: usize,
     pub chr_ram_size: usize,
@@ -44,6 +73,8 @@ impl CartridgeMetadata {
         Self {
             format: RomFormat::INes,
             submapper: 0,
+            console_type: ConsoleType::NesFamicom,
+            timing: TimingMode::Ntsc,
             prg_ram_size: 0x2000,
             prg_nvram_size: 0,
             chr_ram_size: 0,
@@ -79,7 +110,10 @@ impl MemoryRegion {
 pub struct CartridgeMemory {
     pub prg_rom: MemoryRegion,
     pub prg_ram: MemoryRegion,
-    pub chr: MemoryRegion,
+    pub prg_nvram: MemoryRegion,
+    pub chr_rom: MemoryRegion,
+    pub chr_ram: MemoryRegion,
+    pub chr_nvram: MemoryRegion,
 }
 
 impl CartridgeMemory {
@@ -87,12 +121,37 @@ impl CartridgeMemory {
         Self {
             prg_rom: MemoryRegion::new(MemoryKind::Rom, prg_rom_size),
             prg_ram: MemoryRegion::new(MemoryKind::VolatileRam, 0x2000),
-            chr: if chr_rom_size == 0 {
-                MemoryRegion::new(MemoryKind::VolatileRam, 0x2000)
-            } else {
-                MemoryRegion::new(MemoryKind::Rom, chr_rom_size)
-            },
+            prg_nvram: MemoryRegion::new(MemoryKind::Absent, 0),
+            chr_rom: MemoryRegion::new(
+                if chr_rom_size == 0 {
+                    MemoryKind::Absent
+                } else {
+                    MemoryKind::Rom
+                },
+                chr_rom_size,
+            ),
+            chr_ram: MemoryRegion::new(
+                if chr_rom_size == 0 {
+                    MemoryKind::VolatileRam
+                } else {
+                    MemoryKind::Absent
+                },
+                if chr_rom_size == 0 { 0x2000 } else { 0 },
+            ),
+            chr_nvram: MemoryRegion::new(MemoryKind::Absent, 0),
         }
+    }
+
+    pub fn prg_ram_size(self) -> usize {
+        self.prg_ram.size + self.prg_nvram.size
+    }
+
+    pub fn chr_ram_size(self) -> usize {
+        self.chr_ram.size + self.chr_nvram.size
+    }
+
+    pub fn has_nonvolatile_ram(self) -> bool {
+        self.prg_nvram.size != 0 || self.chr_nvram.size != 0
     }
 }
 
@@ -132,6 +191,37 @@ impl Rom {
             raw[8] >> 4
         } else {
             0
+        };
+        let console_type = match raw[7] & 0x03 {
+            0 => ConsoleType::NesFamicom,
+            1 => ConsoleType::VsSystem {
+                ppu_type: if format == RomFormat::Nes2 {
+                    raw[13] & 0x0f
+                } else {
+                    0
+                },
+                hardware_type: if format == RomFormat::Nes2 {
+                    raw[13] >> 4
+                } else {
+                    0
+                },
+            },
+            2 => ConsoleType::PlayChoice10,
+            3 if format == RomFormat::Nes2 => ConsoleType::Extended(raw[13] & 0x0f),
+            _ => return Err("extended console type requires a NES 2.0 header".to_string()),
+        };
+        let timing = if format == RomFormat::Nes2 {
+            match raw[12] & 0x03 {
+                0 => TimingMode::Ntsc,
+                1 => TimingMode::Pal,
+                2 => TimingMode::Multiple,
+                3 => TimingMode::Dendy,
+                _ => unreachable!(),
+            }
+        } else if raw[9] & 1 != 0 {
+            TimingMode::Pal
+        } else {
+            TimingMode::Ntsc
         };
         let four_screen = raw[6] & 0b1000 != 0;
         let vertical_mirroring = raw[6] & 0b1 != 0;
@@ -203,29 +293,6 @@ impl Rom {
                     (size, 0, chr_size, 0)
                 }
             };
-        let total_prg_ram = prg_ram_size
-            .checked_add(prg_nvram_size)
-            .ok_or_else(|| "combined PRG RAM size overflows the host address space".to_string())?;
-        let total_chr_ram = chr_ram_size
-            .checked_add(chr_nvram_size)
-            .ok_or_else(|| "combined CHR RAM size overflows the host address space".to_string())?;
-        let prg_ram_kind = if total_prg_ram == 0 {
-            MemoryKind::Absent
-        } else if prg_nvram_size != 0 {
-            MemoryKind::NonVolatileRam
-        } else {
-            MemoryKind::VolatileRam
-        };
-        let chr_kind = if chr_rom_size != 0 {
-            MemoryKind::Rom
-        } else if chr_nvram_size != 0 {
-            MemoryKind::NonVolatileRam
-        } else if total_chr_ram != 0 {
-            MemoryKind::VolatileRam
-        } else {
-            MemoryKind::Absent
-        };
-
         Ok(Rom {
             prg_rom: raw[prg_rom_start..(prg_rom_start + prg_rom_size)].to_vec(),
             chr_rom: raw[chr_rom_start..(chr_rom_start + chr_rom_size)].to_vec(),
@@ -233,6 +300,8 @@ impl Rom {
             metadata: CartridgeMetadata {
                 format,
                 submapper,
+                console_type,
+                timing,
                 prg_ram_size,
                 prg_nvram_size,
                 chr_ram_size,
@@ -241,14 +310,45 @@ impl Rom {
             screen_mirroring: screen_mirroring,
             memory: CartridgeMemory {
                 prg_rom: MemoryRegion::new(MemoryKind::Rom, prg_rom_size),
-                prg_ram: MemoryRegion::new(prg_ram_kind, total_prg_ram),
-                chr: MemoryRegion::new(
-                    chr_kind,
-                    if chr_rom_size == 0 {
-                        total_chr_ram
+                prg_ram: MemoryRegion::new(
+                    if prg_ram_size == 0 {
+                        MemoryKind::Absent
                     } else {
-                        chr_rom_size
+                        MemoryKind::VolatileRam
                     },
+                    prg_ram_size,
+                ),
+                prg_nvram: MemoryRegion::new(
+                    if prg_nvram_size == 0 {
+                        MemoryKind::Absent
+                    } else {
+                        MemoryKind::NonVolatileRam
+                    },
+                    prg_nvram_size,
+                ),
+                chr_rom: MemoryRegion::new(
+                    if chr_rom_size == 0 {
+                        MemoryKind::Absent
+                    } else {
+                        MemoryKind::Rom
+                    },
+                    chr_rom_size,
+                ),
+                chr_ram: MemoryRegion::new(
+                    if chr_ram_size == 0 {
+                        MemoryKind::Absent
+                    } else {
+                        MemoryKind::VolatileRam
+                    },
+                    chr_ram_size,
+                ),
+                chr_nvram: MemoryRegion::new(
+                    if chr_nvram_size == 0 {
+                        MemoryKind::Absent
+                    } else {
+                        MemoryKind::NonVolatileRam
+                    },
+                    chr_nvram_size,
                 ),
             },
             save_path: None,
@@ -263,7 +363,7 @@ impl Rom {
         let raw = std::fs::read(path)
             .map_err(|err| format!("failed to read ROM {}: {err}", path.display()))?;
         let mut rom = Rom::new(&raw)?;
-        if rom.memory.prg_ram.is_nonvolatile() || rom.memory.chr.is_nonvolatile() {
+        if rom.memory.has_nonvolatile_ram() {
             rom.save_path = Some(match std::env::var_os("NES_SAVE_DIR") {
                 Some(dir) => {
                     let name = path
@@ -436,8 +536,11 @@ pub mod test {
         assert_eq!(rom.metadata.chr_ram_size, 0x1000);
         assert_eq!(rom.metadata.chr_nvram_size, 0x0800);
         assert_eq!(rom.memory.prg_rom.size, PRG_ROM_PAGE_SIZE);
-        assert_eq!(rom.memory.prg_ram.size, 0x6000);
-        assert_eq!(rom.memory.chr.size, CHR_ROM_PAGE_SIZE);
+        assert_eq!(rom.memory.prg_ram.size, 0x2000);
+        assert_eq!(rom.memory.prg_nvram.size, 0x4000);
+        assert_eq!(rom.memory.chr_rom.size, CHR_ROM_PAGE_SIZE);
+        assert_eq!(rom.memory.chr_ram.size, 0x1000);
+        assert_eq!(rom.memory.chr_nvram.size, 0x0800);
         assert_eq!(rom.screen_mirroring, Mirroring::Vertical);
     }
 
@@ -478,7 +581,7 @@ pub mod test {
         assert_eq!(rom.metadata.chr_nvram_size, 0x2000);
         assert_eq!(rom.memory.prg_ram, MemoryRegion::new(MemoryKind::Absent, 0));
         assert_eq!(
-            rom.memory.chr,
+            rom.memory.chr_nvram,
             MemoryRegion::new(MemoryKind::NonVolatileRam, 0x2000)
         );
     }
@@ -499,9 +602,11 @@ pub mod test {
 
         header[4] = 0;
         header[6] = 0x04;
-        assert!(Rom::new(&header)
-            .unwrap_err()
-            .contains("requires at least 528"));
+        assert!(
+            Rom::new(&header)
+                .unwrap_err()
+                .contains("requires at least 528")
+        );
 
         header[7] = 0x08;
         header[6] = 0;
@@ -534,7 +639,7 @@ pub mod test {
             MemoryRegion::new(MemoryKind::VolatileRam, 0x2000)
         );
         assert_eq!(
-            volatile.memory.chr,
+            volatile.memory.chr_ram,
             MemoryRegion::new(MemoryKind::VolatileRam, 0x2000)
         );
 
@@ -546,11 +651,11 @@ pub mod test {
         assert_eq!(battery.metadata.chr_ram_size, 0x2000);
         assert_eq!(battery.metadata.chr_nvram_size, 0);
         assert_eq!(
-            battery.memory.prg_ram,
+            battery.memory.prg_nvram,
             MemoryRegion::new(MemoryKind::NonVolatileRam, 0x8000)
         );
         assert_eq!(
-            battery.memory.chr,
+            battery.memory.chr_ram,
             MemoryRegion::new(MemoryKind::VolatileRam, 0x2000)
         );
     }
@@ -567,6 +672,49 @@ pub mod test {
         });
         let rom = Rom::new(&raw).unwrap();
         assert_eq!(rom.memory.prg_ram, MemoryRegion::new(MemoryKind::Absent, 0));
-        assert_eq!(rom.memory.chr, MemoryRegion::new(MemoryKind::Rom, 0x2000));
+        assert_eq!(
+            rom.memory.chr_rom,
+            MemoryRegion::new(MemoryKind::Rom, 0x2000)
+        );
+    }
+
+    #[test]
+    fn parses_nes2_console_and_timing_metadata() {
+        let mut header = [0u8; 16];
+        header[..4].copy_from_slice(&NES_TAG);
+        header[7] = 0x0b; // NES 2.0, extended console type
+        header[12] = 3; // Dendy
+        header[13] = 0x0a; // VT369
+        let rom = Rom::new(&header).unwrap();
+        assert_eq!(rom.metadata.console_type, ConsoleType::Extended(0x0a));
+        assert_eq!(rom.metadata.timing, TimingMode::Dendy);
+
+        header[7] = 0x09; // Vs. System
+        header[12] = 1; // PAL
+        header[13] = 0x52;
+        let rom = Rom::new(&header).unwrap();
+        assert_eq!(
+            rom.metadata.console_type,
+            ConsoleType::VsSystem {
+                ppu_type: 2,
+                hardware_type: 5,
+            }
+        );
+        assert_eq!(rom.metadata.timing, TimingMode::Pal);
+
+        header[7] = 0x08;
+        header[12] = 2;
+        assert_eq!(
+            Rom::new(&header).unwrap().metadata.timing,
+            TimingMode::Multiple
+        );
+    }
+
+    #[test]
+    fn legacy_ines_tv_bit_selects_pal() {
+        let mut header = [0u8; 16];
+        header[..4].copy_from_slice(&NES_TAG);
+        header[9] = 1;
+        assert_eq!(Rom::new(&header).unwrap().metadata.timing, TimingMode::Pal);
     }
 }

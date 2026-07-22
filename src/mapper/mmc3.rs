@@ -1,6 +1,15 @@
 use super::Mapper;
 use crate::cartridge::{Mirroring, Rom};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mmc3Variant {
+    Sharp,
+    Mmc6,
+    HardwiredMirroring,
+    McAcc,
+    Nec,
+}
+
 // Mapper 4 (MMC3 / TxROM). The workhorse of the mid/late NES library (SMB3,
 // Kirby's Adventure, Mega Man 3-6, ...). Two things set it apart from the
 // simpler mappers:
@@ -26,12 +35,15 @@ use crate::cartridge::{Mirroring, Rom};
 //   $E001 odd   IRQ enable
 #[derive(Clone)]
 pub struct Mmc3 {
+    variant: Mmc3Variant,
     prg_rom: Vec<u8>,
     chr: Vec<u8>,
     chr_is_ram: bool,
     prg_ram: Vec<u8>,
     prg_ram_enabled: bool,
     prg_ram_write_protected: bool,
+    mmc6_ram_enabled: bool,
+    mmc6_protect: u8,
 
     // R0-R7. R0/R1 are 2 KB CHR banks (their low bit is ignored); R2-R5 are
     // 1 KB CHR banks; R6/R7 are 8 KB PRG banks.
@@ -46,11 +58,12 @@ pub struct Mmc3 {
 
     irq_latch: u8,
     irq_counter: u8,
-    irq_reload: bool,  // force reload from latch on the next qualified A12 edge
+    irq_reload: bool, // force reload from latch on the next qualified A12 edge
     irq_enabled: bool,
     irq_line: bool, // asserted; held until acknowledged by a write to $E000
     a12_high: bool,
     a12_low_since: Option<u64>,
+    a12_high_since: Option<u64>,
 
     num_prg_banks: usize, // in 8 KB units
     num_chr_banks: usize, // in 1 KB units
@@ -58,20 +71,34 @@ pub struct Mmc3 {
 
 impl Mmc3 {
     pub fn from_rom(rom: Rom) -> Self {
+        let variant = match rom.metadata.submapper {
+            1 => Mmc3Variant::Mmc6,
+            2 => Mmc3Variant::HardwiredMirroring,
+            3 => Mmc3Variant::McAcc,
+            4 => Mmc3Variant::Nec,
+            _ => Mmc3Variant::Sharp,
+        };
         let chr_is_ram = rom.chr_rom.is_empty();
-        let chr = if chr_is_ram { vec![0; rom.memory.chr.size] } else { rom.chr_rom };
+        let chr = if chr_is_ram {
+            vec![0; rom.memory.chr_ram_size()]
+        } else {
+            rom.chr_rom
+        };
         let num_prg_banks = (rom.prg_rom.len() / 0x2000).max(1);
         let num_chr_banks = (chr.len() / 0x400).max(1);
         let four_screen = rom.screen_mirroring == Mirroring::FourScreen;
         Mmc3 {
+            variant,
             prg_rom: rom.prg_rom,
             chr,
             chr_is_ram,
-            prg_ram: vec![0; rom.memory.prg_ram.size],
+            prg_ram: vec![0; rom.memory.prg_ram_size()],
             // Keep RAM accessible until software writes $A001, matching the
             // mapper's historical behavior in this emulator.
             prg_ram_enabled: true,
             prg_ram_write_protected: false,
+            mmc6_ram_enabled: false,
+            mmc6_protect: 0,
             regs: [0; 8],
             bank_select: 0,
             prg_mode: false,
@@ -86,6 +113,7 @@ impl Mmc3 {
             irq_line: false,
             a12_high: false,
             a12_low_since: None,
+            a12_high_since: None,
             num_prg_banks,
             num_chr_banks,
         }
@@ -100,9 +128,21 @@ impl Mmc3 {
         let last = self.num_prg_banks - 1;
         let second_last = last.saturating_sub(1);
         let bank = match (addr - 0x8000) / 0x2000 {
-            0 => if self.prg_mode { second_last } else { self.regs[6] as usize },
+            0 => {
+                if self.prg_mode {
+                    second_last
+                } else {
+                    self.regs[6] as usize
+                }
+            }
             1 => self.regs[7] as usize,
-            2 => if self.prg_mode { self.regs[6] as usize } else { second_last },
+            2 => {
+                if self.prg_mode {
+                    self.regs[6] as usize
+                } else {
+                    second_last
+                }
+            }
             3 => last,
             _ => unreachable!(),
         };
@@ -130,18 +170,56 @@ impl Mmc3 {
         };
         (bank % self.num_chr_banks) * 0x400 + (addr as usize & 0x3ff)
     }
+
+    fn read_prg_ram(&self, addr: u16) -> u8 {
+        if self.variant != Mmc3Variant::Mmc6 {
+            return if self.prg_ram_enabled {
+                self.prg_ram
+                    .get((addr - 0x6000) as usize)
+                    .copied()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+        }
+        if !self.mmc6_ram_enabled || addr < 0x7000 || self.prg_ram.is_empty() {
+            return 0;
+        }
+        let offset = (addr as usize) & 0x03ff;
+        let bank = usize::from(offset >= 0x200);
+        let readable = self.mmc6_protect & if bank == 0 { 0x20 } else { 0x80 } != 0;
+        readable
+            .then(|| self.prg_ram.get(offset).copied().unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    fn write_prg_ram(&mut self, addr: u16, data: u8) {
+        if self.variant != Mmc3Variant::Mmc6 {
+            if self.prg_ram_enabled && !self.prg_ram_write_protected {
+                if let Some(byte) = self.prg_ram.get_mut((addr - 0x6000) as usize) {
+                    *byte = data;
+                }
+            }
+            return;
+        }
+        if !self.mmc6_ram_enabled || addr < 0x7000 || self.prg_ram.is_empty() {
+            return;
+        }
+        let offset = (addr as usize) & 0x03ff;
+        let bank = usize::from(offset >= 0x200);
+        let mask = if bank == 0 { 0x30 } else { 0xc0 };
+        if self.mmc6_protect & mask == mask {
+            if let Some(byte) = self.prg_ram.get_mut(offset) {
+                *byte = data;
+            }
+        }
+    }
 }
 
 impl Mapper for Mmc3 {
     fn cpu_read(&mut self, addr: u16) -> u8 {
         match addr {
-            0x6000..=0x7fff => {
-                if self.prg_ram_enabled {
-                    self.prg_ram.get((addr - 0x6000) as usize).copied().unwrap_or(0)
-                } else {
-                    0
-                }
-            }
+            0x6000..=0x7fff => self.read_prg_ram(addr),
             0x8000..=0xffff => self.prg_rom[self.prg_offset(addr)],
             _ => 0,
         }
@@ -149,23 +227,29 @@ impl Mapper for Mmc3 {
 
     fn cpu_write(&mut self, addr: u16, data: u8) {
         match addr {
-            0x6000..=0x7fff => {
-                if self.prg_ram_enabled && !self.prg_ram_write_protected {
-                    if let Some(byte) = self.prg_ram.get_mut((addr - 0x6000) as usize) {
-                        *byte = data;
-                    }
-                }
-            }
+            0x6000..=0x7fff => self.write_prg_ram(addr, data),
             0x8000..=0xffff => match addr & 0xe001 {
                 0x8000 => {
                     self.bank_select = (data & 0x07) as usize;
                     self.prg_mode = data & 0x40 != 0;
                     self.chr_inversion = data & 0x80 != 0;
+                    if self.variant == Mmc3Variant::Mmc6 {
+                        self.mmc6_ram_enabled = data & 0x20 != 0;
+                        if !self.mmc6_ram_enabled {
+                            self.mmc6_protect = 0;
+                        }
+                    }
                 }
                 // Standard MMC3 exposes only six PRG bank address bits.
-                0x8001 => self.regs[self.bank_select] = if self.bank_select >= 6 { data & 0x3f } else { data },
+                0x8001 => {
+                    self.regs[self.bank_select] = if self.bank_select >= 6 {
+                        data & 0x3f
+                    } else {
+                        data
+                    }
+                }
                 0xa000 => {
-                    if !self.four_screen {
+                    if !self.four_screen && self.variant != Mmc3Variant::HardwiredMirroring {
                         self.mirroring = if data & 1 != 0 {
                             Mirroring::Horizontal
                         } else {
@@ -174,8 +258,14 @@ impl Mapper for Mmc3 {
                     }
                 }
                 0xa001 => {
-                    self.prg_ram_enabled = data & 0x80 != 0;
-                    self.prg_ram_write_protected = data & 0x40 != 0;
+                    if self.variant == Mmc3Variant::Mmc6 {
+                        if self.mmc6_ram_enabled {
+                            self.mmc6_protect = data & 0xf0;
+                        }
+                    } else {
+                        self.prg_ram_enabled = data & 0x80 != 0;
+                        self.prg_ram_write_protected = data & 0x40 != 0;
+                    }
                 }
                 0xc000 => self.irq_latch = data,
                 0xc001 => {
@@ -213,6 +303,25 @@ impl Mapper for Mmc3 {
 
     fn on_ppu_bus_access(&mut self, addr: u16, ppu_cycle: u64) {
         let high = addr & 0x1000 != 0;
+        if self.variant == Mmc3Variant::McAcc {
+            if high {
+                if !self.a12_high {
+                    self.a12_high_since = Some(ppu_cycle);
+                }
+                self.a12_high = true;
+            } else {
+                if self.a12_high
+                    && self
+                        .a12_high_since
+                        .is_some_and(|start| ppu_cycle.saturating_sub(start) >= 8)
+                {
+                    self.clock_irq_counter();
+                }
+                self.a12_high = false;
+                self.a12_high_since = None;
+            }
+            return;
+        }
         if !high {
             if self.a12_high || self.a12_low_since.is_none() {
                 self.a12_low_since = Some(ppu_cycle);
@@ -229,6 +338,7 @@ impl Mapper for Mmc3 {
             self.clock_irq_counter();
         }
         self.a12_high = true;
+        self.a12_high_since = Some(ppu_cycle);
     }
 
     fn irq_pending(&self) -> bool {
@@ -250,18 +360,31 @@ impl Mapper for Mmc3 {
         self.irq_line = false;
         self.a12_high = false;
         self.a12_low_since = None;
+        self.a12_high_since = None;
+        self.mmc6_ram_enabled = false;
+        self.mmc6_protect = 0;
     }
 
-    fn prg_ram(&self) -> Option<&[u8]> { (!self.prg_ram.is_empty()).then_some(&self.prg_ram) }
-    fn prg_ram_mut(&mut self) -> Option<&mut [u8]> { (!self.prg_ram.is_empty()).then_some(&mut self.prg_ram) }
-    fn chr_ram(&self) -> Option<&[u8]> { self.chr_is_ram.then_some(&self.chr) }
-    fn chr_ram_mut(&mut self) -> Option<&mut [u8]> { self.chr_is_ram.then_some(&mut self.chr) }
+    fn prg_ram(&self) -> Option<&[u8]> {
+        (!self.prg_ram.is_empty()).then_some(&self.prg_ram)
+    }
+    fn prg_ram_mut(&mut self) -> Option<&mut [u8]> {
+        (!self.prg_ram.is_empty()).then_some(&mut self.prg_ram)
+    }
+    fn chr_ram(&self) -> Option<&[u8]> {
+        self.chr_is_ram.then_some(&self.chr)
+    }
+    fn chr_ram_mut(&mut self) -> Option<&mut [u8]> {
+        self.chr_is_ram.then_some(&mut self.chr)
+    }
 }
 
 impl Mmc3 {
     // Clocked on a qualified PPU A12 edge. The counter reloads from the latch
     // on a forced reload or when it has run down to zero, otherwise decrements.
     fn clock_irq_counter(&mut self) {
+        let was_nonzero = self.irq_counter != 0;
+        let forced_reload = self.irq_reload;
         if self.irq_reload || self.irq_counter == 0 {
             self.irq_counter = self.irq_latch;
             self.irq_reload = false;
@@ -269,11 +392,15 @@ impl Mmc3 {
             self.irq_counter -= 1;
         }
 
-        if self.irq_counter == 0 && self.irq_enabled {
+        let fires = if self.variant == Mmc3Variant::Nec {
+            self.irq_counter == 0 && (was_nonzero || forced_reload)
+        } else {
+            self.irq_counter == 0
+        };
+        if fires && self.irq_enabled {
             self.irq_line = true;
         }
     }
-
 }
 
 #[cfg(test)]
@@ -306,6 +433,13 @@ mod test {
     fn set_bank(m: &mut Mmc3, reg: u8, value: u8) {
         m.cpu_write(0x8000, reg); // prg_mode/chr_inv clear (reg < 8)
         m.cpu_write(0x8001, value);
+    }
+
+    fn rom_with_submapper(prg_8k_banks: usize, chr_1k_banks: usize, submapper: u8) -> Rom {
+        let mut image = rom(prg_8k_banks, chr_1k_banks);
+        image.metadata.format = crate::cartridge::RomFormat::Nes2;
+        image.metadata.submapper = submapper;
+        image
     }
 
     #[test]
@@ -557,6 +691,63 @@ mod test {
         let mut m = Mmc3::from_rom(image);
         m.cpu_write(0xa000, 1);
         assert_eq!(m.mirroring(), Mirroring::FourScreen);
+    }
+
+    #[test]
+    fn submapper_two_has_hardwired_mirroring() {
+        let mut m = Mmc3::from_rom(rom_with_submapper(8, 8, 2));
+        m.cpu_write(0xa000, 1);
+        assert_eq!(m.mirroring(), Mirroring::Vertical);
+    }
+
+    #[test]
+    fn submapper_four_uses_nec_zero_latch_irq_behavior() {
+        let mut m = Mmc3::from_rom(rom_with_submapper(8, 8, 4));
+        m.cpu_write(0xc000, 0);
+        m.cpu_write(0xc001, 0);
+        m.cpu_write(0xe001, 0);
+        m.clock_irq_counter();
+        assert!(m.irq_pending());
+        m.cpu_write(0xe000, 0);
+        m.cpu_write(0xe001, 0);
+        m.clock_irq_counter();
+        assert!(!m.irq_pending());
+
+        let mut sharp = Mmc3::from_rom(rom_with_submapper(8, 8, 0));
+        sharp.cpu_write(0xc000, 0);
+        sharp.cpu_write(0xc001, 0);
+        sharp.cpu_write(0xe001, 0);
+        sharp.clock_irq_counter();
+        sharp.cpu_write(0xe000, 0);
+        sharp.cpu_write(0xe001, 0);
+        sharp.clock_irq_counter();
+        assert!(sharp.irq_pending());
+    }
+
+    #[test]
+    fn submapper_three_clocks_irq_counter_on_qualified_a12_falls() {
+        let mut m = Mmc3::from_rom(rom_with_submapper(8, 8, 3));
+        m.cpu_write(0xc000, 5);
+        m.cpu_write(0xc001, 0);
+        m.on_ppu_bus_access(0x1000, 0);
+        m.on_ppu_bus_access(0x1000, 8);
+        assert_eq!(m.irq_counter, 0);
+        m.on_ppu_bus_access(0x0000, 9);
+        assert_eq!(m.irq_counter, 5);
+    }
+
+    #[test]
+    fn submapper_one_uses_mmc6_split_one_kib_ram_protection() {
+        let mut image = rom_with_submapper(8, 8, 1);
+        image.memory.prg_ram.size = 0x400;
+        let mut m = Mmc3::from_rom(image);
+        m.cpu_write(0x8000, 0x20); // global MMC6 RAM enable
+        m.cpu_write(0xa001, 0x30); // low 512-byte bank readable+writable
+        m.cpu_write(0x7001, 0x5a);
+        assert_eq!(m.cpu_read(0x7001), 0x5a);
+        assert_eq!(m.cpu_read(0x7401), 0x5a); // 1 KiB mirrors through $7FFF
+        m.cpu_write(0x7201, 0xa5);
+        assert_eq!(m.cpu_read(0x7201), 0); // high bank remains disabled
     }
 
     #[test]

@@ -6,7 +6,6 @@
 //! and artifact-capture options.
 
 use crate::audio::{self, AudioPump};
-use crate::apu;
 use crate::bus::Bus;
 use crate::cartridge::Rom;
 use crate::cpu::CPU;
@@ -18,10 +17,6 @@ use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
-
-// Match this emulator's current scanline clock exactly: 1,789,773 CPU Hz,
-// three PPU dots per CPU cycle, 341 dots * 262 lines per frame.
-const NES_FPS: f64 = 1_789_773.0 * 3.0 / (341.0 * 262.0);
 
 fn bmp_bytes(frame: &Frame) -> Vec<u8> {
     let (w, h) = (256usize, 240usize);
@@ -280,6 +275,11 @@ pub fn run_probe(rom_path: &str, script: &str, max_frames: u32) -> Result<(), St
 
     let bytes = std::fs::read(rom_path).map_err(|err| format!("read {rom_path}: {err}"))?;
     let rom = Rom::new(&bytes)?;
+    let region = std::env::var("NES_REGION")
+        .ok()
+        .map(|value| crate::region::Region::parse(&value))
+        .transpose()?
+        .unwrap_or_else(|| rom.metadata.timing.default_region());
     let done = Rc::new(Cell::new(false));
     let state = Rc::new(RefCell::new(State {
         rows: Vec::with_capacity(max_frames as usize),
@@ -314,9 +314,9 @@ pub fn run_probe(rom_path: &str, script: &str, max_frames: u32) -> Result<(), St
     let mut frame_no = 0u32;
     let mut cumulative_samples = 0u64;
     let mut next_frame = Instant::now();
-    let frame_duration = Duration::from_secs_f64(1.0 / NES_FPS);
+    let frame_duration = Duration::from_secs_f64(1.0 / region.frames_per_second());
 
-    let bus = Bus::new_with_audio(rom, move |ppu, apu, joypad| {
+    let bus = Bus::new_with_audio_region(rom, region, move |ppu, apu, joypad| {
         frame_no += 1;
         for button in [
             JoypadButton::BUTTON_A,
@@ -509,8 +509,8 @@ pub fn run_probe(rom_path: &str, script: &str, max_frames: u32) -> Result<(), St
         .last()
         .zip(state.rows.first())
         .map_or(0, |(last, first)| last.cpu_cycles - first.cpu_cycles);
-    let expected_samples = measured_cycles as f64 * audio::SAMPLE_RATE as f64
-        / apu::CPU_HZ as f64;
+    let expected_samples =
+        measured_cycles as f64 * audio::SAMPLE_RATE as f64 / region.cpu_hz() as f64;
     let sample_drift = actual_samples.saturating_sub(warmup_samples) as f64 - expected_samples;
     let queue_depths: Vec<u32> = state
         .rows

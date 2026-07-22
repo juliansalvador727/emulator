@@ -35,7 +35,7 @@ impl Mmc2 {
     pub fn from_rom(rom: Rom) -> Self {
         let chr_is_ram = rom.chr_rom.is_empty();
         let chr = if chr_is_ram {
-            vec![0; rom.memory.chr.size.max(0x2000)]
+            vec![0; rom.memory.chr_ram_size().max(0x2000)]
         } else {
             rom.chr_rom
         };
@@ -45,7 +45,7 @@ impl Mmc2 {
             prg_rom: rom.prg_rom,
             chr,
             chr_is_ram,
-            prg_ram: vec![0; rom.memory.prg_ram.size],
+            prg_ram: vec![0; rom.memory.prg_ram_size()],
             prg_bank: 0,
             chr_fd_0000: 0,
             chr_fe_0000: 0,
