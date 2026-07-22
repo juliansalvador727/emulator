@@ -33,14 +33,15 @@ documentation and test ROMs are the sources of truth for hardware behaviour.
   playback
 - Automatic recovery from wedged host audio (stall watchdog with staged
   resume/clear/reopen; device open/close isolated on a helper thread)
-- One standard controller through `$4016`
+- Two standard controllers through `$4016`/`$4017`, with simultaneous
+  keyboard multiplayer
 - On-launch game-selection menu: an arrow-key ROM picker that scans `games/`,
   drawn through the same 256×240 frame pipeline as gameplay
 - Fullscreen and borderless windowed-fullscreen with aspect-correct black bars
 - Native Windows cross-build from WSL, wired as the default `cargo run` target
 - Headless performance probes and deterministic visual regression tests
 
-The Rust suite contains 289 passing tests. All five `cpu_interrupts_v2` ROMs,
+The Rust suite contains 290 passing tests. All five `cpu_interrupts_v2` ROMs,
 both `cpu_reset` ROMs, all six `apu_reset` ROMs, and the eight `apu_test` singles
 also pass. The prioritized remaining work is tracked in [`TODO.md`](TODO.md).
 
@@ -207,15 +208,15 @@ because `WSL_DISTRO_NAME` leaks into Windows processes launched from WSL.
 
 ### Controls
 
-| NES control | Keyboard   |
-| ----------- | ---------- |
-| D-pad       | Arrow keys |
-| A           | A          |
-| B           | S          |
-| Select      | Space      |
-| Start       | Enter      |
-| Fullscreen  | F11        |
-| Back / quit | Escape     |
+| NES control | Player 1   | Player 2 |
+| ----------- | ---------- | -------- |
+| D-pad       | Arrow keys | I/J/K/L  |
+| A           | A          | G        |
+| B           | S          | H        |
+| Select      | Space      | Y        |
+| Start       | Enter      | U        |
+| Fullscreen  | F11        | —        |
+| Back / quit | Escape     | —        |
 
 Escape returns to the [game-selection menu](#game-selection-menu) when the game
 was launched from it, and otherwise quits.
@@ -267,9 +268,7 @@ cargo lin -- tiles /path/to/game.nes
   remain incomplete.
 - OAM DMA uses alternating get/put bus cycles with complete DMC-DMA arbitration,
   including start, middle, and end-window collisions.
-- NES 2.0 console/region metadata, PAL/Dendy timing, save states, and a second
-  controller remain to be implemented. MMC3 board/revision selection does not
-  yet consume the parsed NES 2.0 submapper metadata.
+- Versioned save states remain to be implemented.
 
 ## License
 

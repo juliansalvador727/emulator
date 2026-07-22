@@ -57,11 +57,11 @@ impl Joypad {
 
     /// The current bit without clocking the shift register.
     ///
-    /// A DMC DMA that halts the CPU mid-`$4016`-read makes the CPU repeat that
-    /// read cycle, but the 4021's /OE stays asserted across the repeats, so the
-    /// register only sees one edge no matter how many cycles the halt lasts.
-    /// The Bus uses this for every repeat after the first; that single stolen
-    /// clock is the DMC controller-corruption bug games suffer from.
+    /// A DMC DMA that halts the CPU during a controller-port read makes the CPU
+    /// repeat that cycle, but the 4021's /OE stays asserted across the repeats,
+    /// so the register only sees one edge no matter how long the halt lasts. The
+    /// Bus uses this for every repeat after the first; that single stolen clock
+    /// is the DMC controller-corruption bug games suffer from.
     pub fn peek(&self) -> u8 {
         if self.button_index > 7 {
             return 1;

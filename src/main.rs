@@ -136,16 +136,27 @@ fn run_game(
     let rom = Rom::from_file(&rom_path).unwrap_or_else(|err| panic!("{err}"));
     let region = region_override.unwrap_or_else(|| rom.metadata.timing.default_region());
 
-    // Keyboard -> NES controller button mapping.
+    // Keyboard -> (controller port, NES button) mapping. Player 2 uses a
+    // mirrored layout around IJKL so both players have distinct keys and can
+    // press directions and buttons simultaneously on one keyboard.
     let mut key_map = HashMap::new();
-    key_map.insert(Keycode::Down, JoypadButton::DOWN);
-    key_map.insert(Keycode::Up, JoypadButton::UP);
-    key_map.insert(Keycode::Right, JoypadButton::RIGHT);
-    key_map.insert(Keycode::Left, JoypadButton::LEFT);
-    key_map.insert(Keycode::Space, JoypadButton::SELECT);
-    key_map.insert(Keycode::Return, JoypadButton::START);
-    key_map.insert(Keycode::A, JoypadButton::BUTTON_A);
-    key_map.insert(Keycode::S, JoypadButton::BUTTON_B);
+    key_map.insert(Keycode::Down, (1, JoypadButton::DOWN));
+    key_map.insert(Keycode::Up, (1, JoypadButton::UP));
+    key_map.insert(Keycode::Right, (1, JoypadButton::RIGHT));
+    key_map.insert(Keycode::Left, (1, JoypadButton::LEFT));
+    key_map.insert(Keycode::Space, (1, JoypadButton::SELECT));
+    key_map.insert(Keycode::Return, (1, JoypadButton::START));
+    key_map.insert(Keycode::A, (1, JoypadButton::BUTTON_A));
+    key_map.insert(Keycode::S, (1, JoypadButton::BUTTON_B));
+
+    key_map.insert(Keycode::K, (2, JoypadButton::DOWN));
+    key_map.insert(Keycode::I, (2, JoypadButton::UP));
+    key_map.insert(Keycode::L, (2, JoypadButton::RIGHT));
+    key_map.insert(Keycode::J, (2, JoypadButton::LEFT));
+    key_map.insert(Keycode::Y, (2, JoypadButton::SELECT));
+    key_map.insert(Keycode::U, (2, JoypadButton::START));
+    key_map.insert(Keycode::G, (2, JoypadButton::BUTTON_A));
+    key_map.insert(Keycode::H, (2, JoypadButton::BUTTON_B));
 
     let sample_bytes = audio::HOST_SAMPLE_BYTES;
 
@@ -344,17 +355,30 @@ fn run_game(
                     }
                 }
                 Event::KeyDown { keycode, .. } => {
-                    if let Some(button) = keycode.and_then(|k| key_map.get(&k)) {
-                        cpu.bus
-                            .joypad_mut()
-                            .set_button_pressed_status(*button, true);
+                    if let Some(&(player, button)) = keycode.and_then(|k| key_map.get(&k)) {
+                        match player {
+                            1 => cpu.bus.joypad_mut().set_button_pressed_status(button, true),
+                            2 => cpu
+                                .bus
+                                .joypad2_mut()
+                                .set_button_pressed_status(button, true),
+                            _ => unreachable!(),
+                        }
                     }
                 }
                 Event::KeyUp { keycode, .. } => {
-                    if let Some(button) = keycode.and_then(|k| key_map.get(&k)) {
-                        cpu.bus
-                            .joypad_mut()
-                            .set_button_pressed_status(*button, false);
+                    if let Some(&(player, button)) = keycode.and_then(|k| key_map.get(&k)) {
+                        match player {
+                            1 => cpu
+                                .bus
+                                .joypad_mut()
+                                .set_button_pressed_status(button, false),
+                            2 => cpu
+                                .bus
+                                .joypad2_mut()
+                                .set_button_pressed_status(button, false),
+                            _ => unreachable!(),
+                        }
                     }
                 }
                 _ => {}

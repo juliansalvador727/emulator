@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
-use crate::apu::NesAPU;
 use crate::apu::dmc::DmcDmaRequestKind;
+use crate::apu::NesAPU;
 use crate::cartridge::Rom;
 use crate::cpu::Mem;
 use crate::joypad::Joypad;
@@ -121,8 +121,8 @@ pub struct Bus<'call> {
     // Consecutive CPU writes after an eligible halt attempt. DMA retries each
     // cycle; odd delay parity swaps whether alignment is required.
     dmc_write_delays: u8,
-    // True while a DMC halt is repeating a $4016 read after the first repeat,
-    // holding the controller's /OE asserted so the shift register does not clock.
+    // True while a DMC halt is repeating a controller-port read after the first
+    // repeat, holding the controller's /OE asserted so its register does not clock.
     dmc_reread_holds_oe: bool,
     gameloop_callback: Box<dyn FnMut(&NesPPU, &mut NesAPU, &mut Joypad) + 'call>,
     audio_chunk_samples: Option<usize>,
@@ -130,6 +130,7 @@ pub struct Bus<'call> {
     audio_delivery_enabled: bool,
     host_frame_ready: bool,
     joypad1: Joypad,
+    joypad2: Joypad,
 }
 
 pub struct BusSnapshot {
@@ -149,6 +150,7 @@ pub struct BusSnapshot {
     audio_delivery_enabled: bool,
     host_frame_ready: bool,
     joypad1: Joypad,
+    joypad2: Joypad,
 }
 
 impl<'a> Bus<'a> {
@@ -216,6 +218,7 @@ impl<'a> Bus<'a> {
             audio_delivery_enabled: true,
             host_frame_ready: false,
             joypad1: Joypad::new(),
+            joypad2: Joypad::new(),
         }
     }
 
@@ -546,6 +549,14 @@ impl<'a> Bus<'a> {
         &self.joypad1
     }
 
+    pub fn joypad2_mut(&mut self) -> &mut Joypad {
+        &mut self.joypad2
+    }
+
+    pub fn joypad2(&self) -> &Joypad {
+        &self.joypad2
+    }
+
     pub fn set_audio_delivery_enabled(&mut self, enabled: bool) {
         self.audio_delivery_enabled = enabled;
     }
@@ -569,6 +580,7 @@ impl<'a> Bus<'a> {
             audio_delivery_enabled: self.audio_delivery_enabled,
             host_frame_ready: self.host_frame_ready,
             joypad1: self.joypad1.clone(),
+            joypad2: self.joypad2.clone(),
         }
     }
 
@@ -587,6 +599,7 @@ impl<'a> Bus<'a> {
         self.audio_delivery_enabled = snapshot.audio_delivery_enabled;
         self.host_frame_ready = snapshot.host_frame_ready;
         self.joypad1 = snapshot.joypad1;
+        self.joypad2 = snapshot.joypad2;
     }
 
     pub fn poll_nmi_status(&mut self) -> Option<u8> {
@@ -638,10 +651,13 @@ impl Mem for Bus<'_> {
                     self.joypad1.read()
                 }
             }
-            // $4017 reads controller 2 on real hardware. This emulator only
-            // exposes joypad 1, so return an idle value instead of spamming
-            // stdout for games that poll both controller ports.
-            0x4017 => 0,
+            0x4017 => {
+                if self.dmc_reread_holds_oe {
+                    self.joypad2.peek()
+                } else {
+                    self.joypad2.read()
+                }
+            }
             // $6000-$7FFF is PRG-RAM; $8000-$FFFF is PRG-ROM. Both go through
             // the mapper.
             0x6000..=0xFFFF => self.mapper.borrow_mut().cpu_read(addr),
@@ -707,6 +723,7 @@ impl Mem for Bus<'_> {
 
             0x4016 => {
                 self.joypad1.write(data);
+                self.joypad2.write(data);
             }
 
             // Writes to $6000-$7FFF hit PRG-RAM; writes to $8000-$FFFF are the
@@ -742,9 +759,48 @@ mod test {
     }
 
     #[test]
-    fn joypad2_reads_do_not_fall_through_to_unmapped_io() {
+    fn joypad2_reads_buttons_on_4017_in_standard_order() {
         let mut bus = test_bus();
+        bus.joypad2
+            .set_button_pressed_status(crate::joypad::JoypadButton::BUTTON_A, true);
+        bus.joypad2
+            .set_button_pressed_status(crate::joypad::JoypadButton::START, true);
+        bus.joypad2
+            .set_button_pressed_status(crate::joypad::JoypadButton::LEFT, true);
+
+        // A $4016 strobe latches both standard controller ports.
+        bus.mem_write(0x4016, 1);
+        assert_eq!(bus.mem_read(0x4017), 1);
+        assert_eq!(bus.mem_read(0x4016), 0);
+        assert_eq!(bus.mem_read(0x4017), 1);
+        bus.mem_write(0x4016, 0);
+
+        // A, B, Select, Start, Up, Down, Left, Right, then 1s.
+        assert_eq!(bus.mem_read(0x4017), 1);
         assert_eq!(bus.mem_read(0x4017), 0);
+        assert_eq!(bus.mem_read(0x4017), 0);
+        assert_eq!(bus.mem_read(0x4017), 1);
+        assert_eq!(bus.mem_read(0x4017), 0);
+        assert_eq!(bus.mem_read(0x4017), 0);
+        assert_eq!(bus.mem_read(0x4017), 1);
+        assert_eq!(bus.mem_read(0x4017), 0);
+        assert_eq!(bus.mem_read(0x4017), 1);
+    }
+
+    #[test]
+    fn joypad2_state_survives_snapshot_restore() {
+        let mut bus = test_bus();
+        bus.joypad2
+            .set_button_pressed_status(crate::joypad::JoypadButton::BUTTON_B, true);
+        let snapshot = bus.snapshot();
+
+        bus.joypad2
+            .set_button_pressed_status(crate::joypad::JoypadButton::BUTTON_B, false);
+        bus.restore(snapshot);
+        bus.mem_write(0x4016, 1);
+        bus.mem_write(0x4016, 0);
+        assert_eq!(bus.mem_read(0x4017), 0); // A
+        assert_eq!(bus.mem_read(0x4017), 1); // B
     }
 
     #[test]

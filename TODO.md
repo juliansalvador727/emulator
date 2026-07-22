@@ -8,7 +8,7 @@ and has a separate, lower-priority backlog at the end of this file.
 
 Current verified baseline (2026-07-16):
 
-- 289 passing Rust tests.
+- 290 passing Rust tests.
 - All 256 6502 opcodes (official and undocumented); `nestest` matches the
   reference for all 8,991 instruction lines. `instr_test-v5` (16/16),
   `instr_timing` (2/2), and `instr_misc` (4/4) pass.
@@ -475,7 +475,8 @@ audio never reaches SDL.
 ## P2 — Regions, input, and emulator features
 
 - [x] Add PAL and Dendy CPU/PPU/APU timing and runtime region selection.
-- [ ] Add a second standard controller at `$4017`.
+- [x] Add a second standard controller at `$4017`, including shared `$4016`
+  strobing, run-ahead snapshot state, and simultaneous keyboard controls.
 - [ ] Add peripherals only for a target title: Zapper, Four Score, and other
   expansion devices.
 - [ ] Add versioned save states only after reset semantics and mapper state are
