@@ -1,12 +1,13 @@
 use std::rc::Rc;
 
-use crate::apu::dmc::DmcDmaRequestKind;
 use crate::apu::NesAPU;
+use crate::apu::dmc::DmcDmaRequestKind;
 use crate::cartridge::Rom;
 use crate::cpu::Mem;
 use crate::joypad::Joypad;
 use crate::mapper::{self, SharedMapper};
 use crate::ppu::NesPPU;
+use crate::region::Region;
 
 const RAM: u16 = 0x0000;
 const RAM_MIRRORS_END: u16 = 0x1FFF;
@@ -61,10 +62,7 @@ impl DmcHeldRead {
 }
 
 #[inline]
-fn standalone_dmc_repeated_reads(
-    kind: DmcDmaRequestKind,
-    scheduled_on_get: bool,
-) -> u8 {
+fn standalone_dmc_repeated_reads(kind: DmcDmaRequestKind, scheduled_on_get: bool) -> u8 {
     match kind {
         DmcDmaRequestKind::Load if scheduled_on_get => 2,
         DmcDmaRequestKind::Load => 3,
@@ -103,6 +101,8 @@ pub struct Bus<'call> {
     pub apu: NesAPU,
 
     cycles: usize,
+    region: Region,
+    ppu_clock_phase: u8,
     // DMA reads are allowed only on get cycles; writes occur on put cycles.
     // This phase is independent state in the hardware (its relationship to
     // CPU cycle parity is random at power-on), so do not derive it from
@@ -138,6 +138,7 @@ pub struct BusSnapshot {
     ppu: NesPPU,
     apu: NesAPU,
     cycles: usize,
+    ppu_clock_phase: u8,
     dma_get_cycle: bool,
     // Page selected by the last $4014 write, consumed on the next tick so the
     // 513/514-cycle stall begins at the following CPU-cycle boundary.
@@ -171,15 +172,38 @@ impl<'a> Bus<'a> {
         F: FnMut(&NesPPU, &mut NesAPU, &mut Joypad) + 'call,
         A: FnMut(Vec<f32>) + 'call,
     {
+        let region = rom.metadata.timing.default_region();
+        Self::new_with_audio_region(
+            rom,
+            region,
+            gameloop_callback,
+            audio_chunk_samples,
+            audio_callback,
+        )
+    }
+
+    pub fn new_with_audio_region<'call, F, A>(
+        rom: Rom,
+        region: Region,
+        gameloop_callback: F,
+        audio_chunk_samples: usize,
+        audio_callback: A,
+    ) -> Bus<'call>
+    where
+        F: FnMut(&NesPPU, &mut NesAPU, &mut Joypad) + 'call,
+        A: FnMut(Vec<f32>) + 'call,
+    {
         assert!(audio_chunk_samples > 0);
         let mapper = mapper::from_rom(rom);
-        let ppu = NesPPU::new(Rc::clone(&mapper));
+        let ppu = NesPPU::new_with_region(Rc::clone(&mapper), region);
         Bus {
             cpu_vram: [0; 2048],
             mapper: mapper,
             ppu: ppu,
-            apu: NesAPU::new(),
+            apu: NesAPU::new_with_region(region),
             cycles: 0,
+            region,
+            ppu_clock_phase: 0,
             dma_get_cycle: false,
             oam_dma_page: None,
             dmc_pending_ticks: 0,
@@ -187,8 +211,7 @@ impl<'a> Bus<'a> {
             dmc_write_delays: 0,
             dmc_reread_holds_oe: false,
             gameloop_callback: Box::from(gameloop_callback),
-            audio_chunk_samples: (audio_chunk_samples != usize::MAX)
-                .then_some(audio_chunk_samples),
+            audio_chunk_samples: (audio_chunk_samples != usize::MAX).then_some(audio_chunk_samples),
             audio_callback: Box::from(audio_callback),
             audio_delivery_enabled: true,
             host_frame_ready: false,
@@ -242,11 +265,7 @@ impl<'a> Bus<'a> {
     // One physical CPU cycle. The PPU and APU advance, host-frame state is
     // retained, and interrupt lines are sampled at their hardware boundaries.
     #[inline]
-    fn clock_cpu_cycle(
-        &mut self,
-        frame_ready: &mut bool,
-        interrupt_samples: &mut InterruptBatch,
-    ) {
+    fn clock_cpu_cycle(&mut self, frame_ready: &mut bool, interrupt_samples: &mut InterruptBatch) {
         // The CPU samples the IRQ input before the APU advances for this
         // physical cycle. A frame IRQ raised by `apu.tick` is therefore
         // visible to the CPU on the following cycle, while $4015 can observe
@@ -254,12 +273,13 @@ impl<'a> Bus<'a> {
         let irq_line = self.poll_irq_status();
         self.cycles += 1;
         self.apu.tick(1);
-        self.ppu.tick(3);
+        let (numerator, denominator) = self.region.ppu_ratio();
+        self.ppu_clock_phase += numerator;
+        let ppu_dots = self.ppu_clock_phase / denominator;
+        self.ppu_clock_phase %= denominator;
+        self.ppu.tick(ppu_dots);
         *frame_ready |= self.ppu.take_frame_ready();
-        interrupt_samples.push(
-            self.ppu.poll_nmi_interrupt().is_some(),
-            irq_line,
-        );
+        interrupt_samples.push(self.ppu.poll_nmi_interrupt().is_some(), irq_line);
         self.observe_dmc_request();
         self.dma_get_cycle = !self.dma_get_cycle;
     }
@@ -446,8 +466,7 @@ impl<'a> Bus<'a> {
             return None;
         }
         let request_kind = self.dmc_pending_kind.unwrap();
-        let repeated_reads =
-            standalone_dmc_repeated_reads(request_kind, self.dma_get_cycle);
+        let repeated_reads = standalone_dmc_repeated_reads(request_kind, self.dma_get_cycle);
         let held_read = DmcHeldRead {
             repeated_reads,
             request_kind,
@@ -497,6 +516,24 @@ impl<'a> Bus<'a> {
         std::mem::take(&mut self.host_frame_ready)
     }
 
+    /// Reset the console-side devices while retaining CPU RAM, cartridge RAM,
+    /// and other state that survives the front-panel reset switch.
+    pub fn reset(&mut self) {
+        self.mapper.borrow_mut().reset();
+        self.apu.reset();
+        self.ppu.reset();
+        self.oam_dma_page = None;
+        self.dmc_pending_ticks = 0;
+        self.dmc_pending_kind = None;
+        self.dmc_write_delays = 0;
+        self.dmc_reread_holds_oe = false;
+        self.host_frame_ready = false;
+    }
+
+    pub fn flush_battery_ram(&self) -> Result<(), String> {
+        self.mapper.borrow().flush_persistent_ram()
+    }
+
     pub fn ppu(&self) -> &NesPPU {
         &self.ppu
     }
@@ -523,6 +560,7 @@ impl<'a> Bus<'a> {
             ppu,
             apu: self.apu.clone(),
             cycles: self.cycles,
+            ppu_clock_phase: self.ppu_clock_phase,
             dma_get_cycle: self.dma_get_cycle,
             oam_dma_page: self.oam_dma_page,
             dmc_pending_ticks: self.dmc_pending_ticks,
@@ -540,6 +578,7 @@ impl<'a> Bus<'a> {
         self.ppu = snapshot.ppu;
         self.apu = snapshot.apu;
         self.cycles = snapshot.cycles;
+        self.ppu_clock_phase = snapshot.ppu_clock_phase;
         self.dma_get_cycle = snapshot.dma_get_cycle;
         self.oam_dma_page = snapshot.oam_dma_page;
         self.dmc_pending_ticks = snapshot.dmc_pending_ticks;
@@ -585,6 +624,12 @@ impl Mem for Bus<'_> {
                 let mirror_down_addr = addr & 0b00100000_00000111;
                 self.mem_read(mirror_down_addr)
             }
+            // APU channel registers and OAMDMA are write-only. Games such as
+            // Mike Tyson's Punch-Out!! read them while copying register
+            // shadows; until the CPU data-bus latch is modeled, expose the
+            // existing deterministic open-bus fallback without logging every
+            // access.
+            0x4000..=0x4014 => 0,
             0x4015 => self.apu.read_status(),
             0x4016 => {
                 if self.dmc_reread_holds_oe {
@@ -666,7 +711,11 @@ impl Mem for Bus<'_> {
 
             // Writes to $6000-$7FFF hit PRG-RAM; writes to $8000-$FFFF are the
             // mapper's bank-switch control registers, not errors.
-            0x6000..=0xFFFF => self.mapper.borrow_mut().cpu_write(addr, data),
+            0x6000..=0xFFFF => {
+                self.mapper
+                    .borrow_mut()
+                    .cpu_write_at(addr, data, self.cycles as u64)
+            }
 
             _ => {
                 println!("Ignoring mem write-access at {}", addr);
@@ -696,6 +745,27 @@ mod test {
     fn joypad2_reads_do_not_fall_through_to_unmapped_io() {
         let mut bus = test_bus();
         assert_eq!(bus.mem_read(0x4017), 0);
+    }
+
+    #[test]
+    fn pal_bus_clocks_sixteen_ppu_dots_per_five_cpu_cycles() {
+        let mut bus = Bus::new_with_audio_region(
+            test_rom(vec![]),
+            Region::Pal,
+            |_, _, _| {},
+            usize::MAX,
+            |_| {},
+        );
+        bus.tick(5);
+        assert_eq!(bus.ppu().total_dot_count(), 16);
+    }
+
+    #[test]
+    fn write_only_apu_and_dma_registers_have_deterministic_read_fallback() {
+        let mut bus = test_bus();
+        for addr in 0x4000..=0x4014 {
+            assert_eq!(bus.mem_read(addr), 0, "register ${addr:04X}");
+        }
     }
 
     #[test]

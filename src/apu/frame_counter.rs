@@ -1,4 +1,5 @@
 // https://www.nesdev.org/wiki/APU_Frame_Counter
+use crate::region::Region;
 //
 // The frame counter divides the CPU clock down to ~240 Hz "quarter frame"
 // and ~120 Hz "half frame" clocks that drive the envelopes, the triangle's
@@ -28,8 +29,18 @@ const FOUR_STEP_LENGTH: u32 = 29830; // IRQ, wrap 14915
 const STEP5: u32 = 37281; // quarter + half       18640.5
 const FIVE_STEP_LENGTH: u32 = 37282; //           18641
 
+const PAL_STEP1: u32 = 8313;
+const PAL_STEP2: u32 = 16627;
+const PAL_STEP3: u32 = 24939;
+const PAL_IRQ_SET: u32 = 33252;
+const PAL_STEP4: u32 = 33253;
+const PAL_FOUR_STEP_LENGTH: u32 = 33254;
+const PAL_STEP5: u32 = 41565;
+const PAL_FIVE_STEP_LENGTH: u32 = 41566;
+
 #[derive(Clone)]
 pub struct FrameCounter {
+    pal_timing: bool,
     cycle: u32, // CPU cycles into the current sequence
     five_step: bool,
     irq_inhibit: bool,
@@ -38,17 +49,24 @@ pub struct FrameCounter {
     // A $4017 write only takes effect 3-4 CPU cycles later; see write().
     reset_delay: u8,
     pending_five_step: bool,
+    last_write: u8,
 }
 
 impl FrameCounter {
     pub fn new() -> Self {
+        Self::new_with_region(Region::Ntsc)
+    }
+
+    pub fn new_with_region(region: Region) -> Self {
         FrameCounter {
+            pal_timing: region == Region::Pal,
             cycle: 0,
             five_step: false,
             irq_inhibit: false,
             frame_irq: false,
             reset_delay: 0,
             pending_five_step: false,
+            last_write: 0,
         }
     }
 
@@ -59,6 +77,7 @@ impl FrameCounter {
     // write lands on is approximate - the same order of jitter real
     // hardware exhibits.
     pub fn write(&mut self, data: u8, on_apu_cycle: bool) {
+        self.last_write = data;
         self.pending_five_step = data & 0x80 != 0;
         self.irq_inhibit = data & 0x40 != 0;
         // Setting the inhibit flag clears any pending frame interrupt.
@@ -66,6 +85,19 @@ impl FrameCounter {
             self.frame_irq = false;
         }
         self.reset_delay = if on_apu_cycle { 3 } else { 4 };
+    }
+
+    // Reset re-applies the last value written to $4017. Unlike a CPU write,
+    // the reset signal establishes the sequencer state directly; the CPU's
+    // seven reset-entry cycles provide the observed delay before reset-vector
+    // code begins executing.
+    pub fn reset(&mut self) {
+        self.cycle = 0;
+        self.five_step = self.last_write & 0x80 != 0;
+        self.irq_inhibit = self.last_write & 0x40 != 0;
+        self.frame_irq = false;
+        self.reset_delay = 0;
+        self.pending_five_step = self.five_step;
     }
 
     // Advance one CPU cycle.
@@ -87,11 +119,35 @@ impl FrameCounter {
         }
 
         self.cycle += 1;
+        let (step1, step2, step3, irq_set, step4, four_length, step5, five_length) =
+            if self.pal_timing {
+                (
+                    PAL_STEP1,
+                    PAL_STEP2,
+                    PAL_STEP3,
+                    PAL_IRQ_SET,
+                    PAL_STEP4,
+                    PAL_FOUR_STEP_LENGTH,
+                    PAL_STEP5,
+                    PAL_FIVE_STEP_LENGTH,
+                )
+            } else {
+                (
+                    STEP1,
+                    STEP2,
+                    STEP3,
+                    IRQ_SET,
+                    STEP4,
+                    FOUR_STEP_LENGTH,
+                    STEP5,
+                    FIVE_STEP_LENGTH,
+                )
+            };
         if self.five_step {
             match self.cycle {
-                STEP1 | STEP3 => FrameEvent::Quarter,
-                STEP2 | STEP5 => FrameEvent::Half,
-                FIVE_STEP_LENGTH => {
+                cycle if cycle == step1 || cycle == step3 => FrameEvent::Quarter,
+                cycle if cycle == step2 || cycle == step5 => FrameEvent::Half,
+                cycle if cycle == five_length => {
                     self.cycle = 0;
                     FrameEvent::None
                 }
@@ -99,20 +155,20 @@ impl FrameCounter {
             }
         } else {
             match self.cycle {
-                STEP1 | STEP3 => FrameEvent::Quarter,
-                STEP2 => FrameEvent::Half,
+                cycle if cycle == step1 || cycle == step3 => FrameEvent::Quarter,
+                cycle if cycle == step2 => FrameEvent::Half,
                 // The frame interrupt flag is held asserted for three
                 // consecutive CPU cycles around the end of the 4-step
                 // sequence (wiki APU cycles 14914, 14914.5 and 14915).
-                IRQ_SET => {
+                cycle if cycle == irq_set => {
                     self.set_irq();
                     FrameEvent::None
                 }
-                STEP4 => {
+                cycle if cycle == step4 => {
                     self.set_irq();
                     FrameEvent::Half
                 }
-                FOUR_STEP_LENGTH => {
+                cycle if cycle == four_length => {
                     self.set_irq();
                     self.cycle = 0;
                     FrameEvent::None
@@ -248,5 +304,38 @@ mod test {
         // The next quarter clock arrives a full STEP1 later, not at 7457-5000.
         let events = run(&mut fc, STEP1);
         assert_eq!(events, vec![(STEP1, FrameEvent::Quarter)]);
+    }
+
+    #[test]
+    fn reset_rewrites_last_mode_and_clears_irq() {
+        let mut fc = FrameCounter::new();
+        fc.write(0x80, true);
+        run(&mut fc, 3);
+        run(&mut fc, 10_000);
+        fc.frame_irq = true;
+
+        fc.reset();
+
+        assert!(fc.five_step);
+        assert!(!fc.irq_inhibit);
+        assert!(!fc.frame_irq);
+        assert_eq!(fc.cycle, 0);
+        assert_eq!(fc.reset_delay, 0);
+    }
+
+    #[test]
+    fn pal_four_step_event_timing() {
+        let mut fc = FrameCounter::new_with_region(Region::Pal);
+        let events = run(&mut fc, PAL_FOUR_STEP_LENGTH);
+        assert_eq!(
+            events,
+            vec![
+                (PAL_STEP1, FrameEvent::Quarter),
+                (PAL_STEP2, FrameEvent::Half),
+                (PAL_STEP3, FrameEvent::Quarter),
+                (PAL_STEP4, FrameEvent::Half),
+            ]
+        );
+        assert!(fc.frame_irq);
     }
 }

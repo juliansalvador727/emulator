@@ -4,19 +4,31 @@ A playable NES emulator written in Rust. It currently combines a complete
 official 6502 instruction set with a dot-driven PPU renderer, mapper-controlled
 banking and IRQs, controller input, and five-channel audio.
 
-The emulator is NTSC-oriented. Video, keyboard input, and bound-stream audio
+NTSC, licensed PAL, and Dendy timing are selected from cartridge metadata and
+can be overridden explicitly. Video, keyboard input, and bound-stream audio
 share one bundled SDL3 runtime with a single, carefully managed lifecycle. NES
 documentation and test ROMs are the sources of truth for hardware behaviour.
 
 ## Current support
 
-- All official 6502 opcodes, CPU interrupts, and `nestest` trace validation
+- All 256 official and undocumented 6502 opcodes, with the complete 8,991-line
+  `nestest` trace matching its reference
+- Bus-cycle CPU interrupt timing, including CLI/SEI/PLP latency, branch-specific
+  IRQ polling, seven-cycle interrupt entry, and NMI vector hijacking
+- Separate power-on and front-panel reset behavior: seven reset-vector cycles,
+  preserved A/X/Y and RAM on soft reset, and in-place APU/PPU reset
 - Dot-driven PPU rendering with fetch-timed loopy scrolling, sprite evaluation,
   sprite-0 hit timing, vblank/NMI races, and odd-frame skipping
 - Background and sprite rendering, including 8×16 sprites, priority, clipping,
   and the eight-sprites-per-line limit
-- NROM (0), MMC1 (1), UxROM (2), CNROM (3), MMC3 (4), AxROM (7), and GxROM (66)
+- NROM (0), MMC1 (1), UxROM (2), CNROM (3), MMC3/MMC6 (4), AxROM (7),
+  MMC2/PxROM (9), and GxROM (66)
 - Fetch-driven MMC3 IRQs using qualified PPU A12 edges
+- Distinct volatile and battery-backed cartridge RAM with atomic `.sav`
+  replacement, including simultaneous NES 2.0 RAM/NVRAM regions
+- iNES and NES 2.0 header parsing, including 12-bit mapper IDs, submappers,
+  console/region metadata, both ROM-size encodings, and separate RAM/NVRAM
+- NTSC, PAL, and Dendy CPU/PPU/APU clocks, raster timing, and host pacing
 - Pulse, triangle, noise, and DMC audio with IRQs, DMA, filtering, and SDL3
   playback
 - Automatic recovery from wedged host audio (stall watchdog with staged
@@ -28,8 +40,9 @@ documentation and test ROMs are the sources of truth for hardware behaviour.
 - Native Windows cross-build from WSL, wired as the default `cargo run` target
 - Headless performance probes and deterministic visual regression tests
 
-The test suite currently contains 245 passing tests. The prioritized remaining
-work is tracked in [`TODO.md`](TODO.md).
+The Rust suite contains 289 passing tests. All five `cpu_interrupts_v2` ROMs,
+both `cpu_reset` ROMs, all six `apu_reset` ROMs, and the eight `apu_test` singles
+also pass. The prioritized remaining work is tracked in [`TODO.md`](TODO.md).
 
 ## Requirements
 
@@ -83,6 +96,14 @@ Run a game by passing its path (default target is Windows via WSL interop; use
 ```bash
 cargo run --release -- games/pacman.nes
 cargo run --release -- /path/to/game.nes
+```
+
+Region timing normally follows the ROM header. Override it with `--region`
+or `NES_REGION` when metadata is missing or incorrect:
+
+```bash
+cargo run --release -- games/game.nes --region pal
+NES_REGION=dendy cargo lin -- games/game.nes
 ```
 
 With no ROM argument, launch opens the [game-selection
@@ -199,6 +220,14 @@ because `WSL_DISTRO_NAME` leaks into Windows processes launched from WSL.
 Escape returns to the [game-selection menu](#game-selection-menu) when the game
 was launched from it, and otherwise quits.
 
+### Battery saves
+
+Battery-backed RAM is loaded when a ROM starts and atomically written when the
+game exits or returns to the menu. By default, `game.nes` uses `game.sav` in the
+same directory. Set `NES_SAVE_DIR` to place saves elsewhere; the directory is
+created on demand. Mapper reset and run-ahead snapshots preserve cartridge RAM
+without writing speculative state to disk.
+
 ## Validation and diagnostics
 
 These run on the native-Linux target via the `cargo lin` alias — that keeps the
@@ -211,8 +240,7 @@ cargo lin -- nestest > mynes.log 2>/dev/null
 diff <(sed 's/ PPU:.*//' nestest.log | head -n "$(wc -l < mynes.log)") mynes.log
 ```
 
-The trace matches all 5,003 official-opcode entries and stops when `nestest`
-reaches its first unofficial opcode.
+The trace matches all 8,991 official and undocumented instruction lines.
 
 Run a headless optimized probe with optional scripted input:
 
@@ -224,7 +252,7 @@ The probe reports frame timing, audio production and drift, frame hashes, DMA
 activity, and visible-time PPU writes. It can also create deterministic BMPs
 and compare them against reviewed baselines. See
 [`probes/README.md`](probes/README.md) for all probe
-options and the visual-regression runner.
+options and the visual/audio regression runners.
 
 Inspect a CHR tile in an SDL window:
 
@@ -239,8 +267,9 @@ cargo lin -- tiles /path/to/game.nes
   remain incomplete.
 - OAM DMA uses alternating get/put bus cycles with complete DMC-DMA arbitration,
   including start, middle, and end-window collisions.
-- Unofficial 6502 opcodes, NES 2.0, PAL/Dendy timing, battery saves, save
-  states, and a second controller remain to be implemented.
+- NES 2.0 console/region metadata, PAL/Dendy timing, save states, and a second
+  controller remain to be implemented. MMC3 board/revision selection does not
+  yet consume the parsed NES 2.0 submapper metadata.
 
 ## License
 

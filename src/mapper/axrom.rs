@@ -10,6 +10,7 @@ pub struct Axrom {
     prg_rom: Vec<u8>,
     chr: Vec<u8>,
     chr_is_ram: bool,
+    prg_ram: Vec<u8>,
     prg_bank: usize, // switchable 32 KB bank at $8000-$FFFF
     num_banks: usize,
     mirroring: Mirroring,
@@ -18,12 +19,13 @@ pub struct Axrom {
 impl Axrom {
     pub fn from_rom(rom: Rom) -> Self {
         let chr_is_ram = rom.chr_rom.is_empty();
-        let chr = if chr_is_ram { vec![0; 0x2000] } else { rom.chr_rom };
+        let chr = if chr_is_ram { vec![0; rom.memory.chr_ram_size()] } else { rom.chr_rom };
         let num_banks = (rom.prg_rom.len() / 0x8000).max(1);
         Axrom {
             prg_rom: rom.prg_rom,
             chr,
             chr_is_ram,
+            prg_ram: vec![0; rom.memory.prg_ram_size()],
             prg_bank: 0,
             num_banks,
             // Powers up single-screen; the game sets which page on its first write.
@@ -35,12 +37,17 @@ impl Axrom {
 impl Mapper for Axrom {
     fn cpu_read(&mut self, addr: u16) -> u8 {
         match addr {
+            0x6000..=0x7fff => self.prg_ram.get((addr - 0x6000) as usize).copied().unwrap_or(0),
             0x8000..=0xffff => self.prg_rom[self.prg_bank * 0x8000 + (addr as usize - 0x8000)],
             _ => 0,
         }
     }
 
     fn cpu_write(&mut self, addr: u16, data: u8) {
+        if let 0x6000..=0x7fff = addr {
+            if let Some(byte) = self.prg_ram.get_mut((addr - 0x6000) as usize) { *byte = data; }
+            return;
+        }
         if addr >= 0x8000 {
             self.prg_bank = (data as usize & 0x7) % self.num_banks;
             self.mirroring = if data & 0x10 != 0 {
@@ -64,6 +71,11 @@ impl Mapper for Axrom {
     fn mirroring(&self) -> Mirroring {
         self.mirroring
     }
+    fn reset(&mut self) { self.prg_bank = 0; self.mirroring = Mirroring::SingleScreenLower; }
+    fn prg_ram(&self) -> Option<&[u8]> { (!self.prg_ram.is_empty()).then_some(&self.prg_ram) }
+    fn prg_ram_mut(&mut self) -> Option<&mut [u8]> { (!self.prg_ram.is_empty()).then_some(&mut self.prg_ram) }
+    fn chr_ram(&self) -> Option<&[u8]> { self.chr_is_ram.then_some(&self.chr) }
+    fn chr_ram_mut(&mut self) -> Option<&mut [u8]> { self.chr_is_ram.then_some(&mut self.chr) }
 }
 
 #[cfg(test)]
@@ -77,9 +89,12 @@ mod test {
             prg_rom.extend(std::iter::repeat(b as u8).take(0x8000));
         }
         Rom {
+            memory: crate::cartridge::CartridgeMemory::test_defaults(prg_rom.len(), 0),
+            save_path: None,
             prg_rom,
             chr_rom: vec![],
             mapper: 7,
+            metadata: crate::cartridge::CartridgeMetadata::test_defaults(),
             screen_mirroring: Mirroring::Horizontal, // ignored by AxROM
         }
     }
@@ -100,5 +115,14 @@ mod test {
         assert_eq!(m.mirroring(), Mirroring::SingleScreenLower);
         m.cpu_write(0x8000, 0x10);
         assert_eq!(m.mirroring(), Mirroring::SingleScreenUpper);
+    }
+
+    #[test]
+    fn reset_restores_bank_and_lower_nametable() {
+        let mut m = Axrom::from_rom(rom(2));
+        m.cpu_write(0x8000, 0x11);
+        m.reset();
+        assert_eq!(m.cpu_read(0x8000), 0);
+        assert_eq!(m.mirroring(), Mirroring::SingleScreenLower);
     }
 }

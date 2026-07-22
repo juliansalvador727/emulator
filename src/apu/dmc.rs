@@ -10,8 +10,11 @@
 
 // NTSC rate table: CPU cycles between output unit clocks, indexed by the
 // low nibble of $4010.
-const RATE_TABLE: [u16; 16] = [
+const NTSC_RATE_TABLE: [u16; 16] = [
     428, 380, 340, 320, 286, 254, 226, 214, 190, 160, 142, 128, 106, 84, 72, 54,
+];
+const PAL_RATE_TABLE: [u16; 16] = [
+    398, 354, 316, 298, 276, 236, 210, 198, 176, 148, 132, 118, 98, 78, 66, 50,
 ];
 
 /// Why the memory reader is asking the DMA unit for a byte.
@@ -27,6 +30,7 @@ pub(crate) enum DmcDmaRequestKind {
 
 #[derive(Clone)]
 pub struct Dmc {
+    rate_table: &'static [u16; 16],
     irq_enabled: bool,
     loop_flag: bool,
     timer_period: u16,
@@ -52,10 +56,20 @@ pub struct Dmc {
 
 impl Dmc {
     pub fn new() -> Self {
+        Self::new_with_region(crate::region::Region::Ntsc)
+    }
+
+    pub fn new_with_region(region: crate::region::Region) -> Self {
+        let rate_table = if region == crate::region::Region::Pal {
+            &PAL_RATE_TABLE
+        } else {
+            &NTSC_RATE_TABLE
+        };
         Dmc {
+            rate_table,
             irq_enabled: false,
             loop_flag: false,
-            timer_period: RATE_TABLE[0],
+            timer_period: rate_table[0],
             timer: 0,
             output_level: 0,
             sample_address: 0xc000,
@@ -79,7 +93,7 @@ impl Dmc {
             self.irq_flag = false;
         }
         self.loop_flag = data & 0x40 != 0;
-        self.timer_period = RATE_TABLE[(data & 0x0f) as usize];
+        self.timer_period = self.rate_table[(data & 0x0f) as usize];
     }
 
     // $4011: -DDD DDDD direct load of the output level.
@@ -415,5 +429,12 @@ mod test {
             d.clock_output_unit();
         }
         assert_eq!(d.output(), level);
+    }
+
+    #[test]
+    fn pal_uses_the_pal_rate_table() {
+        let mut d = Dmc::new_with_region(crate::region::Region::Pal);
+        d.write_control(0x0f);
+        assert_eq!(d.timer_period, 50);
     }
 }

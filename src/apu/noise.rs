@@ -8,8 +8,11 @@ use crate::apu::envelope::Envelope;
 use crate::apu::length_counter::LengthCounter;
 
 // NTSC timer periods, in CPU cycles, indexed by the low nibble of $400E.
-const PERIOD_TABLE: [u16; 16] = [
+const NTSC_PERIOD_TABLE: [u16; 16] = [
     4, 8, 16, 32, 64, 96, 128, 160, 202, 254, 380, 508, 762, 1016, 2034, 4068,
+];
+const PAL_PERIOD_TABLE: [u16; 16] = [
+    4, 8, 14, 30, 60, 88, 118, 148, 188, 236, 354, 472, 708, 944, 1890, 3778,
 ];
 
 #[derive(Clone)]
@@ -21,17 +24,28 @@ pub struct Noise {
     timer_period: u16,
     timer: u16,
     shift: u16, // 15-bit LFSR, loaded with 1 on power-up
+    period_table: &'static [u16; 16],
 }
 
 impl Noise {
     pub fn new() -> Self {
+        Self::new_with_region(crate::region::Region::Ntsc)
+    }
+
+    pub fn new_with_region(region: crate::region::Region) -> Self {
+        let period_table = if region == crate::region::Region::Pal {
+            &PAL_PERIOD_TABLE
+        } else {
+            &NTSC_PERIOD_TABLE
+        };
         Noise {
             envelope: Envelope::new(),
             length: LengthCounter::new(),
             mode: false,
-            timer_period: PERIOD_TABLE[0],
+            timer_period: period_table[0],
             timer: 0,
             shift: 1,
+            period_table,
         }
     }
 
@@ -44,7 +58,7 @@ impl Noise {
     // $400E: M--- PPPP
     pub fn write_mode_period(&mut self, data: u8) {
         self.mode = data & 0x80 != 0;
-        self.timer_period = PERIOD_TABLE[(data & 0x0f) as usize];
+        self.timer_period = self.period_table[(data & 0x0f) as usize];
     }
 
     // $400F: LLLL L--- - also restarts the envelope
@@ -150,5 +164,12 @@ mod test {
         assert_eq!(n.output(), 15);
         n.length.set_enabled(false);
         assert_eq!(n.output(), 0);
+    }
+
+    #[test]
+    fn pal_uses_the_pal_period_table() {
+        let mut n = Noise::new_with_region(crate::region::Region::Pal);
+        n.write_mode_period(0x0f);
+        assert_eq!(n.timer_period, 3778);
     }
 }

@@ -1,5 +1,6 @@
 use crate::cartridge::Mirroring;
 use crate::mapper::SharedMapper;
+use crate::region::Region;
 use crate::render::{frame::Frame, palette::SYSTEM_PALLETE};
 use registers::control::ControlRegister;
 use registers::loopy::LoopyRegister;
@@ -43,8 +44,11 @@ struct SpriteUnit {
 pub struct NesPPU {
     pub mapper: SharedMapper,
     pub palette_table: [u8; 32],
-    pub vram: [u8; 2048],
+    // Four-screen cartridges provide an additional 2 KiB of nametable RAM.
+    // Two-screen modes simply address the lower half.
+    pub vram: [u8; 4096],
     pub oam_data: [u8; 256],
+    region: Region,
 
     loopy: LoopyRegister,
     pub ctrl: ControlRegister,
@@ -113,9 +117,14 @@ pub struct NesPPU {
 
 impl NesPPU {
     pub fn new(mapper: SharedMapper) -> Self {
+        Self::new_with_region(mapper, Region::Ntsc)
+    }
+
+    pub fn new_with_region(mapper: SharedMapper, region: Region) -> Self {
         NesPPU {
             mapper: mapper,
-            vram: [0; 2048],
+            region,
+            vram: [0; 4096],
             oam_data: [0; 64 * 4],
             // Power-on palette RAM as NES black ($0F) rather than $00 (a visible
             // gray). Games that only initialize the background palettes leave the
@@ -167,10 +176,32 @@ impl NesPPU {
         }
     }
 
+    fn pre_render_scanline(&self) -> u16 {
+        self.region.scanlines() - 1
+    }
+
     // The finished frame, ready to present. Valid to read at vblank, once every
     // visible line has been composited during this frame's ticks.
     pub fn frame(&self) -> &Frame {
         &self.frame
+    }
+
+    /// Apply console reset while preserving external PPU memories and the
+    /// current VRAM/OAM address state that hardware does not power-cycle.
+    pub fn reset(&mut self) {
+        self.ctrl = ControlRegister::new();
+        self.mask = MaskRegister::new();
+        self.rendering_enabled = false;
+        self.pending_rendering_enabled = false;
+        self.rendering_change_at = None;
+        self.loopy.reset_latch();
+        self.internal_data_buf = 0;
+        self.last_data_read_at = None;
+        self.suppress_vblank = false;
+        self.nmi_interrupt = None;
+        self.nmi_interrupt_at = 0;
+        self.odd_frame = false;
+        self.odd_skip_armed = false;
     }
 
     /// Consume the host presentation event raised at the start of vblank.
@@ -242,6 +273,11 @@ impl NesPPU {
         frame_complete
     }
 
+    #[cfg(test)]
+    pub(crate) fn total_dot_count(&self) -> u64 {
+        self.total_dots
+    }
+
     fn rendering_enabled(&self) -> bool {
         self.rendering_enabled
     }
@@ -261,24 +297,27 @@ impl NesPPU {
     }
 
     fn rendering_in_progress(&self) -> bool {
-        (self.scanline < 240 || self.scanline == 261) && self.rendering_enabled()
+        (self.scanline < 240 || self.scanline == self.pre_render_scanline())
+            && self.rendering_enabled()
     }
 
     // Advance one PPU dot. Rendering, fetches, scrolling and mapper-visible
     // address-bus activity all originate from this timeline.
     fn clock_dot(&mut self) -> bool {
         self.apply_pending_rendering_state();
-        let render_line = self.scanline < 240 || self.scanline == 261;
-        if self.scanline == 261 && self.dot == 0 {
+        let pre_render = self.pre_render_scanline();
+        let render_line = self.scanline < 240 || self.scanline == pre_render;
+        if self.scanline == pre_render && self.dot == 0 {
             self.odd_skip_armed = false;
-        } else if self.scanline == 261 && self.dot == 337 {
+        } else if self.scanline == pre_render && self.dot == 337 {
             // PPUMASK is sampled before the skipped-clock point. A rendering
             // enable that lands after this dot is too late to shorten the
             // current odd frame.
             // This model decides the later dot-339 skip here at dot 337. Use
             // the directly written PPUMASK request: by the actual skip point,
             // its internal rendering signal has crossed the transition delay.
-            self.odd_skip_armed = self.odd_frame && self.rendering_requested();
+            self.odd_skip_armed =
+                self.region.has_odd_frame_skip() && self.odd_frame && self.rendering_requested();
         }
         if render_line && self.rendering_enabled() {
             if (1..=256).contains(&self.dot) || (321..=336).contains(&self.dot) {
@@ -314,7 +353,7 @@ impl NesPPU {
             if self.dot == 257 {
                 self.loopy.copy_horizontal();
             }
-            if self.scanline == 261 && (280..=304).contains(&self.dot) {
+            if self.scanline == pre_render && (280..=304).contains(&self.dot) {
                 self.loopy.copy_vertical();
             }
         }
@@ -327,7 +366,7 @@ impl NesPPU {
             self.render_pixel();
         }
 
-        if self.scanline == 241 && self.dot == 0 {
+        if self.scanline == self.region.vblank_start_scanline() && self.dot == 0 {
             // All 240 visible lines are complete. Notify the host separately
             // from NMI generation so presentation and input sampling occur at
             // the real vblank boundary even when NMI is disabled.
@@ -340,7 +379,7 @@ impl NesPPU {
                 }
             }
             self.suppress_vblank = false;
-        } else if self.scanline == 261 {
+        } else if self.scanline == pre_render {
             if self.dot == 0 {
                 self.status.reset_vblank_status();
                 self.status.set_sprite_zero_hit(false);
@@ -352,15 +391,15 @@ impl NesPPU {
         // the skip at dot 339, but always let dot 340 end the line if rendering
         // was enabled too late; deriving a mutable `last_dot` could otherwise
         // strand the raster beyond dot 340 when PPUMASK changes at the edge.
-        let frame_end =
-            self.dot == 340 || (self.scanline == 261 && self.dot == 339 && self.odd_skip_armed);
+        let frame_end = self.dot == 340
+            || (self.scanline == pre_render && self.dot == 339 && self.odd_skip_armed);
         let frame_complete = if frame_end {
             if render_line && self.rendering_enabled() {
                 self.current_sprites = self.next_sprites;
                 self.next_sprites = [SpriteUnit::default(); 8];
             }
             self.dot = 0;
-            if self.scanline == 261 {
+            if self.scanline == pre_render {
                 self.scanline = 0;
                 self.odd_frame = !self.odd_frame;
                 true
@@ -387,9 +426,17 @@ impl NesPPU {
                 self.bg_pattern_lo = (self.bg_pattern_lo & 0xff00) | self.next_tile_lo as u16;
                 self.bg_pattern_hi = (self.bg_pattern_hi & 0xff00) | self.next_tile_hi as u16;
                 self.bg_attr_lo = (self.bg_attr_lo & 0xff00)
-                    | if self.next_tile_attr & 1 != 0 { 0xff } else { 0 };
+                    | if self.next_tile_attr & 1 != 0 {
+                        0xff
+                    } else {
+                        0
+                    };
                 self.bg_attr_hi = (self.bg_attr_hi & 0xff00)
-                    | if self.next_tile_attr & 2 != 0 { 0xff } else { 0 };
+                    | if self.next_tile_attr & 2 != 0 {
+                        0xff
+                    } else {
+                        0
+                    };
                 let addr = 0x2000 | (self.loopy.current() & 0x0fff);
                 self.next_tile_id = self.ppu_bus_read(addr);
             }
@@ -402,17 +449,13 @@ impl NesPPU {
             }
             4 => {
                 let fine_y = (self.loopy.current() >> 12) & 7;
-                let addr = self.ctrl.bknd_pattern_addr()
-                    + self.next_tile_id as u16 * 16
-                    + fine_y;
+                let addr = self.ctrl.bknd_pattern_addr() + self.next_tile_id as u16 * 16 + fine_y;
                 self.next_tile_lo = self.ppu_bus_read(addr);
             }
             6 => {
                 let fine_y = (self.loopy.current() >> 12) & 7;
-                let addr = self.ctrl.bknd_pattern_addr()
-                    + self.next_tile_id as u16 * 16
-                    + fine_y
-                    + 8;
+                let addr =
+                    self.ctrl.bknd_pattern_addr() + self.next_tile_id as u16 * 16 + fine_y + 8;
                 self.next_tile_hi = self.ppu_bus_read(addr);
             }
             7 => self.loopy.increment_x(),
@@ -421,7 +464,11 @@ impl NesPPU {
     }
 
     fn target_sprite_scanline(&self) -> usize {
-        if self.scanline == 261 { 0 } else { self.scanline as usize + 1 }
+        if self.scanline == self.pre_render_scanline() {
+            0
+        } else {
+            self.scanline as usize + 1
+        }
     }
 
     fn clock_secondary_oam_clear(&mut self) {
@@ -453,8 +500,7 @@ impl NesPPU {
 
         // Odd dots read primary OAM; even dots run the evaluation/write half.
         if self.dot & 1 != 0 {
-            self.sprite_eval_latch =
-                self.oam_data[self.sprite_eval_n * 4 + self.sprite_eval_m];
+            self.sprite_eval_latch = self.oam_data[self.sprite_eval_n * 4 + self.sprite_eval_m];
             self.oam_data_bus = self.sprite_eval_latch;
             return;
         }
@@ -694,7 +740,9 @@ impl NesPPU {
 
     fn ppu_bus_read(&mut self, addr: u16) -> u8 {
         let addr = addr & 0x3fff;
-        self.mapper.borrow_mut().on_ppu_bus_access(addr, self.total_dots);
+        self.mapper
+            .borrow_mut()
+            .on_ppu_bus_access(addr, self.total_dots);
         match addr {
             0x0000..=0x1fff => self.mapper.borrow_mut().ppu_read(addr),
             0x2000..=0x3eff => self.vram[self.mirror_vram_addr(addr) as usize],
@@ -705,7 +753,9 @@ impl NesPPU {
 
     fn ppu_bus_write(&mut self, addr: u16, value: u8) {
         let addr = addr & 0x3fff;
-        self.mapper.borrow_mut().on_ppu_bus_access(addr, self.total_dots);
+        self.mapper
+            .borrow_mut()
+            .on_ppu_bus_access(addr, self.total_dots);
         match addr {
             0x0000..=0x1fff => self.mapper.borrow_mut().ppu_write(addr, value),
             0x2000..=0x3eff => {
@@ -732,7 +782,10 @@ impl NesPPU {
 
     #[cfg(test)]
     pub fn new_empty_rom() -> Self {
-        NesPPU::new(crate::mapper::test_nrom(vec![0; 0x2000], Mirroring::Horizontal))
+        NesPPU::new(crate::mapper::test_nrom(
+            vec![0; 0x2000],
+            Mirroring::Horizontal,
+        ))
     }
 
     pub fn write_to_ppu_addr(&mut self, value: u8) {
@@ -755,7 +808,7 @@ impl NesPPU {
             && self.status.is_in_vblank()
             // In this dot-at-a-time representation, state dot 0 is the
             // boundary where pre-render clearing is visible to a CPU write.
-            && !(self.scanline == 261 && self.dot == 0)
+            && !(self.scanline == self.pre_render_scanline() && self.dot == 0)
         {
             self.nmi_interrupt = Some(1);
             self.nmi_interrupt_at = self.total_dots.wrapping_add(6);
@@ -794,7 +847,7 @@ impl NesPPU {
         let data = self.io_data_bus;
         // A read immediately before vblank suppresses that frame's vblank flag
         // and NMI. A read on dot 1 clears the just-set flag/NMI below.
-        if self.scanline == 241 && self.dot == 0 {
+        if self.scanline == self.region.vblank_start_scanline() && self.dot == 0 {
             self.suppress_vblank = true;
         }
         self.status.reset_vblank_status();
@@ -1073,7 +1126,10 @@ pub mod test {
             prg_rom: vec![0; 0x8000],
             chr_rom: vec![0; 0x2000],
             mapper: 4,
+            metadata: crate::cartridge::CartridgeMetadata::test_defaults(),
             screen_mirroring: Mirroring::Vertical,
+            memory: crate::cartridge::CartridgeMemory::test_defaults(0x8000, 0x2000),
+            save_path: None,
         });
         (NesPPU::new(mapper.clone()), mapper)
     }
@@ -1611,7 +1667,10 @@ pub mod test {
         ppu.tick(2); // scanline zero dots 0 and 1
 
         let expected = SYSTEM_PALLETE[0x30];
-        assert_eq!(&ppu.frame().data[0..3], &[expected.0, expected.1, expected.2]);
+        assert_eq!(
+            &ppu.frame().data[0..3],
+            &[expected.0, expected.1, expected.2]
+        );
     }
 
     #[test]
@@ -1619,8 +1678,12 @@ pub mod test {
         let mut ppu = NesPPU::new_empty_rom();
         ppu.write_to_mask(0x10);
         for sprite in 0..9 {
-            ppu.oam_data[sprite * 4..sprite * 4 + 4]
-                .copy_from_slice(&[0, 1, 0, (sprite * 8) as u8]);
+            ppu.oam_data[sprite * 4..sprite * 4 + 4].copy_from_slice(&[
+                0,
+                1,
+                0,
+                (sprite * 8) as u8,
+            ]);
         }
         ppu.dot = 65;
         ppu.tick(192);
@@ -2064,7 +2127,10 @@ pub mod test {
     //   [0x2800 a ] [0x2C00 b ]
     #[test]
     fn test_vram_vertical_mirror() {
-        let mut ppu = NesPPU::new(crate::mapper::test_nrom(vec![0; 0x2000], Mirroring::Vertical));
+        let mut ppu = NesPPU::new(crate::mapper::test_nrom(
+            vec![0; 0x2000],
+            Mirroring::Vertical,
+        ));
 
         ppu.write_to_ppu_addr(0x20);
         ppu.write_to_ppu_addr(0x05);
@@ -2087,6 +2153,23 @@ pub mod test {
 
         ppu.read_data(); //load into buffer
         assert_eq!(ppu.read_data(), 0x77); //read from B
+    }
+
+    #[test]
+    fn four_screen_vram_keeps_all_nametables_independent() {
+        let mut ppu = NesPPU::new(crate::mapper::test_nrom(
+            vec![0; 0x2000],
+            Mirroring::FourScreen,
+        ));
+        for (table, value) in [0x20u8, 0x24, 0x28, 0x2c].into_iter().zip(1u8..) {
+            ppu.write_to_ppu_addr(table);
+            ppu.write_to_ppu_addr(0x05);
+            ppu.write_to_data(value);
+        }
+        assert_eq!(ppu.vram[0x005], 1);
+        assert_eq!(ppu.vram[0x405], 2);
+        assert_eq!(ppu.vram[0x805], 3);
+        assert_eq!(ppu.vram[0xc05], 4);
     }
 
     #[test]
@@ -2181,5 +2264,30 @@ pub mod test {
         assert!(ppu.oam_data.iter().all(|&value| value == 0x55));
         assert_eq!(ppu.oam_addr, 0x10);
         assert_eq!(ppu.read_io_data_bus(), 0xaa);
+    }
+
+    #[test]
+    fn pal_uses_scanline_311_as_pre_render_without_an_odd_dot_skip() {
+        let mapper = crate::mapper::test_nrom(vec![0; 0x2000], Mirroring::Vertical);
+        let mut ppu = NesPPU::new_with_region(mapper, Region::Pal);
+        ppu.scanline = 311;
+        ppu.dot = 339;
+        ppu.odd_frame = true;
+        force_mask(&mut ppu, 0x18);
+        assert!(!ppu.tick(1));
+        assert_eq!(ppu.dot, 340);
+        assert!(ppu.tick(1));
+        assert_eq!((ppu.scanline, ppu.dot), (0, 0));
+    }
+
+    #[test]
+    fn dendy_starts_vblank_on_scanline_291() {
+        let mapper = crate::mapper::test_nrom(vec![0; 0x2000], Mirroring::Vertical);
+        let mut ppu = NesPPU::new_with_region(mapper, Region::Dendy);
+        ppu.scanline = 291;
+        ppu.dot = 0;
+        ppu.tick(1);
+        assert!(ppu.status.is_in_vblank());
+        assert!(ppu.take_frame_ready());
     }
 }

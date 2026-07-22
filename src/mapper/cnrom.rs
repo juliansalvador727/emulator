@@ -9,6 +9,7 @@ pub struct Cnrom {
     prg_rom: Vec<u8>,
     chr: Vec<u8>,
     chr_is_ram: bool,
+    prg_ram: Vec<u8>,
     chr_bank: usize,
     num_chr_banks: usize,
     mirroring: Mirroring,
@@ -17,12 +18,13 @@ pub struct Cnrom {
 impl Cnrom {
     pub fn from_rom(rom: Rom) -> Self {
         let chr_is_ram = rom.chr_rom.is_empty();
-        let chr = if chr_is_ram { vec![0; 0x2000] } else { rom.chr_rom };
+        let chr = if chr_is_ram { vec![0; rom.memory.chr_ram_size()] } else { rom.chr_rom };
         let num_chr_banks = (chr.len() / 0x2000).max(1);
         Cnrom {
             prg_rom: rom.prg_rom,
             chr,
             chr_is_ram,
+            prg_ram: vec![0; rom.memory.prg_ram_size()],
             chr_bank: 0,
             num_chr_banks,
             mirroring: rom.screen_mirroring,
@@ -33,6 +35,7 @@ impl Cnrom {
 impl Mapper for Cnrom {
     fn cpu_read(&mut self, addr: u16) -> u8 {
         match addr {
+            0x6000..=0x7fff => self.prg_ram.get((addr - 0x6000) as usize).copied().unwrap_or(0),
             0x8000..=0xffff => {
                 let mut index = addr - 0x8000;
                 // Mirror a 16 KB image across both banks.
@@ -46,6 +49,10 @@ impl Mapper for Cnrom {
     }
 
     fn cpu_write(&mut self, addr: u16, data: u8) {
+        if let 0x6000..=0x7fff = addr {
+            if let Some(byte) = self.prg_ram.get_mut((addr - 0x6000) as usize) { *byte = data; }
+            return;
+        }
         // The written value selects the 8 KB CHR bank (bus conflicts ignored).
         if addr >= 0x8000 {
             self.chr_bank = (data as usize) % self.num_chr_banks;
@@ -65,6 +72,11 @@ impl Mapper for Cnrom {
     fn mirroring(&self) -> Mirroring {
         self.mirroring
     }
+    fn reset(&mut self) { self.chr_bank = 0; }
+    fn prg_ram(&self) -> Option<&[u8]> { (!self.prg_ram.is_empty()).then_some(&self.prg_ram) }
+    fn prg_ram_mut(&mut self) -> Option<&mut [u8]> { (!self.prg_ram.is_empty()).then_some(&mut self.prg_ram) }
+    fn chr_ram(&self) -> Option<&[u8]> { self.chr_is_ram.then_some(&self.chr) }
+    fn chr_ram_mut(&mut self) -> Option<&mut [u8]> { self.chr_is_ram.then_some(&mut self.chr) }
 }
 
 #[cfg(test)]
@@ -78,9 +90,12 @@ mod test {
             chr_rom.extend(std::iter::repeat(b as u8).take(0x2000));
         }
         Rom {
+            memory: crate::cartridge::CartridgeMemory::test_defaults(0x8000, chr_rom.len()),
+            save_path: None,
             prg_rom: vec![0; 0x8000],
             chr_rom,
             mapper: 3,
+            metadata: crate::cartridge::CartridgeMetadata::test_defaults(),
             screen_mirroring: Mirroring::Horizontal,
         }
     }
@@ -106,5 +121,13 @@ mod test {
         let mut m = Cnrom::from_rom(rom(2));
         m.ppu_write(0x0000, 0xff);
         assert_eq!(m.ppu_read(0x0000), 0);
+    }
+
+    #[test]
+    fn reset_restores_chr_bank_zero() {
+        let mut m = Cnrom::from_rom(rom(2));
+        m.cpu_write(0x8000, 1);
+        m.reset();
+        assert_eq!(m.ppu_read(0), 0);
     }
 }

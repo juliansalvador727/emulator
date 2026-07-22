@@ -15,9 +15,8 @@ use crate::cartridge::{Mirroring, Rom};
 //   $C000-$DFFF CHR bank 1
 //   $E000-$FFFF PRG bank
 //
-// This implements the common SxROM behaviour; the 512 KB SUROM high-PRG-bit
-// trick is not modelled (none of the usual MMC1 games need it). Optional 8 KB
-// PRG-RAM lives at $6000-$7FFF. CHR is 4 KB-banked ROM, or a flat 8 KB of
+// This implements the common SxROM behaviour, including the SUROM/SXROM high
+// PRG address bit and SOROM/SXROM PRG-RAM banking. CHR is 4 KB-banked ROM, or a flat 8 KB of
 // CHR-RAM when the cartridge ships no CHR (the bank registers then don't matter
 // since the RAM is only 8 KB).
 #[derive(Clone)]
@@ -25,13 +24,14 @@ pub struct Mmc1 {
     prg_rom: Vec<u8>,
     chr: Vec<u8>,
     chr_is_ram: bool,
-    prg_ram: [u8; 0x2000],
+    prg_ram: Vec<u8>,
 
     shift: u8,     // serial load register; sentinel bit marks the 5th write
     control: u8,   // mirroring (0-1), PRG mode (2-3), CHR mode (4)
     chr_bank0: u8, // 4 KB CHR bank at $0000 (low bit ignored in 8 KB mode)
     chr_bank1: u8, // 4 KB CHR bank at $1000 (used only in 4 KB mode)
-    prg_bank: u8,  // 16 KB PRG bank
+    prg_bank: u8,  // low 4 bits: PRG bank; bit 4: PRG-RAM disable
+    last_serial_write_cycle: Option<u64>,
 
     num_prg_banks: usize, // in 16 KB units
     num_chr_banks: usize, // in 4 KB units
@@ -44,14 +44,14 @@ const SHIFT_RESET: u8 = 0x10;
 impl Mmc1 {
     pub fn from_rom(rom: Rom) -> Self {
         let chr_is_ram = rom.chr_rom.is_empty();
-        let chr = if chr_is_ram { vec![0; 0x2000] } else { rom.chr_rom };
+        let chr = if chr_is_ram { vec![0; rom.memory.chr_ram_size()] } else { rom.chr_rom };
         let num_prg_banks = (rom.prg_rom.len() / 0x4000).max(1);
         let num_chr_banks = (chr.len() / 0x1000).max(1);
         Mmc1 {
             prg_rom: rom.prg_rom,
             chr,
             chr_is_ram,
-            prg_ram: [0; 0x2000],
+            prg_ram: vec![0; rom.memory.prg_ram_size()],
             shift: SHIFT_RESET,
             // Power-on state: PRG mode 3 (fixed last bank at $C000, the mode the
             // reset vector relies on). Other bits default to 0.
@@ -59,6 +59,7 @@ impl Mmc1 {
             chr_bank0: 0,
             chr_bank1: 0,
             prg_bank: 0,
+            last_serial_write_cycle: None,
             num_prg_banks,
             num_chr_banks,
         }
@@ -75,20 +76,30 @@ impl Mmc1 {
     // Byte offset into prg_rom for the $8000 half (upper=false) or $C000 half
     // (upper=true) of the window, per the current PRG bank mode.
     fn prg_base(&self, upper: bool) -> usize {
-        let last = self.num_prg_banks - 1;
+        // SUROM/SXROM connect CHR A16 (CHR bank 0 bit 4) to PRG A18,
+        // selecting one of two 256 KiB regions. Fixed banks are fixed within
+        // that selected region rather than across the whole 512 KiB image.
+        let outer = if self.num_prg_banks > 16 {
+            ((self.chr_bank0 as usize >> 4) & 1) * 16
+        } else {
+            0
+        };
+        let region_banks = (self.num_prg_banks - outer).min(16);
+        let last = outer + region_banks.saturating_sub(1);
+        let selected = outer + (self.prg_bank as usize & 0x0f);
         let bank = match self.prg_mode() {
             // 0/1: switch a full 32 KB bank at $8000 (low bit of the reg ignored).
             0 | 1 => {
-                let base = (self.prg_bank & !1) as usize;
+                let base = outer + (self.prg_bank as usize & 0x0e);
                 if upper { base + 1 } else { base }
             }
             // 2: fix the first bank at $8000, switch 16 KB at $C000.
             2 => {
-                if upper { self.prg_bank as usize } else { 0 }
+                if upper { selected } else { outer }
             }
             // 3: switch 16 KB at $8000, fix the last bank at $C000.
             3 => {
-                if upper { last } else { self.prg_bank as usize }
+                if upper { last } else { selected }
             }
             _ => unreachable!(),
         };
@@ -115,9 +126,33 @@ impl Mmc1 {
             0 => self.control = value & 0x1f,
             1 => self.chr_bank0 = value & 0x1f,
             2 => self.chr_bank1 = value & 0x1f,
-            // Bit 4 is PRG-RAM enable, which we don't model; keep the bank bits.
-            3 => self.prg_bank = value & 0x0f,
+            3 => self.prg_bank = value & 0x1f,
             _ => unreachable!(),
+        }
+    }
+
+    fn prg_ram_enabled(&self) -> bool { self.prg_bank & 0x10 == 0 }
+
+    fn prg_ram_offset(&self, addr: u16) -> Option<usize> {
+        if !self.prg_ram_enabled() || self.prg_ram.is_empty() { return None; }
+        let banks = self.prg_ram.len().div_ceil(0x2000);
+        let bank = ((self.chr_bank0 as usize >> 2) & 3) % banks;
+        let offset = bank * 0x2000 + (addr - 0x6000) as usize;
+        (offset < self.prg_ram.len()).then_some(offset)
+    }
+
+    fn write_serial(&mut self, addr: u16, data: u8) {
+        if data & 0x80 != 0 {
+            self.shift = SHIFT_RESET;
+            self.control |= 0x0c;
+        } else {
+            let complete = self.shift & 1 == 1;
+            self.shift = (self.shift >> 1) | ((data & 1) << 4);
+            if complete {
+                let value = self.shift & 0x1f;
+                self.write_register(addr, value);
+                self.shift = SHIFT_RESET;
+            }
         }
     }
 }
@@ -125,7 +160,7 @@ impl Mmc1 {
 impl Mapper for Mmc1 {
     fn cpu_read(&mut self, addr: u16) -> u8 {
         match addr {
-            0x6000..=0x7fff => self.prg_ram[(addr - 0x6000) as usize],
+            0x6000..=0x7fff => self.prg_ram_offset(addr).map(|i| self.prg_ram[i]).unwrap_or(0),
             0x8000..=0xffff => {
                 let upper = addr >= 0xc000;
                 self.prg_rom[self.prg_base(upper) + (addr as usize & 0x3fff)]
@@ -136,23 +171,23 @@ impl Mapper for Mmc1 {
 
     fn cpu_write(&mut self, addr: u16, data: u8) {
         match addr {
-            0x6000..=0x7fff => self.prg_ram[(addr - 0x6000) as usize] = data,
-            0x8000..=0xffff => {
-                if data & 0x80 != 0 {
-                    // Reset: clear the shift register and force PRG mode 3.
-                    self.shift = SHIFT_RESET;
-                    self.control |= 0x0c;
-                } else {
-                    let complete = self.shift & 1 == 1;
-                    self.shift = (self.shift >> 1) | ((data & 1) << 4);
-                    if complete {
-                        let value = self.shift & 0x1f;
-                        self.write_register(addr, value);
-                        self.shift = SHIFT_RESET;
-                    }
-                }
-            }
+            0x6000..=0x7fff => if let Some(i) = self.prg_ram_offset(addr) { self.prg_ram[i] = data; },
+            0x8000..=0xffff => self.write_serial(addr, data),
             _ => {}
+        }
+    }
+
+    fn cpu_write_at(&mut self, addr: u16, data: u8, cpu_cycle: u64) {
+        if addr < 0x8000 {
+            self.cpu_write(addr, data);
+            return;
+        }
+        let adjacent = self.last_serial_write_cycle == Some(cpu_cycle.saturating_sub(1));
+        self.last_serial_write_cycle = Some(cpu_cycle);
+        // Bit-7 reset writes are always honored; only serial data writes are
+        // suppressed on the second cycle of a read-modify-write sequence.
+        if data & 0x80 != 0 || !adjacent {
+            self.write_serial(addr, data);
         }
     }
 
@@ -179,6 +214,17 @@ impl Mapper for Mmc1 {
             _ => unreachable!(),
         }
     }
+
+    fn reset(&mut self) {
+        self.shift = SHIFT_RESET;
+        self.control |= 0x0c;
+        self.last_serial_write_cycle = None;
+    }
+
+    fn prg_ram(&self) -> Option<&[u8]> { (!self.prg_ram.is_empty()).then_some(&self.prg_ram) }
+    fn prg_ram_mut(&mut self) -> Option<&mut [u8]> { (!self.prg_ram.is_empty()).then_some(&mut self.prg_ram) }
+    fn chr_ram(&self) -> Option<&[u8]> { self.chr_is_ram.then_some(&self.chr) }
+    fn chr_ram_mut(&mut self) -> Option<&mut [u8]> { self.chr_is_ram.then_some(&mut self.chr) }
 }
 
 #[cfg(test)]
@@ -197,9 +243,12 @@ mod test {
             chr_rom.extend(std::iter::repeat(b as u8).take(0x1000));
         }
         Rom {
+            memory: crate::cartridge::CartridgeMemory::test_defaults(prg_rom.len(), chr_rom.len()),
+            save_path: None,
             prg_rom,
             chr_rom,
             mapper: 1,
+            metadata: crate::cartridge::CartridgeMetadata::test_defaults(),
             screen_mirroring: Mirroring::Horizontal,
         }
     }
@@ -222,7 +271,7 @@ mod test {
         assert_eq!(m.prg_bank, 0);
         // The fifth write commits the accumulated value.
         m.cpu_write(0xe000, 1);
-        assert_eq!(m.prg_bank, 0b11111 & 0x0f);
+        assert_eq!(m.prg_bank, 0b11111);
     }
 
     #[test]
@@ -299,5 +348,58 @@ mod test {
         assert!(m.chr_is_ram);
         m.ppu_write(0x0123, 0xab);
         assert_eq!(m.ppu_read(0x0123), 0xab);
+    }
+
+    #[test]
+    fn adjacent_serial_data_write_is_ignored_but_reset_is_not() {
+        let mut m = Mmc1::from_rom(rom(8, 2));
+        m.cpu_write_at(0xe000, 1, 10);
+        m.cpu_write_at(0xe000, 0, 11); // ignored RMW second write
+        for cycle in [13, 15, 17, 19] {
+            m.cpu_write_at(0xe000, 1, cycle);
+        }
+        assert_eq!(m.prg_bank, 0x1f);
+
+        load(&mut m, 0x8000, 0); // leave fixed-bank mode
+        m.cpu_write_at(0x8000, 0, 30);
+        m.cpu_write_at(0x8000, 0x80, 31); // adjacent, but reset always wins
+        assert_eq!(m.prg_mode(), 3);
+        assert_eq!(m.shift, SHIFT_RESET);
+    }
+
+    #[test]
+    fn surom_outer_bit_selects_256k_region_and_its_fixed_bank() {
+        let mut m = Mmc1::from_rom(rom(32, 0));
+        load(&mut m, 0xa000, 0x10);
+        load(&mut m, 0xe000, 3);
+        assert_eq!(m.cpu_read(0x8000), 19);
+        assert_eq!(m.cpu_read(0xc000), 31);
+    }
+
+    #[test]
+    fn sxrom_banks_prg_ram_and_prg_register_can_disable_it() {
+        let mut image = rom(32, 0);
+        image.memory.prg_ram.size = 0x8000;
+        let mut m = Mmc1::from_rom(image);
+        m.cpu_write(0x6000, 0x11);
+        load(&mut m, 0xa000, 0x04); // CHR A15/A14 -> PRG-RAM bank 1
+        m.cpu_write(0x6000, 0x22);
+        load(&mut m, 0xa000, 0x00);
+        assert_eq!(m.cpu_read(0x6000), 0x11);
+        load(&mut m, 0xa000, 0x04);
+        assert_eq!(m.cpu_read(0x6000), 0x22);
+        load(&mut m, 0xe000, 0x10);
+        assert_eq!(m.cpu_read(0x6000), 0);
+    }
+
+    #[test]
+    fn reset_restores_serial_and_fixed_bank_mode_but_preserves_ram() {
+        let mut m = Mmc1::from_rom(rom(8, 0));
+        m.cpu_write(0x6000, 0x5a);
+        load(&mut m, 0x8000, 0);
+        m.reset();
+        assert_eq!(m.prg_mode(), 3);
+        assert_eq!(m.shift, SHIFT_RESET);
+        assert_eq!(m.cpu_read(0x6000), 0x5a);
     }
 }

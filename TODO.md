@@ -6,13 +6,34 @@ model, native Windows build). The Rust emulator at the repository root is the
 active project; the older C emulator under `NES/` is retained as a reference
 and has a separate, lower-priority backlog at the end of this file.
 
-Current verified baseline (2026-07-15):
+Current verified baseline (2026-07-16):
 
-- 245 passing Rust tests.
+- 289 passing Rust tests.
 - All 256 6502 opcodes (official and undocumented); `nestest` matches the
   reference for all 8,991 instruction lines. `instr_test-v5` (16/16),
   `instr_timing` (2/2), and `instr_misc` (4/4) pass.
-- NROM, MMC1, UxROM, CNROM, MMC3, AxROM, and GxROM/GNROM.
+- CPU interrupt timing is bus-cycle modeled. All five `cpu_interrupts_v2`
+  singles and the composite pass, including the complete 528-alignment
+  IRQ/DMA table and branch-specific interrupt polling cases.
+- Power-on and front-panel reset are separate operations with a seven-cycle
+  reset-vector sequence. Both `cpu_reset` ROMs and all six `apu_reset` ROMs
+  pass; `apu_reset/4017_timing` reports the expected 10-clock delay.
+- NROM, MMC1, UxROM, CNROM, standard MMC3, AxROM, MMC2/PxROM, and
+  GxROM/GNROM, with explicit reset-state coverage. MMC1 includes SUROM/SXROM
+  banking and consecutive-write suppression; MMC3 includes PRG-RAM
+  protection, six-bit PRG bank registers, and four-screen nametable RAM. MMC2
+  uses post-read FD/FE CHR latches and runs Mike Tyson's Punch-Out!! into a
+  playable bout.
+- Cartridge memory is typed as ROM, volatile RAM, nonvolatile RAM, or absent.
+  Battery-backed PRG/CHR RAM uses atomic `.sav` replacement and supports the
+  configurable `NES_SAVE_DIR` location. NES 2.0 parsing preserves separate
+  volatile/NVRAM sizes, extended mapper/submapper fields, and both ROM-size
+  encodings.
+- NES 2.0 console/timing metadata selects NTSC, PAL, or Dendy CPU/PPU/APU
+  clocks and raster timing; `--region`/`NES_REGION` provides an explicit
+  override. Volatile RAM and NVRAM remain distinct at runtime and in saves.
+- NES 2.0 mapper-4 submappers select Sharp MMC3, MMC6, hard-wired mirroring,
+  MC-ACC falling-edge IRQ, or NEC old-style IRQ behavior.
 - Dot-driven background and sprite rendering with mapper-visible PPU fetches.
 - P1 PPU register and memory behavior complete. OAM DMA is modeled as real
   alternating get/put cycles with OAMADDR wrapping, and DMC DMA arbitrates with
@@ -234,10 +255,14 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
   latches `_delayed` line states), a unified 7-cycle `service_interrupt` for
   BRK/IRQ/NMI with a late (PCL-push) vector decision so a pending NMI hijacks a
   BRK/IRQ vector, RTI's immediate I-flag effect, and the branch-specific poll
-  point (end of cycle 2). All five `cpu_interrupts_v2` ROMs now pass, including
-  `4-irq_and_dma` across its complete 528-alignment IRQ/DMA boundary table and
-  `5-branch_delays_irq` after the exact APU frame-counter IRQ timing work. There
-  are no regressions in nestest, instr_*, ppu_vbl_nmi, or the visual baselines.
+  points (before the offset fetch and, on a page crossing, before the high-byte
+  fixup). All five `cpu_interrupts_v2` ROMs pass, including `4-irq_and_dma`
+  across its complete 528-alignment IRQ/DMA boundary table and
+  `5-branch_delays_irq`. Taken branches now issue their real provisional-address
+  and page-fixup bus reads. The runner also ignores legacy `$00F8` completion
+  while a blargg `$6000` protocol is active, so temporary IRQ wait loops cannot
+  terminate a test early. There are no regressions in nestest, instr_*,
+  ppu_vbl_nmi, or the visual baselines.
   Slice 3 (done, no code needed): all 7 `vbl_nmi_timing` sub-tests
   (`1.frame_basics`..`7.nmi_timing`) now pass with NO compensating PPU offset --
   the per-cycle CPU timing places each register access on its true cycle, and
@@ -248,19 +273,23 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
   halted DMA cycles preserve per-cycle interrupt samples without advancing the
   instruction poll pipeline. The focused unit tests, all three DMC-during-read
   DMA ROMs, both sprite/DMC ROMs, and `4-irq_and_dma` pass.
-- [ ] Implement accurate reset and power-cycle state separately; do not treat
-  application startup, reset, and save-state restore as the same operation.
-  (Still one `reset()`; power-on vs. reset RAM/APU/PPU differences are unmodeled.)
+- [x] Implement accurate reset and power-cycle state separately. `CPU::power_on`
+  establishes A/X/Y/P and runs the real seven-cycle reset-vector bus sequence;
+  `CPU::reset` preserves A/X/Y and RAM, sets I, decrements S three times through
+  read-only stack cycles, and resets the APU/PPU in place. APU reset clears
+  `$4015`/IRQs and reapplies the last `$4017` mode while preserving channel
+  registers; PPU reset preserves external memories and address state while
+  clearing its resettable control/latch state. The headless runner now honors
+  blargg status `$81` at the ROM's reset wait loop. Both `cpu_reset` ROMs and all
+  six `apu_reset` ROMs pass; `4017_timing` measures a 10-clock power/reset delay.
 
 ## P1 — APU correctness
 
 - [x] Validate `$4017` write parity/delay and frame-counter sequencing with APU
   test ROMs. `apu_test` 8/8, `blargg_apu_2005.07.30` 11/11 (includes the `$4017`
-  parity/delay and frame-counter sequencing singles). `cpu_interrupts_v2/
-  5-branch_delays_irq` now passes too, so the frame-counter IRQ timing it was
-  blocked on is good. Remaining `apu_reset` 4017_written/4017_timing failures are
-  power-on frame-counter *phase*, tracked under the reset/power-cycle item, not
-  here.
+  parity/delay and frame-counter sequencing singles). All six `apu_reset` ROMs
+  now pass after the power-on/reset split. `cpu_interrupts_v2/5-branch_delays_irq`
+  also passes with the corrected branch interrupt poll points and bus reads.
 - [x] Validate DMC fetch stalls, IRQ assertion/acknowledgement, address wrapping,
   looping, and DMA arbitration against test ROMs. Fetch stalls and the
   DMA-during-read behavior are done: all three `dmc_dma_during_read4` DMA ROMs
@@ -288,12 +317,21 @@ per-pixel clipping, blanked backdrop output, and dot-windowed vblank/NMI state.
     lead over the other APU units -- swept leads 0/1/2 with **no effect at all**,
     because `sync_dmc.s` re-synchronizes the ROM to the DMC timer and cancels any
     global phase offset. The residual cycle was therefore in the servicing path.
-- [ ] Validate channel mixer levels, nonlinear mixing, filters, sample-rate
+- [x] Validate channel mixer levels, nonlinear mixing, filters, sample-rate
   conversion, and long-run clock drift against known references. `apu_mixer` 4/4
-  (square/triangle/noise/dmc) pass; long-run clock drift still unmeasured.
-- [ ] Add PAL and Dendy APU timing tables when region support is introduced.
-- [ ] Keep probe reporting for queue depth, drops, underflows, device reopens,
-  and sample drift green during timing changes.
+  (square/triangle/noise/dmc) pass; the NESdev nonlinear equations and
+  90/440 Hz high-pass plus 14 kHz low-pass chain are covered by focused tests.
+  CPU-to-host conversion now uses an exact integer rational clock: it emits
+  exactly 48,000 samples per 1,789,773 NTSC CPU cycles and 5,760,000 over two
+  minutes, independent of tick batching. The 7,200-frame NROM/MMC1/MMC3 sweep
+  stays within one sample of its actual emulated-cycle oracle.
+- [x] Add PAL and Dendy APU timing tables when region support is introduced.
+- [x] Keep probe reporting for queue depth, drops, underflows, device reopens,
+  and sample drift green during timing changes. `PROBE_MAX_SAMPLE_DRIFT` makes
+  drift an enforceable threshold; realtime runs can additionally set
+  `PROBE_REQUIRE_HEALTHY_AUDIO=1` to require a bounded available queue and zero
+  drops, underflows, or reopens. `probes/run_audio_validation.sh` checks all
+  three reviewed mapper cases for 7,200 frames by default.
 
 ## P1 — Low-latency host presentation, input, and audio
 
@@ -377,33 +415,50 @@ audio never reaches SDL.
 
 ## P1 — Harden existing mappers and cartridge memory
 
-- [ ] MMC3:
+- [x] Standard MMC3/iNES mapper 4:
   - [x] implement `$A001` PRG-RAM enable and write protection;
-  - finish four-screen nametable storage/behavior;
-  - support relevant board/revision differences after NES 2.0 submappers exist.
-- [ ] MMC1:
-  - ignore consecutive serial writes on adjacent CPU cycles;
-  - support SUROM/SXROM large-PRG banking when a target ROM requires it;
-  - model PRG-RAM enable/banking for the relevant boards.
-- [ ] Implement battery-backed PRG/CHR RAM persistence with atomic writes and a
+  - [x] mask R6/R7 to the MMC3's six PRG bank bits and cover mode/mirroring
+    edge cases;
+  - [x] finish four-screen nametable storage/behavior.
+- [x] MMC1:
+  - [x] ignore consecutive serial-data writes on adjacent CPU cycles without
+    suppressing bit-7 reset writes;
+  - [x] support SUROM/SXROM 512 KiB PRG banking;
+  - [x] model PRG-RAM enable and SOROM/SXROM banking.
+- [x] Implement battery-backed PRG/CHR RAM persistence with atomic writes and a
   configurable save directory.
-- [ ] Distinguish volatile RAM, nonvolatile RAM, ROM, and absent memory from
+- [x] Distinguish volatile RAM, nonvolatile RAM, ROM, and absent memory from
   cartridge metadata rather than assuming one 8 KiB PRG-RAM block.
-- [ ] Add focused unit tests and at least one legal ROM/test-ROM validation case
-  for every mapper behavior change.
+- [x] Add focused mapper reset-state, memory-type, PRG/CHR persistence, MMC1,
+  and MMC3 edge-case unit tests.
+- [x] Add source-available test-ROM validation for the mapper behavior changes.
+  The pinned mapper manifest passes both CPU dummy-write ROMs, MMC3 IRQ tests
+  1-4 plus revision B, and the repository-authored MMC1 fixture covering
+  SUROM's 512 KiB outer PRG bit, all four SXROM PRG-RAM banks, RAM disable, and
+  mapper state across a harness-triggered front-panel reset.
 
 ## P1 — Cartridge formats and region metadata
 
-- [ ] Parse NES 2.0 headers, mapper extensions, submappers, exponent/multiplier
-  ROM sizes, PRG/CHR RAM and NVRAM sizes, console type, and region timing.
-- [ ] Improve iNES validation for malformed/truncated files and ambiguous
-  archaic headers while retaining trainer support.
-- [ ] Use battery and RAM metadata to configure mapper memory and persistence.
-- [ ] Select NTSC/PAL/Dendy timing from metadata with an explicit user override.
-- [ ] Add parser fixtures for valid and invalid iNES/NES 2.0 combinations.
+- [x] Parse NES 2.0 identification, 12-bit mapper IDs, submappers, linear and
+  exponent/multiplier PRG/CHR ROM sizes, and separate PRG/CHR RAM/NVRAM sizes.
+- [x] Parse the remaining NES 2.0 console type and region timing metadata.
+- [x] Use NES 2.0 submappers to select MMC3 board/revision differences instead
+  of applying them to standard iNES mapper 4.
+- [x] Reject short headers, invalid format markers, truncated trainer/ROM
+  payloads, and host-size arithmetic overflow while retaining trainer support.
+- [ ] Decide compatibility policy for ambiguous archaic/dirty iNES headers.
+- [x] Use iNES battery and RAM metadata to configure mapper memory and
+  persistence; preserve split RAM/NVRAM sizes when parsing NES 2.0.
+- [x] Teach mapper memory and persistence to expose simultaneous NES 2.0
+  volatile RAM and NVRAM as distinct runtime regions.
+- [x] Select NTSC/PAL/Dendy timing from metadata with an explicit user override.
+- [x] Add parser fixtures for valid and invalid iNES/NES 2.0 combinations.
 
 ## P2 — Mapper and game-library expansion
 
+- [x] Add mapper 9 (MMC2/PxROM) for Mike Tyson's Punch-Out!!: one switchable
+  and three fixed PRG banks, paired 4 KiB FD/FE CHR banks with post-read latch
+  changes, runtime mirroring, bank wrapping, and front-reset coverage.
 - [ ] Choose new mappers from a documented target game library rather than
   numerical order. Record the motivating ROM/test ROM and expected behavior.
 - [ ] Highest-value current candidates:
@@ -419,14 +474,13 @@ audio never reaches SDL.
 
 ## P2 — Regions, input, and emulator features
 
-- [ ] Add PAL and Dendy CPU/PPU/APU timing and runtime region selection.
+- [x] Add PAL and Dendy CPU/PPU/APU timing and runtime region selection.
 - [ ] Add a second standard controller at `$4017`.
 - [ ] Add peripherals only for a target title: Zapper, Four Score, and other
   expansion devices.
 - [ ] Add versioned save states only after reset semantics and mapper state are
   explicit; include CPU, PPU pipeline, APU, DMA, controllers, RAM, mapper, and
   timing phase.
-- [ ] Add configurable battery-save locations and clear error reporting.
 - [ ] Consider NSF/NSFe playback and Game Genie only if they become product
   goals; neither should block core console accuracy.
 
@@ -436,6 +490,7 @@ audio never reaches SDL.
   result, emulator revision, and relevant region/configuration.
 - [ ] Expand ROM-level visual baselines when a new mapper or timing-sensitive
   behavior is added; keep copyrighted ROMs out of git when licensing requires.
+  Mapper 9 now has reviewed opponent-card, ring-entry, and in-bout frames.
 - [ ] Add sprite-overflow state and other new timing signals to probe capture
   reports when those features are implemented.
 - [ ] Re-profile NROM, MMC1, and MMC3 after the dot renderer lands; preserve
